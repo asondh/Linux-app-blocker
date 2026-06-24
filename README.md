@@ -49,12 +49,32 @@ python3 ~/appblocker.py
 
 Or copy `AppBlocker.desktop` to `~/Desktop` and double-click it.
 
-## Recommended: system-wide install (runs as an executable, no commands)
+## Recommended: install as a Debian package (.deb)
 
-This is the answer to *"I don't want to run special commands"* and *"manage all
-my children's accounts at once"*:
+On Debian/Ubuntu/Mint/Pop!_OS this is the "install it like a normal app" route —
+`apt` pulls in the prerequisites (`python3-tk`, `polkit`) for you and turns on
+the background service automatically, so there is **no manual setup**:
 
 ```bash
+./build-deb.sh                                    # builds dist/appblocker_<ver>_all.deb
+sudo apt install ./dist/appblocker_0.2.0_all.deb  # installs + auto-resolves deps
+```
+
+Building the `.deb` only needs `dpkg-deb` (already on every Debian system) and
+no root. Want a prebuilt `.deb` to just download and double-click? Ask and I'll
+attach one to a GitHub release.
+
+Remove it like any package: `sudo apt remove appblocker` (add `--purge` to also
+delete `/etc/appblocker`).
+
+## Alternative: shell installer (any systemd distro)
+
+If you are not on a Debian-based distro, install the prerequisites yourself and
+run the shell installer:
+
+```bash
+sudo apt install python3 python3-tk policykit-1   # Debian/Ubuntu
+# Fedora: sudo dnf install python3 python3-tkinter polkit
 sudo ./install.sh
 ```
 
@@ -102,7 +122,9 @@ stored in `blocked.json` next to your other settings.
 
 - `appblocker.py` — the whole app (GUI **and** `--daemon`/`--system` modes).
 - `appblocker.service` — systemd unit for the root enforcement daemon.
-- `install.sh` / `uninstall.sh` — system-wide install/removal.
+- `build-deb.sh` — builds the `.deb` package into `dist/`.
+- `packaging/` — Debian control file, maintainer scripts, and shared launchers.
+- `install.sh` / `uninstall.sh` — shell installer for non-Debian systemd distros.
 - `AppBlocker.desktop` — simple double-click launcher for the no-install case.
 
 ## Run modes

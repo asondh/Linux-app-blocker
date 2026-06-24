@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=AppBlocker (Admin)
+GenericName=Application Blocker
+Comment=Block apps and browsers for all users, with timers and schedules
+Exec=appblocker-admin
+Icon=security-high
+Terminal=false
+Categories=Utility;System;Security;
+StartupNotify=true
+Keywords=block;parental;control;timer;schedule;browser;

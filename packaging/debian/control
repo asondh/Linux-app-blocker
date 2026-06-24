@@ -1,0 +1,18 @@
+Package: appblocker
+Version: 0.2.0
+Section: utils
+Priority: optional
+Architecture: all
+Maintainer: AppBlocker <appblocker@example.com>
+Depends: python3 (>= 3.6), python3-tk, policykit-1
+Recommends: python3-pil, python3-pystray
+Homepage: https://github.com/asondh/Linux-app-blocker
+Description: Parent-friendly application blocker with timers and schedules
+ AppBlocker lets a parent block applications (especially web browsers) for
+ their children, machine-wide, without sudo gymnastics. A root systemd
+ service enforces a shared blocklist for every user and starts on boot.
+ .
+ Features include manual / timer / weekly-schedule blocks, per-user
+ targeting, and auto-block rules ("while app X runs for a child, block apps
+ Y and Z for them"). The admin GUI opens via a graphical polkit prompt so
+ children cannot change settings.

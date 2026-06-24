@@ -1,0 +1,10 @@
+#!/bin/sh
+# Launch the AppBlocker admin GUI as root with a graphical polkit prompt so
+# only someone with the admin password can change settings.
+if command -v pkexec >/dev/null 2>&1; then
+    exec pkexec env DISPLAY="$DISPLAY" \
+        XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}" \
+        /usr/bin/appblocker --system "$@"
+else
+    exec sudo /usr/bin/appblocker --system "$@"
+fi
