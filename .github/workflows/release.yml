@@ -27,9 +27,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out the code
+        # Default checkout = the commit that triggered this run (the pushed
+        # tag, the released commit, or the branch for a manual run). This lets
+        # a manual run build current code and create a brand-new release tag.
         uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
 
       - name: Build the .deb package
         run: |
@@ -39,9 +40,13 @@ jobs:
       - name: Show what was built
         run: ls -l dist/
 
-      - name: Attach the .deb to the Release
+      - name: Create/locate the Release and attach the .deb
         uses: softprops/action-gh-release@v2
         with:
           # Use the manual input when present, otherwise the pushed tag.
+          # If the tag/release doesn't exist yet, this creates it at the
+          # checked-out commit.
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          name: AppBlocker ${{ github.event.inputs.tag || github.ref_name }}
           files: dist/*.deb
+          generate_release_notes: true
