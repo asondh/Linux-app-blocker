@@ -1,0 +1,15 @@
+[Unit]
+Description=AppBlocker system-wide application blocker
+Documentation=https://github.com/asondh/Linux-app-blocker
+After=multi-user.target
+
+[Service]
+Type=simple
+# Runs as root so it can enforce blocks for every user on the machine.
+ExecStart=/usr/local/bin/appblocker --daemon
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
