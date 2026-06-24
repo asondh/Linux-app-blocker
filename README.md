@@ -104,6 +104,31 @@ sudo ./uninstall.sh --purge    # also removes /etc/appblocker
 > `dist/appblocker`. The systemd install above already gives you a no-command
 > experience without needing this.
 
+## Blocking web apps (PWAs) and custom programs
+
+Click **➕ Add App**. You get two ways to identify an app:
+
+- **An installed program** — browse to its file. It's matched by its process
+  name (and the built-in browsers already know their real process names, e.g.
+  Brave runs as `brave`, Chrome as `chrome`).
+- **A web app / PWA, or a custom command** — a PWA on the desktop is really your
+  browser opened with a web address, so it has no program of its own. Paste the
+  web address (e.g. `app.roblox.com`) and AppBlocker blocks any browser window
+  launched for that address — without blocking the rest of the browser.
+
+## Troubleshooting: "it didn't block anything"
+
+The blocker kills a program by its *running* process name. If a custom app
+isn't being blocked, find its real name while it's open:
+
+```bash
+ps -eo comm,args | grep -i <part-of-the-name>
+```
+
+Use the name shown in the first column when adding the app. (The four built-in
+browsers are already configured correctly.) To confirm the background service
+is running: `systemctl status appblocker`.
+
 ## Auto-block rules (conditional blocking)
 
 Open **⛓ Auto-Block Rules** and click **Add Rule**:

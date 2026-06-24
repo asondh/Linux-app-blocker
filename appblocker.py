@@ -91,13 +91,19 @@ COLOR_BG = "#f4f6f7"
 COLOR_HEADER = "#2c3e50"
 COLOR_ACCENT = "#2980b9"
 
-# Default browsers to pre-populate. For each we list candidate executable
-# names; the first one found on PATH is used.
+# Default browsers to pre-populate. For each: (display name, candidate launcher
+# names to locate with `which`, runtime process names to actually match).
+# The launcher name is often NOT the running process name — e.g. the
+# "brave-browser" launcher runs a process called "brave", and "google-chrome"
+# runs "chrome" — so we must match the real process names.
 DEFAULT_APPS = [
-    ("Firefox", ["firefox", "firefox-esr"]),
-    ("Chromium", ["chromium", "chromium-browser"]),
-    ("Google Chrome", ["google-chrome", "google-chrome-stable", "chrome"]),
-    ("Brave", ["brave-browser", "brave", "brave-browser-stable"]),
+    ("Firefox", ["firefox", "firefox-esr"], ["firefox", "firefox-esr"]),
+    ("Chromium", ["chromium", "chromium-browser"],
+     ["chromium", "chromium-browse", "chromium-browser"]),
+    ("Google Chrome", ["google-chrome", "google-chrome-stable", "chrome"],
+     ["chrome", "google-chrome"]),
+    ("Brave", ["brave-browser", "brave", "brave-browser-stable"],
+     ["brave", "brave-browser"]),
 ]
 
 
@@ -299,6 +305,46 @@ def app_target_label(app):
     return ", ".join(names)
 
 
+def app_match_terms(app):
+    """The list of strings used to recognise this app's processes."""
+    terms = app.get("match_terms")
+    if terms:
+        return [t for t in terms if t]
+    pn = app.get("proc_name")
+    return [pn] if pn else []
+
+
+def _term_matches_process(term, comm, exe_base):
+    """
+    True if `term` identifies a process given its /proc 'comm' and the
+    basename of its executable. Both comm and exe_base are lowercase.
+    /proc comm is truncated to 15 chars, so compare truncated too.
+    """
+    t = term.lower()
+    if not t:
+        return False
+    if comm == t or exe_base == t:
+        return True
+    # comm is capped at 15 chars by the kernel; match the truncated form.
+    if len(t) > 15 and comm and comm == t[:15]:
+        return True
+    return False
+
+
+def app_matches(app, comm, exe_base, cmdline):
+    """
+    Whether a process (lowercase comm, exe basename, full command line)
+    matches `app`. Two match styles:
+      * "process"     -> the process/executable name equals a term
+      * "commandline" -> a term appears anywhere in the command line
+                         (used for PWAs and custom launch commands)
+    """
+    terms = app_match_terms(app)
+    if app.get("match_type") == "commandline":
+        return any(t.lower() in cmdline for t in terms)
+    return any(_term_matches_process(t, comm, exe_base) for t in terms)
+
+
 # --------------------------------------------------------------------------- #
 # Process monitor — kills blocked apps in the background.
 # --------------------------------------------------------------------------- #
@@ -338,41 +384,40 @@ class ProcessMonitor(threading.Thread):
 
         # One scan of the process table — reused for trigger evaluation and
         # for the kill pass so a fast-launching child can't slip between scans.
-        procs = list(self._iter_processes())  # [(pid, comm, uid), ...]
-        running = {}                          # proc name(lower) -> set(uids)
-        for _pid, comm, uid in procs:
-            running.setdefault(comm.lower(), set()).add(uid)
-
-        # Build the active rule set: proc_name -> set of target UIDs (or None
-        # for all users). A name may be blocked for different user sets, so
-        # accumulate across app blocks and trigger rules.
-        rules = {}  # name(lower) -> set(uids) | None(=all)
-
-        def add_target(name, uids):
-            name = (name or "").lower()
-            if not name:
-                return
-            if name in rules:
-                if rules[name] is None or uids is None:
-                    rules[name] = None        # "all users" subsumes any set
-                else:
-                    rules[name] |= uids
-            else:
-                rules[name] = None if uids is None else set(uids)
+        procs = list(self._iter_processes())  # [(pid, comm, uid, exe_base, cmd)]
 
         with self.state.lock:
-            for app in self.state.apps:
-                if effective_blocked(app):
-                    add_target(app.get("proc_name", ""), app_target_uids(app))
+            apps = [dict(a) for a in self.state.apps]
             trigger_rules = [dict(r) for r in self.state.rules]
+
+        # Look up an app (with its match rules) by its stored proc_name key.
+        apps_by_key = {}
+        for a in apps:
+            key = (a.get("proc_name") or "").lower()
+            if key:
+                apps_by_key.setdefault(key, a)
+
+        def resolve(ref):
+            """A rule references an app by name; fall back to a process match."""
+            return apps_by_key.get((ref or "").lower()) or \
+                {"match_type": "process", "match_terms": [ref], "proc_name": ref}
+
+        # Active blockers: list of (matcher_app, uids_or_None). uids None = all.
+        blockers = []
+        for app in apps:
+            if effective_blocked(app):
+                blockers.append((app, app_target_uids(app)))
 
         # Dynamic trigger rules: while a trigger app is running for some user,
         # block its target apps for exactly the user(s) running the trigger.
         for rule in trigger_rules:
             if not rule.get("enabled", True):
                 continue
-            trig = (rule.get("trigger") or "").lower()
-            active_uids = set(running.get(trig, set()))
+            trig_app = resolve(rule.get("trigger"))
+            active_uids = {
+                uid for _pid, comm, uid, exe, cmd in procs
+                if app_matches(trig_app, comm, exe, cmd)
+            }
             if not active_uids:
                 continue
             allowed = rule.get("users") or []
@@ -380,18 +425,20 @@ class ProcessMonitor(threading.Thread):
                 active_uids &= usernames_to_uids(allowed)
             if not active_uids:
                 continue
+            trig_key = (trig_app.get("proc_name") or "").lower()
             for target in rule.get("targets", []):
-                if (target or "").lower() == trig:
+                tgt_app = resolve(target)
+                if (tgt_app.get("proc_name") or "").lower() == trig_key:
                     continue  # never kill the trigger itself
-                add_target(target, active_uids)
+                blockers.append((tgt_app, set(active_uids)))
 
-        if rules:
-            for pid, comm, uid in procs:
-                cl = comm.lower()
-                if cl in rules:
-                    target = rules[cl]            # None = all users
-                    if target is None or uid in target:
+        if blockers:
+            for pid, comm, uid, exe, cmd in procs:
+                for app, uids in blockers:
+                    if (uids is None or uid in uids) and \
+                            app_matches(app, comm, exe, cmd):
                         self._kill(pid)
+                        break
 
         if (changed_timer or reloaded) and self.on_change:
             self.on_change()
@@ -416,7 +463,12 @@ class ProcessMonitor(threading.Thread):
 
     @staticmethod
     def _iter_processes():
-        """Yield (pid, comm, uid) for every process via /proc."""
+        """
+        Yield (pid, comm, uid, exe_base, cmdline) for every process via /proc.
+        All string fields are lowercase. comm is the kernel process name,
+        exe_base is the basename of the real executable, cmdline is the full
+        command line (used to match PWAs / custom launch commands).
+        """
         my_pid = os.getpid()
         for entry in os.listdir("/proc"):
             if not entry.isdigit():
@@ -429,19 +481,29 @@ class ProcessMonitor(threading.Thread):
                 uid = os.stat(f"/proc/{entry}").st_uid
             except OSError:
                 continue
-            comm = None
+            comm = ""
             try:
                 with open(f"/proc/{entry}/comm", "r") as fh:
-                    comm = fh.read().strip()
+                    comm = fh.read().strip().lower()
             except Exception:
-                # Fall back to the basename of the executable path.
-                try:
-                    exe = os.readlink(f"/proc/{entry}/exe")
-                    comm = os.path.basename(exe)
-                except Exception:
-                    continue
-            if comm:
-                yield pid, comm, uid
+                pass
+            exe_base = ""
+            try:
+                exe_base = os.path.basename(
+                    os.readlink(f"/proc/{entry}/exe")).lower()
+            except Exception:
+                pass
+            cmdline = ""
+            try:
+                with open(f"/proc/{entry}/cmdline", "rb") as fh:
+                    cmdline = fh.read().replace(b"\x00", b" ").decode(
+                        "utf-8", "replace").strip().lower()
+            except Exception:
+                pass
+            if not comm and exe_base:
+                comm = exe_base
+            if comm or exe_base or cmdline:
+                yield pid, comm, uid, exe_base, cmdline
 
     @staticmethod
     def _kill(pid):
@@ -475,7 +537,9 @@ class AppState:
           "mode": "manual" | "timer" | "schedule",
           "timer_end": None | <epoch seconds>,
           "target_users": [],             # [] = all users, else list of names
-          "schedule": []                  # list of {days, start, end} windows
+          "schedule": [],                 # list of {days, start, end} windows
+          "match_type": "process",        # "process" or "commandline"
+          "match_terms": ["firefox"]      # names (process) or substrings (cmd)
         }
     """
 
@@ -503,6 +567,10 @@ class AppState:
             app.setdefault("timer_end", None)
             app.setdefault("target_users", [])
             app.setdefault("schedule", [])
+            app.setdefault("match_type", "process")
+            if not app.get("match_terms"):
+                pn = app.get("proc_name")
+                app["match_terms"] = [pn] if pn else []
         return apps
 
     @staticmethod
@@ -569,12 +637,14 @@ class AppState:
     @staticmethod
     def _default_apps():
         apps = []
-        for name, candidates in DEFAULT_APPS:
-            path, proc = detect_executable(candidates)
+        for name, candidates, terms in DEFAULT_APPS:
+            path, _proc = detect_executable(candidates)
             apps.append({
                 "name": name,
                 "path": path or "",
-                "proc_name": proc,
+                "proc_name": terms[0],      # primary runtime process name
+                "match_type": "process",
+                "match_terms": list(terms),  # all runtime names to match
                 "blocked": False,
                 "mode": "manual",
                 "timer_end": None,
@@ -584,13 +654,26 @@ class AppState:
         return apps
 
     # -- mutations ---------------------------------------------------------- #
-    def add_app(self, name, path):
-        proc = os.path.basename(path) if path else name.lower()
+    def add_app(self, name, path, match_type="process", match_terms=None):
+        """
+        Add a custom app.
+            match_type == "process"     -> match by executable/process name
+            match_type == "commandline" -> match a substring of the command
+                                           line (use for PWAs / custom commands)
+        """
+        if match_type == "commandline":
+            terms = [t for t in (match_terms or []) if t]
+            proc = (name or (terms[0] if terms else "app")).lower()
+        else:
+            proc = os.path.basename(path) if path else name.lower()
+            terms = [t for t in (match_terms or [proc]) if t]
         with self.lock:
             self.apps.append({
                 "name": name,
                 "path": path,
                 "proc_name": proc,
+                "match_type": match_type,
+                "match_terms": terms,
                 "blocked": False,
                 "mode": "manual",
                 "timer_end": None,
@@ -955,6 +1038,8 @@ class AppBlockerUI:
             bits.append(f"Users: {app_target_label(app)}")
         if app.get("mode") == "schedule" and app.get("schedule"):
             bits.append(f"Schedule: {schedule_summary(app['schedule'])}")
+        if app.get("match_type") == "commandline":
+            bits.append("Web app: " + ", ".join(app_match_terms(app)))
         return "   ·   ".join(bits)
 
     @staticmethod
@@ -1067,59 +1152,87 @@ class AppBlockerUI:
         win = tk.Toplevel(self.root)
         win.title("Add Application")
         win.configure(bg=COLOR_BG)
-        win.geometry("460x220")
+        win.geometry("500x420")
         win.transient(self.root)
         win.grab_set()
 
         tk.Label(win, text="Add a custom app to block", bg=COLOR_BG,
                  fg=COLOR_HEADER, font=("Helvetica", 13, "bold")).pack(
-                     pady=(14, 8))
+                     pady=(14, 6))
 
-        frm = tk.Frame(win, bg=COLOR_BG)
-        frm.pack(fill="x", padx=18)
+        kind = tk.StringVar(value="process")
+        body = tk.Frame(win, bg=COLOR_BG)
+        body.pack(fill="x", padx=18)
 
-        tk.Label(frm, text="Name:", bg=COLOR_BG).grid(
+        tk.Label(body, text="Name:", bg=COLOR_BG).grid(
             row=0, column=0, sticky="w", pady=4)
         name_var = tk.StringVar()
-        tk.Entry(frm, textvariable=name_var, width=36).grid(
+        tk.Entry(body, textvariable=name_var, width=40).grid(
             row=0, column=1, columnspan=2, pady=4, sticky="we")
+        body.columnconfigure(1, weight=1)
 
-        tk.Label(frm, text="Path:", bg=COLOR_BG).grid(
-            row=1, column=0, sticky="w", pady=4)
+        tk.Radiobutton(win, text="An installed program (pick its file)",
+                       variable=kind, value="process", bg=COLOR_BG,
+                       anchor="w").pack(fill="x", padx=18, pady=(8, 0))
+
+        prog = tk.Frame(win, bg=COLOR_BG)
+        prog.pack(fill="x", padx=36)
         path_var = tk.StringVar()
-        tk.Entry(frm, textvariable=path_var, width=26).grid(
-            row=1, column=1, pady=4, sticky="we")
+        tk.Entry(prog, textvariable=path_var).pack(
+            side="left", fill="x", expand=True)
 
         def browse():
-            p = filedialog.askopenfilename(title="Select executable")
+            p = filedialog.askopenfilename(title="Select the program")
             if p:
                 path_var.set(p)
+                kind.set("process")
                 if not name_var.get():
                     name_var.set(os.path.basename(p).title())
 
-        tk.Button(frm, text="Browse…", command=browse, relief="flat",
-                  bg=COLOR_ACCENT, fg="white", cursor="hand2").grid(
-                      row=1, column=2, padx=(6, 0), pady=4)
+        tk.Button(prog, text="Browse…", command=browse, relief="flat",
+                  bg=COLOR_ACCENT, fg="white", cursor="hand2").pack(
+                      side="left", padx=(6, 0))
 
-        frm.columnconfigure(1, weight=1)
+        tk.Radiobutton(win, text="A web app / PWA, or a custom command",
+                       variable=kind, value="commandline", bg=COLOR_BG,
+                       anchor="w").pack(fill="x", padx=18, pady=(10, 0))
+        cmd = tk.Frame(win, bg=COLOR_BG)
+        cmd.pack(fill="x", padx=36)
+        match_var = tk.StringVar()
+        tk.Entry(cmd, textvariable=match_var).pack(fill="x")
+        tk.Label(win, text="Enter the web address (or any unique text from the "
+                 "launch command). A PWA on the desktop is your browser opened "
+                 "with a web address, so paste that address here — e.g. "
+                 "youtube.com or app.roblox.com.", bg=COLOR_BG, fg="#7f8c8d",
+                 wraplength=440, justify="left").pack(padx=20, pady=(2, 0))
 
         def save():
             name = name_var.get().strip()
-            path = path_var.get().strip()
             if not name:
-                messagebox.showwarning("Missing", "Please enter a name.", parent=win)
+                messagebox.showwarning("Missing", "Please enter a name.",
+                                       parent=win)
                 return
-            # If a name without a path is given, try to auto-detect.
-            if not path:
-                detected = which(name.lower())
-                if detected:
-                    path = detected
-            self.state.add_app(name, path)
+            if kind.get() == "commandline":
+                term = match_var.get().strip()
+                if not term:
+                    messagebox.showwarning(
+                        "Missing", "Enter the web address / command text to "
+                        "match.", parent=win)
+                    return
+                self.state.add_app(name, "", match_type="commandline",
+                                   match_terms=[term])
+            else:
+                path = path_var.get().strip()
+                if not path:
+                    detected = which(name.lower())
+                    if detected:
+                        path = detected
+                self.state.add_app(name, path)
             win.destroy()
             self.refresh()
 
         btnbar = tk.Frame(win, bg=COLOR_BG)
-        btnbar.pack(fill="x", padx=18, pady=16)
+        btnbar.pack(side="bottom", fill="x", padx=18, pady=14)
         tk.Button(btnbar, text="Add", command=save, bg=COLOR_ACTIVE,
                   fg="white", relief="flat", padx=16, pady=6,
                   cursor="hand2").pack(side="right")
@@ -1622,16 +1735,33 @@ class AppBlockerUI:
 
     # -- window lifecycle --------------------------------------------------- #
     def on_close(self):
-        """Closing the window minimizes (to tray if available)."""
+        """Closing the window."""
         if self.tray_icon:
             self.root.withdraw()
             return
+        if SYSTEM_MODE:
+            # The root systemd service enforces the rules independently of this
+            # window, so closing it is completely safe — blocking continues and
+            # resumes automatically on every boot.
+            messagebox.showinfo(
+                "AppBlocker keeps running",
+                "You can close this window safely.\n\n"
+                "The background service keeps enforcing your rules for all "
+                "users, and starts automatically every time the computer is "
+                "turned on. Reopen \"AppBlocker (Admin)\" only when you want to "
+                "change the rules.")
+            self._really_quit()
+            return
+        # User mode: there is no background service, so blocking only runs while
+        # this app is open.
         if self.state.any_blocked():
             keep = messagebox.askyesno(
                 "Keep blocking?",
                 "Apps are still blocked. Keep AppBlocker running in the "
                 "background to enforce blocking?\n\n"
-                "Yes = minimize and keep blocking\nNo = quit (stops blocking)")
+                "Yes = minimize and keep blocking\nNo = quit (stops blocking)\n\n"
+                "Tip: install the system service (sudo ./install.sh or the .deb) "
+                "to block all users automatically at every startup.")
             if keep:
                 self.root.iconify()
                 return
