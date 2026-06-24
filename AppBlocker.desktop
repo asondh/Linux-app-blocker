@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=AppBlocker
+GenericName=Application Blocker
+Comment=Block browsers and other apps for kids, with timers and a parent password
+# Adjust the path below if you saved appblocker.py somewhere other than your home folder.
+Exec=python3 %h/appblocker.py
+Icon=security-high
+Terminal=false
+Categories=Utility;System;Security;
+StartupNotify=true
+Keywords=block;parental;control;timer;browser;
