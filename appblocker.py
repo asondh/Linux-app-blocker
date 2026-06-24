@@ -346,6 +346,82 @@ def app_matches(app, comm, exe_base, cmdline):
 
 
 # --------------------------------------------------------------------------- #
+# Website blocking (machine-wide, via /etc/hosts).
+# Blocked domains are written into a clearly-marked, self-contained block so we
+# never disturb the rest of the file. Requires root (system mode).
+# --------------------------------------------------------------------------- #
+HOSTS_FILE = "/etc/hosts"
+HOSTS_BEGIN = "# >>> AppBlocker blocked websites (managed — do not edit) >>>"
+HOSTS_END = "# <<< AppBlocker blocked websites <<<"
+SINKHOLE = "0.0.0.0"
+
+
+def normalize_domain(text):
+    """Reduce user input to a bare domain: strip scheme, path, and leading www."""
+    d = (text or "").strip().lower()
+    for scheme in ("https://", "http://"):
+        if d.startswith(scheme):
+            d = d[len(scheme):]
+    d = d.split("/")[0].split("?")[0].split("#")[0].strip()
+    if d.startswith("www."):
+        d = d[4:]
+    return d
+
+
+def _build_hosts_block(domains):
+    lines = [HOSTS_BEGIN]
+    seen = set()
+    for raw in domains:
+        d = normalize_domain(raw)
+        if not d or d in seen:
+            continue
+        seen.add(d)
+        lines.append(f"{SINKHOLE} {d}")
+        lines.append(f"{SINKHOLE} www.{d}")
+    lines.append(HOSTS_END)
+    return "\n".join(lines) + "\n"
+
+
+def _strip_managed_block(content):
+    """Return /etc/hosts content with any existing AppBlocker block removed."""
+    if HOSTS_BEGIN in content and HOSTS_END in content:
+        pre = content.split(HOSTS_BEGIN)[0]
+        post = content.split(HOSTS_END, 1)[1]
+        return pre.rstrip("\n") + "\n" + post.lstrip("\n")
+    return content
+
+
+def sync_blocked_websites(domains):
+    """
+    Make /etc/hosts reflect `domains` (blocklist mode). Only the managed block
+    is touched. Returns True if the file changed. Needs root; silently no-ops
+    if it can't write.
+    """
+    try:
+        with open(HOSTS_FILE, "r") as fh:
+            content = fh.read()
+    except Exception:
+        return False
+    base = _strip_managed_block(content)
+    if domains:
+        new = base.rstrip("\n") + "\n\n" + _build_hosts_block(domains)
+    else:
+        new = base.rstrip("\n") + "\n"
+    if new == content:
+        return False
+    try:
+        tmp = HOSTS_FILE + ".appblocker.tmp"
+        with open(tmp, "w") as fh:
+            fh.write(new)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, HOSTS_FILE)
+        return True
+    except Exception as exc:
+        sys.stderr.write(f"[websites] could not update {HOSTS_FILE}: {exc}\n")
+        return False
+
+
+# --------------------------------------------------------------------------- #
 # Process monitor — kills blocked apps in the background.
 # --------------------------------------------------------------------------- #
 class ProcessMonitor(threading.Thread):
@@ -439,6 +515,13 @@ class ProcessMonitor(threading.Thread):
                             app_matches(app, comm, exe, cmd):
                         self._kill(pid)
                         break
+
+        # Keep /etc/hosts in sync with the blocked-website list (system mode,
+        # root only). Cheap: only rewrites the file when it actually differs.
+        if SYSTEM_MODE:
+            with self.state.lock:
+                domains = list(self.state.websites)
+            sync_blocked_websites(domains)
 
         if (changed_timer or reloaded) and self.on_change:
             self.on_change()
@@ -547,6 +630,7 @@ class AppState:
         self.lock = threading.RLock()
         self.apps = []
         self.rules = []   # auto-block trigger rules (see _normalize_rules)
+        self.websites = []  # blocked website domains (machine-wide)
         self._mtime = None
         self.load()
 
@@ -597,15 +681,26 @@ class AppState:
             clean.append(r)
         return clean
 
+    @staticmethod
+    def _normalize_websites(value):
+        out = []
+        for d in value or []:
+            nd = normalize_domain(d)
+            if nd and nd not in out:
+                out.append(nd)
+        return out
+
     def load(self):
         data = load_json(BLOCKED_FILE, None)
         if data and isinstance(data, dict) and "apps" in data:
             self.apps = self._normalize(data["apps"])
             self.rules = self._normalize_rules(data.get("rules"))
+            self.websites = self._normalize_websites(data.get("websites"))
             self._mtime = self._file_mtime()
         else:
             self.apps = self._default_apps()
             self.rules = []
+            self.websites = []
             self.save()
 
     def reload_if_changed(self):
@@ -622,6 +717,7 @@ class AppState:
             with self.lock:
                 self.apps = self._normalize(data["apps"])
                 self.rules = self._normalize_rules(data.get("rules"))
+                self.websites = self._normalize_websites(data.get("websites"))
                 self._mtime = mtime
             return True
         return False
@@ -631,7 +727,8 @@ class AppState:
             self.save_locked()
 
     def save_locked(self):
-        save_json(BLOCKED_FILE, {"apps": self.apps, "rules": self.rules})
+        save_json(BLOCKED_FILE, {"apps": self.apps, "rules": self.rules,
+                                 "websites": self.websites})
         self._mtime = self._file_mtime()
 
     @staticmethod
@@ -751,6 +848,13 @@ class AppState:
             if 0 <= index < len(self.rules):
                 self.rules[index]["enabled"] = enabled
                 self.save_locked()
+
+    # -- blocked websites --------------------------------------------------- #
+    def set_websites(self, domains):
+        with self.lock:
+            self.websites = self._normalize_websites(domains)
+            self.save_locked()
+            return list(self.websites)
 
 
 # --------------------------------------------------------------------------- #
@@ -900,6 +1004,13 @@ class AppBlockerUI:
                   bg="#8e44ad", fg="white", activebackground="#6c3483",
                   font=("Helvetica", 11), relief="flat",
                   padx=12, pady=8, cursor="hand2").pack(side="right", padx=8)
+
+        if SYSTEM_MODE:
+            tk.Button(bar, text="🌐 Block Websites",
+                      command=self.websites_dialog,
+                      bg="#16a085", fg="white", activebackground="#0e6655",
+                      font=("Helvetica", 11), relief="flat",
+                      padx=12, pady=8, cursor="hand2").pack(side="right")
 
     def _build_list(self):
         container = tk.Frame(self.root, bg=COLOR_BG)
@@ -1441,6 +1552,53 @@ class AppBlockerUI:
         tk.Button(bar, text="Cancel", command=win.destroy, relief="flat",
                   padx=12, pady=6, cursor="hand2").pack(side="right", padx=8)
 
+    # -- blocked websites UI ------------------------------------------------ #
+    def websites_dialog(self):
+        win = tk.Toplevel(self.root)
+        win.title("Block Websites")
+        win.configure(bg=COLOR_BG)
+        win.geometry("480x520")
+        win.transient(self.root)
+        win.grab_set()
+
+        tk.Label(win, text="🌐 Blocked Websites", bg=COLOR_BG, fg=COLOR_HEADER,
+                 font=("Helvetica", 14, "bold")).pack(pady=(14, 2))
+        tk.Label(win, text="These websites are blocked in every browser, for "
+                 "everyone on this computer. Enter one domain per line "
+                 "(e.g. youtube.com).", bg=COLOR_BG, fg="#7f8c8d",
+                 wraplength=440, justify="left").pack(padx=18, pady=(0, 8))
+
+        txt = tk.Text(win, height=14, width=44, font=("monospace", 11))
+        txt.pack(fill="both", expand=True, padx=18)
+        with self.state.lock:
+            txt.insert("1.0", "\n".join(self.state.websites))
+
+        tk.Label(win, text="Note: this is machine-wide. A browser using "
+                 "“secure DNS” (DoH) or a VPN can bypass it.", bg=COLOR_BG,
+                 fg="#b9770e", wraplength=440, justify="left").pack(
+                     padx=18, pady=(6, 0))
+
+        def save():
+            raw = txt.get("1.0", tk.END)
+            domains = [line for line in raw.splitlines() if line.strip()]
+            saved = self.state.set_websites(domains)
+            # Apply immediately (we are root in system mode); the daemon also
+            # keeps it in sync, but this gives instant feedback.
+            sync_blocked_websites(saved)
+            messagebox.showinfo(
+                "Saved", f"{len(saved)} website(s) blocked.\n\nChanges take "
+                "effect right away (you may need to reload open tabs).",
+                parent=win)
+            win.destroy()
+
+        bar = tk.Frame(win, bg=COLOR_BG)
+        bar.pack(side="bottom", fill="x", padx=18, pady=14)
+        tk.Button(bar, text="Save", command=save, bg=COLOR_ACTIVE, fg="white",
+                  relief="flat", padx=16, pady=6, cursor="hand2").pack(
+                      side="right")
+        tk.Button(bar, text="Cancel", command=win.destroy, relief="flat",
+                  padx=12, pady=6, cursor="hand2").pack(side="right", padx=8)
+
     def change_password(self):
         if not self._authenticate("Enter current password to change it."):
             return
@@ -1868,7 +2026,30 @@ def main():
         "--system", action="store_true",
         help="GUI edits the system-wide blocklist in /etc/appblocker "
              "(requires root; implied when run as root)")
+    parser.add_argument(
+        "--web-clear", action="store_true",
+        help="emergency: remove all AppBlocker website blocks from /etc/hosts")
+    parser.add_argument(
+        "--web-status", action="store_true",
+        help="print the currently blocked websites and exit")
     args = parser.parse_args()
+
+    if args.web_clear:
+        changed = sync_blocked_websites([])
+        print("Cleared AppBlocker website blocks from /etc/hosts."
+              if changed else "No AppBlocker website blocks were present.")
+        return
+
+    if args.web_status:
+        configure_paths(system_mode=True)
+        st = AppState()
+        if st.websites:
+            print("Blocked websites:")
+            for d in st.websites:
+                print(f"  {d}")
+        else:
+            print("No websites are blocked.")
+        return
 
     # The daemon is always system-wide. The GUI is system-wide when asked, or
     # automatically when launched as root; otherwise it stays per-user.

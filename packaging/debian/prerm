@@ -3,7 +3,14 @@
 set -e
 
 case "$1" in
-    remove|deconfigure|upgrade)
+    remove|deconfigure)
+        if [ -d /run/systemd/system ]; then
+            systemctl disable --now appblocker.service || true
+        fi
+        # Remove any website blocks we added to /etc/hosts.
+        [ -x /usr/bin/appblocker ] && /usr/bin/appblocker --web-clear || true
+        ;;
+    upgrade)
         if [ -d /run/systemd/system ]; then
             systemctl disable --now appblocker.service || true
         fi

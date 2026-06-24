@@ -129,6 +129,25 @@ Use the name shown in the first column when adding the app. (The four built-in
 browsers are already configured correctly.) To confirm the background service
 is running: `systemctl status appblocker`.
 
+## Blocking websites
+
+In the admin window, click **🌐 Block Websites** and enter one domain per line
+(e.g. `youtube.com`). They're blocked in **every browser, for everyone on the
+machine**, by adding entries to `/etc/hosts`. This is a blocklist: the sites you
+list are blocked, everything else works.
+
+Notes and limits:
+
+- It is **machine-wide**, not per-user (the hosts file is global).
+- It's a blocklist only. "Allow only these, block everything else" needs
+  DNS-level control and isn't included yet.
+- A browser set to use **secure DNS (DoH)** or a **VPN** can bypass it.
+- Only the four built-in browsers' real process names are auto-known; website
+  blocks work in all of them.
+- Emergency off switch (from a terminal): `sudo appblocker --web-clear`
+  removes every AppBlocker entry from `/etc/hosts`. `appblocker --web-status`
+  lists what's blocked. Uninstalling the package also clears them.
+
 ## Auto-block rules (conditional blocking)
 
 Open **⛓ Auto-Block Rules** and click **Add Rule**:
