@@ -1,0 +1,13 @@
+#!/bin/sh
+# Pre-removal: stop and disable the enforcement service.
+set -e
+
+case "$1" in
+    remove|deconfigure|upgrade)
+        if [ -d /run/systemd/system ]; then
+            systemctl disable --now appblocker.service || true
+        fi
+        ;;
+esac
+
+exit 0

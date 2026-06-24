@@ -1,0 +1,16 @@
+#!/bin/sh
+# Post-removal: reload systemd. On purge, also delete the config (which holds
+# the password hash and blocklist).
+set -e
+
+case "$1" in
+    purge)
+        rm -rf /etc/appblocker
+        ;;
+esac
+
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload || true
+fi
+
+exit 0

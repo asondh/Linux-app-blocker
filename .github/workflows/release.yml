@@ -1,0 +1,45 @@
+name: Release .deb
+
+# Build the Debian package and publish it as a downloadable GitHub Release
+# whenever a version tag (e.g. v0.2.0) is pushed.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write   # needed to create the Release and upload the .deb
+
+jobs:
+  build-deb:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Build the .deb package
+        run: |
+          chmod +x build-deb.sh
+          ./build-deb.sh
+
+      - name: Show what was built
+        run: ls -l dist/
+
+      - name: Publish the GitHub Release with the .deb attached
+        uses: softprops/action-gh-release@v2
+        with:
+          name: AppBlocker ${{ github.ref_name }}
+          files: dist/*.deb
+          generate_release_notes: true
+          body: |
+            ## AppBlocker ${{ github.ref_name }}
+
+            Download the `.deb` below and install it on Debian/Ubuntu/Mint:
+
+            ```bash
+            sudo apt install ./appblocker_*_all.deb
+            ```
+
+            `apt` will pull in the prerequisites (python3-tk, polkit) automatically
+            and enable the background blocking service. Then open
+            **AppBlocker (Admin)** from your applications menu.
