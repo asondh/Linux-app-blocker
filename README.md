@@ -26,6 +26,11 @@ It runs in two ways:
     supported.
 - **Per-user targeting** (system mode) — choose exactly which children a block
   applies to, or "All users".
+- **Auto-block rules** — *"while my child is running app X, automatically block
+  apps Y and Z for them."* Pick a trigger app and the apps to disable while it
+  runs; the block applies only to the user actually running the trigger and
+  lifts a few seconds after they close it. Manage these under
+  **⛓ Auto-Block Rules** in the admin window.
 - **No-sudo blocking mechanism** — a monitor scans `/proc` and kills any blocked
   process within a few seconds. As root (system mode) it can enforce across all
   users; as a normal user it covers your own session.
@@ -78,6 +83,20 @@ sudo ./uninstall.sh --purge    # also removes /etc/appblocker
 > `pip install pyinstaller && pyinstaller --onefile appblocker.py` →
 > `dist/appblocker`. The systemd install above already gives you a no-command
 > experience without needing this.
+
+## Auto-block rules (conditional blocking)
+
+Open **⛓ Auto-Block Rules** and click **Add Rule**:
+
+1. **Trigger app** — when this app is running (e.g. *Steam*)…
+2. **Apps to block** — …these get disabled (e.g. *Firefox*, *Chrome*)…
+3. **Users** (system mode) — …for the user(s) running the trigger.
+
+The daemon checks every few seconds: as soon as a targeted child launches the
+trigger, the chosen apps are killed for *that* child only (other users are
+unaffected). When they quit the trigger, the targets are allowed again. Rules
+can be toggled on/off or deleted (both require the parent password). This is
+stored in `blocked.json` next to your other settings.
 
 ## Files
 

@@ -336,28 +336,57 @@ class ProcessMonitor(threading.Thread):
         reloaded = self.state.reload_if_changed()
         changed_timer = self._expire_timers()
 
+        # One scan of the process table — reused for trigger evaluation and
+        # for the kill pass so a fast-launching child can't slip between scans.
+        procs = list(self._iter_processes())  # [(pid, comm, uid), ...]
+        running = {}                          # proc name(lower) -> set(uids)
+        for _pid, comm, uid in procs:
+            running.setdefault(comm.lower(), set()).add(uid)
+
         # Build the active rule set: proc_name -> set of target UIDs (or None
-        # for all users). A name may be blocked for different user sets across
-        # several entries, so accumulate.
+        # for all users). A name may be blocked for different user sets, so
+        # accumulate across app blocks and trigger rules.
         rules = {}  # name(lower) -> set(uids) | None(=all)
+
+        def add_target(name, uids):
+            name = (name or "").lower()
+            if not name:
+                return
+            if name in rules:
+                if rules[name] is None or uids is None:
+                    rules[name] = None        # "all users" subsumes any set
+                else:
+                    rules[name] |= uids
+            else:
+                rules[name] = None if uids is None else set(uids)
+
         with self.state.lock:
             for app in self.state.apps:
-                if not effective_blocked(app):
-                    continue
-                name = app.get("proc_name", "").lower()
-                if not name:
-                    continue
-                uids = app_target_uids(app)
-                if name in rules:
-                    if rules[name] is None or uids is None:
-                        rules[name] = None  # all users wins
-                    else:
-                        rules[name] |= uids
-                else:
-                    rules[name] = uids
+                if effective_blocked(app):
+                    add_target(app.get("proc_name", ""), app_target_uids(app))
+            trigger_rules = [dict(r) for r in self.state.rules]
+
+        # Dynamic trigger rules: while a trigger app is running for some user,
+        # block its target apps for exactly the user(s) running the trigger.
+        for rule in trigger_rules:
+            if not rule.get("enabled", True):
+                continue
+            trig = (rule.get("trigger") or "").lower()
+            active_uids = set(running.get(trig, set()))
+            if not active_uids:
+                continue
+            allowed = rule.get("users") or []
+            if allowed:
+                active_uids &= usernames_to_uids(allowed)
+            if not active_uids:
+                continue
+            for target in rule.get("targets", []):
+                if (target or "").lower() == trig:
+                    continue  # never kill the trigger itself
+                add_target(target, active_uids)
 
         if rules:
-            for pid, comm, uid in self._iter_processes():
+            for pid, comm, uid in procs:
                 cl = comm.lower()
                 if cl in rules:
                     target = rules[cl]            # None = all users
@@ -453,6 +482,7 @@ class AppState:
     def __init__(self):
         self.lock = threading.RLock()
         self.apps = []
+        self.rules = []   # auto-block trigger rules (see _normalize_rules)
         self._mtime = None
         self.load()
 
@@ -475,13 +505,39 @@ class AppState:
             app.setdefault("schedule", [])
         return apps
 
+    @staticmethod
+    def _normalize_rules(rules):
+        """
+        Auto-block trigger rule:
+            {
+              "name": "While gaming, block browsers",
+              "enabled": True,
+              "trigger": "steam",        # proc name that, while running...
+              "targets": ["firefox"],    # ...causes these proc names to block
+              "users": []                # [] = any user, else specific names
+            }
+        Targets are blocked only for the user(s) actually running the trigger.
+        """
+        clean = []
+        for r in rules or []:
+            if not isinstance(r, dict) or not r.get("trigger"):
+                continue
+            r.setdefault("name", "")
+            r.setdefault("enabled", True)
+            r.setdefault("targets", [])
+            r.setdefault("users", [])
+            clean.append(r)
+        return clean
+
     def load(self):
         data = load_json(BLOCKED_FILE, None)
         if data and isinstance(data, dict) and "apps" in data:
             self.apps = self._normalize(data["apps"])
+            self.rules = self._normalize_rules(data.get("rules"))
             self._mtime = self._file_mtime()
         else:
             self.apps = self._default_apps()
+            self.rules = []
             self.save()
 
     def reload_if_changed(self):
@@ -497,6 +553,7 @@ class AppState:
         if data and isinstance(data, dict) and "apps" in data:
             with self.lock:
                 self.apps = self._normalize(data["apps"])
+                self.rules = self._normalize_rules(data.get("rules"))
                 self._mtime = mtime
             return True
         return False
@@ -506,7 +563,7 @@ class AppState:
             self.save_locked()
 
     def save_locked(self):
-        save_json(BLOCKED_FILE, {"apps": self.apps})
+        save_json(BLOCKED_FILE, {"apps": self.apps, "rules": self.rules})
         self._mtime = self._file_mtime()
 
     @staticmethod
@@ -587,6 +644,30 @@ class AppState:
     def any_blocked(self):
         with self.lock:
             return any(effective_blocked(a) for a in self.apps)
+
+    # -- auto-block rules --------------------------------------------------- #
+    def add_rule(self, rule):
+        with self.lock:
+            self.rules.append(rule)
+            self.save_locked()
+
+    def update_rule(self, index, rule):
+        with self.lock:
+            if 0 <= index < len(self.rules):
+                self.rules[index] = rule
+                self.save_locked()
+
+    def remove_rule(self, index):
+        with self.lock:
+            if 0 <= index < len(self.rules):
+                del self.rules[index]
+                self.save_locked()
+
+    def toggle_rule(self, index, enabled):
+        with self.lock:
+            if 0 <= index < len(self.rules):
+                self.rules[index]["enabled"] = enabled
+                self.save_locked()
 
 
 # --------------------------------------------------------------------------- #
@@ -731,6 +812,11 @@ class AppBlockerUI:
                   bg=COLOR_ACCENT, fg="white", activebackground="#1f618d",
                   font=("Helvetica", 11), relief="flat",
                   padx=12, pady=8, cursor="hand2").pack(side="right")
+
+        tk.Button(bar, text="⛓ Auto-Block Rules", command=self.rules_dialog,
+                  bg="#8e44ad", fg="white", activebackground="#6c3483",
+                  font=("Helvetica", 11), relief="flat",
+                  padx=12, pady=8, cursor="hand2").pack(side="right", padx=8)
 
     def _build_list(self):
         container = tk.Frame(self.root, bg=COLOR_BG)
@@ -1038,6 +1124,208 @@ class AppBlockerUI:
                   fg="white", relief="flat", padx=16, pady=6,
                   cursor="hand2").pack(side="right")
         tk.Button(btnbar, text="Cancel", command=win.destroy, relief="flat",
+                  padx=12, pady=6, cursor="hand2").pack(side="right", padx=8)
+
+    # -- auto-block rules UI ------------------------------------------------ #
+    def _app_choices(self):
+        with self.state.lock:
+            return [(a.get("name", ""), a.get("proc_name", ""))
+                    for a in self.state.apps if a.get("proc_name")]
+
+    def _proc_to_name(self):
+        return {proc.lower(): name for name, proc in self._app_choices()}
+
+    def _rule_summary(self, rule):
+        p2n = self._proc_to_name()
+        trig = rule.get("trigger", "")
+        trig_name = p2n.get(trig.lower(), trig)
+        targets = rule.get("targets", [])
+        tnames = ", ".join(p2n.get(t.lower(), t) for t in targets) or "(none)"
+        who = ", ".join(rule.get("users") or []) or "any user"
+        return f"While {trig_name} is running  →  block {tnames}\nfor {who}"
+
+    def rules_dialog(self):
+        win = tk.Toplevel(self.root)
+        win.title("Auto-Block Rules")
+        win.configure(bg=COLOR_BG)
+        win.geometry("560x460")
+        win.transient(self.root)
+        win.grab_set()
+
+        tk.Label(win, text="Auto-Block Rules", bg=COLOR_BG, fg=COLOR_HEADER,
+                 font=("Helvetica", 14, "bold")).pack(pady=(14, 2))
+        tk.Label(win, text="While a chosen app is running for a user, the apps "
+                 "you pick get blocked for that same user.", bg=COLOR_BG,
+                 fg="#7f8c8d", wraplength=520, justify="left").pack(
+                     padx=16, pady=(0, 8))
+
+        listwrap = tk.Frame(win, bg=COLOR_BG)
+        listwrap.pack(fill="both", expand=True, padx=14)
+
+        def render():
+            for c in listwrap.winfo_children():
+                c.destroy()
+            with self.state.lock:
+                rules = list(self.state.rules)
+            if not rules:
+                tk.Label(listwrap, text="No rules yet. Click “Add Rule”.",
+                         bg=COLOR_BG, fg="#95a5a6").pack(pady=20)
+                return
+            for i, rule in enumerate(rules):
+                card = tk.Frame(listwrap, bg="white", highlightbackground="#dfe4ea",
+                                highlightthickness=1)
+                card.pack(fill="x", pady=3)
+                en = tk.BooleanVar(value=rule.get("enabled", True))
+                tk.Checkbutton(
+                    card, variable=en, bg="white",
+                    command=lambda idx=i, v=en: self._toggle_rule(idx, v, render)
+                ).pack(side="left", padx=4)
+                tk.Label(card, text=self._rule_summary(rule), bg="white",
+                         fg=COLOR_HEADER, justify="left", anchor="w",
+                         font=("Helvetica", 10)).pack(
+                             side="left", fill="x", expand=True, padx=6, pady=6)
+                tk.Button(card, text="✕", relief="flat", bg="white", fg="#95a5a6",
+                          cursor="hand2",
+                          command=lambda idx=i: self._delete_rule(idx, render)
+                          ).pack(side="right", padx=4)
+                tk.Button(card, text="Edit", relief="flat", bg="white",
+                          fg=COLOR_ACCENT, cursor="hand2",
+                          command=lambda idx=i: self._edit_rule(win, idx, render)
+                          ).pack(side="right")
+
+        bar = tk.Frame(win, bg=COLOR_BG)
+        bar.pack(fill="x", padx=14, pady=12)
+        tk.Button(bar, text="＋ Add Rule",
+                  command=lambda: self._edit_rule(win, None, render),
+                  bg="#8e44ad", fg="white", relief="flat", padx=14, pady=6,
+                  cursor="hand2").pack(side="left")
+        tk.Button(bar, text="Close", command=win.destroy, relief="flat",
+                  padx=12, pady=6, cursor="hand2").pack(side="right")
+        render()
+
+    def _toggle_rule(self, idx, var, on_done):
+        if not var.get():  # disabling a protection -> require the parent
+            if not self._authenticate("Disabling a rule requires the password."):
+                var.set(True)
+                return
+        self.state.toggle_rule(idx, var.get())
+        on_done()
+
+    def _delete_rule(self, idx, on_done):
+        if not self._authenticate("Deleting a rule requires the password."):
+            return
+        self.state.remove_rule(idx)
+        on_done()
+
+    def _edit_rule(self, parent, index, on_done):
+        choices = self._app_choices()
+        if not choices:
+            messagebox.showinfo("Add apps first",
+                                "Add the apps you want to use before creating "
+                                "a rule.", parent=parent)
+            return
+        with self.state.lock:
+            existing = dict(self.state.rules[index]) if index is not None else {}
+        name_to_proc = {name: proc for name, proc in choices}
+        proc_to_name = {proc.lower(): name for name, proc in choices}
+
+        win = tk.Toplevel(parent)
+        win.title("Edit Rule" if index is not None else "New Rule")
+        win.configure(bg=COLOR_BG)
+        win.geometry("460x560")
+        win.transient(parent)
+        win.grab_set()
+
+        tk.Label(win, text="When this app is running…", bg=COLOR_BG,
+                 fg=COLOR_HEADER, font=("Helvetica", 11, "bold")).pack(
+                     anchor="w", padx=18, pady=(14, 2))
+        trigger_var = tk.StringVar()
+        cur_trig = existing.get("trigger", "")
+        trigger_var.set(proc_to_name.get(cur_trig.lower(),
+                                          choices[0][0] if choices else ""))
+        ttk.Combobox(win, textvariable=trigger_var,
+                     values=[n for n, _ in choices], state="readonly").pack(
+                         fill="x", padx=18)
+
+        tk.Label(win, text="…automatically block these apps:", bg=COLOR_BG,
+                 fg=COLOR_HEADER, font=("Helvetica", 11, "bold")).pack(
+                     anchor="w", padx=18, pady=(12, 2))
+        tgt_wrap = tk.Frame(win, bg=COLOR_BG)
+        tgt_wrap.pack(fill="x", padx=24)
+        cur_targets = {t.lower() for t in existing.get("targets", [])}
+        target_vars = []
+        for name, proc in choices:
+            v = tk.BooleanVar(value=proc.lower() in cur_targets)
+            tk.Checkbutton(tgt_wrap, text=name, variable=v, bg=COLOR_BG,
+                           anchor="w").pack(fill="x")
+            target_vars.append((proc, v))
+
+        # users (system mode)
+        user_vars = {}
+        if SYSTEM_MODE:
+            tk.Label(win, text="For these users:", bg=COLOR_BG, fg=COLOR_HEADER,
+                     font=("Helvetica", 11, "bold")).pack(
+                         anchor="w", padx=18, pady=(12, 2))
+            cur_users = set(existing.get("users") or [])
+            any_var = tk.BooleanVar(value=not cur_users)
+
+            def toggle_any():
+                if any_var.get():
+                    for v in user_vars.values():
+                        v.set(False)
+
+            tk.Checkbutton(win, text="Any user", variable=any_var,
+                           command=toggle_any, bg=COLOR_BG, anchor="w").pack(
+                               fill="x", padx=24)
+            ufr = tk.Frame(win, bg=COLOR_BG)
+            ufr.pack(fill="x", padx=40)
+            for uname, _uid in self.users:
+                v = tk.BooleanVar(value=uname in cur_users)
+                tk.Checkbutton(ufr, text=uname, variable=v,
+                               command=lambda: any_var.set(False), bg=COLOR_BG,
+                               anchor="w").pack(fill="x")
+                user_vars[uname] = v
+
+        name_var = tk.StringVar(value=existing.get("name", ""))
+        nfr = tk.Frame(win, bg=COLOR_BG)
+        nfr.pack(fill="x", padx=18, pady=(12, 0))
+        tk.Label(nfr, text="Label (optional):", bg=COLOR_BG).pack(side="left")
+        tk.Entry(nfr, textvariable=name_var).pack(side="left", fill="x",
+                                                  expand=True, padx=6)
+
+        def save():
+            trig_proc = name_to_proc.get(trigger_var.get(), "")
+            if not trig_proc:
+                messagebox.showwarning("Pick a trigger",
+                                       "Choose the app that triggers the rule.",
+                                       parent=win)
+                return
+            targets = [proc for proc, v in target_vars if v.get()]
+            if not targets:
+                messagebox.showwarning("Pick targets",
+                                       "Choose at least one app to block.",
+                                       parent=win)
+                return
+            rule = {
+                "name": name_var.get().strip(),
+                "enabled": True,
+                "trigger": trig_proc,
+                "targets": targets,
+                "users": [u for u, v in user_vars.items() if v.get()],
+            }
+            if index is None:
+                self.state.add_rule(rule)
+            else:
+                self.state.update_rule(index, rule)
+            win.destroy()
+            on_done()
+
+        bar = tk.Frame(win, bg=COLOR_BG)
+        bar.pack(side="bottom", fill="x", padx=18, pady=14)
+        tk.Button(bar, text="Save Rule", command=save, bg=COLOR_ACTIVE,
+                  fg="white", relief="flat", padx=16, pady=6,
+                  cursor="hand2").pack(side="right")
+        tk.Button(bar, text="Cancel", command=win.destroy, relief="flat",
                   padx=12, pady=6, cursor="hand2").pack(side="right", padx=8)
 
     def change_password(self):
