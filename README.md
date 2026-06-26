@@ -162,6 +162,13 @@ unaffected). When they quit the trigger, the targets are allowed again. Rules
 can be toggled on/off or deleted (both require the parent password). This is
 stored in `blocked.json` next to your other settings.
 
+A rule can **also block websites while the trigger runs** — fill in the
+"…and block these websites" field (e.g. `youtube.com, tiktok.com`). Those sites
+are blocked (machine-wide, via `/etc/hosts`) only while the trigger app/PWA is
+running, and unblocked again when it closes. Example: *while the homework PWA is
+open, block YouTube.* (Website blocks can't be scoped to one user, since the
+hosts file is global.)
+
 ## Files
 
 - `appblocker.py` — the whole app (GUI **and** `--daemon`/`--system` modes).

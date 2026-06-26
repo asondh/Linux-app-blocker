@@ -485,7 +485,9 @@ class ProcessMonitor(threading.Thread):
                 blockers.append((app, app_target_uids(app)))
 
         # Dynamic trigger rules: while a trigger app is running for some user,
-        # block its target apps for exactly the user(s) running the trigger.
+        # block its target apps for exactly the user(s) running the trigger,
+        # and (machine-wide) block any websites the rule lists.
+        dynamic_sites = set()
         for rule in trigger_rules:
             if not rule.get("enabled", True):
                 continue
@@ -507,6 +509,7 @@ class ProcessMonitor(threading.Thread):
                 if (tgt_app.get("proc_name") or "").lower() == trig_key:
                     continue  # never kill the trigger itself
                 blockers.append((tgt_app, set(active_uids)))
+            dynamic_sites.update(rule.get("block_sites") or [])
 
         if blockers:
             for pid, comm, uid, exe, cmd in procs:
@@ -516,12 +519,14 @@ class ProcessMonitor(threading.Thread):
                         self._kill(pid)
                         break
 
-        # Keep /etc/hosts in sync with the blocked-website list (system mode,
-        # root only). Cheap: only rewrites the file when it actually differs.
+        # Keep /etc/hosts in sync (system mode, root only). The effective list
+        # is the always-on websites plus any added by currently-active trigger
+        # rules. Cheap: only rewrites the file when it actually differs.
         if SYSTEM_MODE:
             with self.state.lock:
-                domains = list(self.state.websites)
-            sync_blocked_websites(domains)
+                domains = set(self.state.websites)
+            domains |= dynamic_sites
+            sync_blocked_websites(sorted(domains))
 
         if (changed_timer or reloaded) and self.on_change:
             self.on_change()
@@ -666,9 +671,12 @@ class AppState:
               "enabled": True,
               "trigger": "steam",        # proc name that, while running...
               "targets": ["firefox"],    # ...causes these proc names to block
+              "block_sites": ["x.com"],  # ...and these websites to be blocked
               "users": []                # [] = any user, else specific names
             }
-        Targets are blocked only for the user(s) actually running the trigger.
+        Target apps are blocked only for the user(s) running the trigger;
+        website blocks are machine-wide (the hosts file is global) but only
+        while the trigger is running.
         """
         clean = []
         for r in rules or []:
@@ -678,6 +686,8 @@ class AppState:
             r.setdefault("enabled", True)
             r.setdefault("targets", [])
             r.setdefault("users", [])
+            r["block_sites"] = [normalize_domain(d) for d in r.get("block_sites", [])
+                                if normalize_domain(d)]
             clean.append(r)
         return clean
 
@@ -1364,9 +1374,13 @@ class AppBlockerUI:
         trig = rule.get("trigger", "")
         trig_name = p2n.get(trig.lower(), trig)
         targets = rule.get("targets", [])
-        tnames = ", ".join(p2n.get(t.lower(), t) for t in targets) or "(none)"
+        parts = [p2n.get(t.lower(), t) for t in targets]
+        sites = rule.get("block_sites") or []
+        if sites:
+            parts.append("websites: " + ", ".join(sites))
+        what = ", ".join(parts) or "(nothing)"
         who = ", ".join(rule.get("users") or []) or "any user"
-        return f"While {trig_name} is running  →  block {tnames}\nfor {who}"
+        return f"While {trig_name} is running  →  block {what}\nfor {who}"
 
     def rules_dialog(self):
         win = tk.Toplevel(self.root)
@@ -1456,7 +1470,7 @@ class AppBlockerUI:
         win = tk.Toplevel(parent)
         win.title("Edit Rule" if index is not None else "New Rule")
         win.configure(bg=COLOR_BG)
-        win.geometry("460x560")
+        win.geometry("460x680")
         win.transient(parent)
         win.grab_set()
 
@@ -1483,6 +1497,20 @@ class AppBlockerUI:
             tk.Checkbutton(tgt_wrap, text=name, variable=v, bg=COLOR_BG,
                            anchor="w").pack(fill="x")
             target_vars.append((proc, v))
+
+        sites_var = None
+        if SYSTEM_MODE:
+            tk.Label(win, text="…and block these websites (comma-separated):",
+                     bg=COLOR_BG, fg=COLOR_HEADER,
+                     font=("Helvetica", 11, "bold")).pack(
+                         anchor="w", padx=18, pady=(12, 2))
+            sites_var = tk.StringVar(
+                value=", ".join(existing.get("block_sites") or []))
+            tk.Entry(win, textvariable=sites_var).pack(fill="x", padx=24)
+            tk.Label(win, text="e.g. youtube.com, tiktok.com — blocked for the "
+                     "whole computer while the trigger runs.", bg=COLOR_BG,
+                     fg="#7f8c8d", wraplength=400, justify="left").pack(
+                         anchor="w", padx=24)
 
         # users (system mode)
         user_vars = {}
@@ -1525,16 +1553,21 @@ class AppBlockerUI:
                                        parent=win)
                 return
             targets = [proc for proc, v in target_vars if v.get()]
-            if not targets:
-                messagebox.showwarning("Pick targets",
-                                       "Choose at least one app to block.",
-                                       parent=win)
+            sites = []
+            if sites_var is not None:
+                sites = [normalize_domain(s) for s in sites_var.get().replace(
+                    ";", ",").split(",") if normalize_domain(s)]
+            if not targets and not sites:
+                messagebox.showwarning(
+                    "Nothing to block",
+                    "Choose at least one app or website to block.", parent=win)
                 return
             rule = {
                 "name": name_var.get().strip(),
                 "enabled": True,
                 "trigger": trig_proc,
                 "targets": targets,
+                "block_sites": sites,
                 "users": [u for u, v in user_vars.items() if v.get()],
             }
             if index is None:
