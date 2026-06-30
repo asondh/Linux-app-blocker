@@ -148,6 +148,32 @@ Notes and limits:
   removes every AppBlocker entry from `/etc/hosts`. `appblocker --web-status`
   lists what's blocked. Uninstalling the package also clears them.
 
+## Website-visit monitoring & alerts
+
+Open **📊 Activity** (admin window). AppBlocker reads each user's **browser
+history** (Firefox / Chrome / Chromium / Brave) and keeps a per-user log you can
+filter by **user, day, and site**, with an approximate **time-per-site** summary
+— so you skim a table, not a wall of text.
+
+Click **🔔 Alerts & Email** to:
+
+- **Watch specific sites** — get alerted the moment any user visits one.
+- **Email alerts** — enter an SMTP account (e.g. Gmail `smtp.gmail.com`, port
+  587, with an **app password**) and use **Send test email** to confirm it
+  works. Alerts then arrive in your inbox within seconds of a visit.
+
+Honest limits:
+
+- It reads browser history, so **incognito/private windows and cleared history
+  are not captured.** (v0.7.0 adds a lockdown to disable incognito and block
+  history deletion — closing this gap.)
+- **Time-on-site is approximate** (estimated from the gaps between visits).
+- It is **not** affected by secure-DNS/VPN — the browser records its own
+  history regardless.
+
+Useful from a terminal: `sudo appblocker --email-test` (send a test alert) and
+`sudo appblocker --import-history` (import history once now).
+
 ## Auto-block rules (conditional blocking)
 
 Open **⛓ Auto-Block Rules** and click **Add Rule**:
