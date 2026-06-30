@@ -36,9 +36,17 @@ import json
 import time
 import signal
 import hashlib
+import glob
+import ssl
+import shutil
+import sqlite3
+import smtplib
 import argparse
+import tempfile
 import threading
 import subprocess
+from email.message import EmailMessage
+from urllib.parse import urlparse
 
 # tkinter is only needed for the GUI. The root daemon (--daemon) runs headless,
 # possibly on a machine without python3-tk, so import it lazily/guarded.
@@ -422,6 +430,353 @@ def sync_blocked_websites(domains):
 
 
 # --------------------------------------------------------------------------- #
+# Website-visit monitoring.
+# Reads each user's browser history (Firefox / Chrome / Chromium / Brave),
+# records visits into a small SQLite log, supports per-user/site/day queries
+# with approximate time-on-site, and raises email alerts on watched sites.
+# --------------------------------------------------------------------------- #
+MONITOR_HISTORY_INTERVAL = 45     # seconds between history imports
+VISIT_IDLE_CAP = 1800             # cap a single visit's duration at 30 min
+ALERT_DEBOUNCE = 600              # don't re-alert same user+site within 10 min
+CHROME_EPOCH_OFFSET = 11644473600  # seconds between 1601-01-01 and 1970-01-01
+
+
+def history_db_path():
+    return os.path.join(APP_DIR, "history.db")
+
+
+def domain_of(url):
+    """Bare domain from a URL (lowercased, no www), or '' for non-web URLs."""
+    try:
+        p = urlparse(url)
+    except Exception:
+        return ""
+    if p.scheme not in ("http", "https"):
+        return ""
+    host = (p.hostname or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+def iter_history_sources(home):
+    """
+    Yield (browser_label, kind, db_path) for a user's home directory.
+    kind is 'firefox' (places.sqlite) or 'chromium' (History).
+    Covers apt, snap and flatpak install locations.
+    """
+    ff_bases = [
+        f"{home}/.mozilla/firefox",
+        f"{home}/snap/firefox/common/.mozilla/firefox",
+        f"{home}/.var/app/org.mozilla.firefox/.mozilla/firefox",
+    ]
+    for base in ff_bases:
+        for db in glob.glob(f"{base}/*/places.sqlite"):
+            yield ("firefox", "firefox", db)
+
+    chromium = {
+        "chrome": [f"{home}/.config/google-chrome"],
+        "chromium": [
+            f"{home}/.config/chromium",
+            f"{home}/snap/chromium/common/chromium",
+            f"{home}/.var/app/org.chromium.Chromium/config/chromium",
+        ],
+        "brave": [
+            f"{home}/.config/BraveSoftware/Brave-Browser",
+            f"{home}/.var/app/com.brave.Browser/config/BraveSoftware/Brave-Browser",
+        ],
+    }
+    for label, bases in chromium.items():
+        for base in bases:
+            for db in glob.glob(f"{base}/*/History"):
+                yield (label, "chromium", db)
+
+
+def _read_browser_history(kind, db_path, since_native):
+    """
+    Read visits newer than `since_native` (the browser's own time units).
+    Returns (rows, max_native) where rows = [(epoch_seconds, url, title)].
+    Copies the DB (and WAL/SHM) first so we can read it while the browser runs.
+    """
+    rows = []
+    max_native = since_native
+    tmpdir = tempfile.mkdtemp(prefix="appblocker-hist-")
+    try:
+        copy = os.path.join(tmpdir, "db")
+        shutil.copyfile(db_path, copy)
+        for suffix in ("-wal", "-shm"):
+            if os.path.exists(db_path + suffix):
+                try:
+                    shutil.copyfile(db_path + suffix, copy + suffix)
+                except Exception:
+                    pass
+        conn = sqlite3.connect(copy)
+        try:
+            cur = conn.cursor()
+            if kind == "firefox":
+                cur.execute(
+                    "SELECT v.visit_date, p.url, p.title "
+                    "FROM moz_historyvisits v JOIN moz_places p ON p.id = v.place "
+                    "WHERE v.visit_date > ? ORDER BY v.visit_date", (since_native,))
+                for visit_date, url, title in cur.fetchall():
+                    if visit_date is None:
+                        continue
+                    max_native = max(max_native, visit_date)
+                    rows.append((visit_date / 1_000_000.0, url, title or ""))
+            else:  # chromium family
+                cur.execute(
+                    "SELECT v.visit_time, u.url, u.title "
+                    "FROM visits v JOIN urls u ON u.id = v.url "
+                    "WHERE v.visit_time > ? ORDER BY v.visit_time", (since_native,))
+                for visit_time, url, title in cur.fetchall():
+                    if visit_time is None:
+                        continue
+                    max_native = max(max_native, visit_time)
+                    epoch = visit_time / 1_000_000.0 - CHROME_EPOCH_OFFSET
+                    rows.append((epoch, url, title or ""))
+        finally:
+            conn.close()
+    except Exception as exc:
+        sys.stderr.write(f"[monitor] read {db_path}: {exc}\n")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    return rows, max_native
+
+
+class HistoryStore:
+    """SQLite-backed log of website visits, queried by the GUI viewer."""
+
+    def __init__(self, path=None):
+        self.path = path or history_db_path()
+        ensure_app_dir()
+        self._init()
+
+    def _connect(self):
+        return sqlite3.connect(self.path)
+
+    def _init(self):
+        conn = self._connect()
+        try:
+            conn.executescript(
+                "CREATE TABLE IF NOT EXISTS visits ("
+                " username TEXT, domain TEXT, url TEXT, title TEXT, ts INTEGER);"
+                "CREATE INDEX IF NOT EXISTS i_visits_user_ts ON visits(username, ts);"
+                "CREATE INDEX IF NOT EXISTS i_visits_domain ON visits(domain);"
+                "CREATE TABLE IF NOT EXISTS cursors ("
+                " source TEXT PRIMARY KEY, last INTEGER);")
+            conn.commit()
+        finally:
+            conn.close()
+        if SYSTEM_MODE:
+            try:
+                os.chmod(self.path, 0o600)
+            except OSError:
+                pass
+
+    def get_cursor(self, source):
+        conn = self._connect()
+        try:
+            r = conn.execute("SELECT last FROM cursors WHERE source=?",
+                             (source,)).fetchone()
+            return r[0] if r else 0
+        finally:
+            conn.close()
+
+    def add_visits(self, username, rows, source, last_native):
+        """rows = [(epoch, url, title)]. Stores web visits, updates the cursor."""
+        conn = self._connect()
+        try:
+            data = []
+            for epoch, url, title in rows:
+                dom = domain_of(url)
+                if dom:
+                    data.append((username, dom, url, title, int(epoch)))
+            if data:
+                conn.executemany(
+                    "INSERT INTO visits(username,domain,url,title,ts) "
+                    "VALUES (?,?,?,?,?)", data)
+            conn.execute(
+                "INSERT INTO cursors(source,last) VALUES(?,?) "
+                "ON CONFLICT(source) DO UPDATE SET last=excluded.last",
+                (source, int(last_native)))
+            conn.commit()
+            return len(data)
+        finally:
+            conn.close()
+
+    def users(self):
+        conn = self._connect()
+        try:
+            return [r[0] for r in conn.execute(
+                "SELECT DISTINCT username FROM visits ORDER BY username")]
+        finally:
+            conn.close()
+
+    def query(self, username=None, domain_like=None, day=None, limit=2000):
+        """Return visit rows (username, domain, url, ts) matching filters."""
+        sql = "SELECT username, domain, url, ts FROM visits WHERE 1=1"
+        args = []
+        if username and username != "All users":
+            sql += " AND username=?"
+            args.append(username)
+        if domain_like:
+            sql += " AND domain LIKE ?"
+            args.append(f"%{domain_like.lower()}%")
+        if day:  # 'YYYY-MM-DD' local
+            start = int(time.mktime(time.strptime(day, "%Y-%m-%d")))
+            sql += " AND ts >= ? AND ts < ?"
+            args += [start, start + 86400]
+        sql += " ORDER BY ts DESC LIMIT ?"
+        args.append(limit)
+        conn = self._connect()
+        try:
+            return conn.execute(sql, args).fetchall()
+        finally:
+            conn.close()
+
+    def site_durations(self, username=None, day=None):
+        """
+        Approximate time-on-site per domain: sum the gaps between a user's
+        consecutive visits, capping each gap at VISIT_IDLE_CAP. Returns a list
+        of (domain, visit_count, approx_seconds) sorted by time desc.
+        """
+        sql = "SELECT username, domain, ts FROM visits WHERE 1=1"
+        args = []
+        if username and username != "All users":
+            sql += " AND username=?"
+            args.append(username)
+        if day:
+            start = int(time.mktime(time.strptime(day, "%Y-%m-%d")))
+            sql += " AND ts >= ? AND ts < ?"
+            args += [start, start + 86400]
+        sql += " ORDER BY username, ts"
+        conn = self._connect()
+        try:
+            recs = conn.execute(sql, args).fetchall()
+        finally:
+            conn.close()
+        seconds, counts = {}, {}
+        for i, (user, dom, ts) in enumerate(recs):
+            counts[dom] = counts.get(dom, 0) + 1
+            dur = 0
+            if i + 1 < len(recs) and recs[i + 1][0] == user:
+                dur = min(max(0, recs[i + 1][2] - ts), VISIT_IDLE_CAP)
+            seconds[dom] = seconds.get(dom, 0) + dur
+        out = [(d, counts[d], seconds.get(d, 0)) for d in counts]
+        out.sort(key=lambda r: r[2], reverse=True)
+        return out
+
+
+def send_email(cfg, subject, body):
+    """Send an email using the SMTP config dict. Raises on failure."""
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = cfg.get("from") or cfg.get("username", "")
+    msg["To"] = cfg.get("to", "")
+    msg.set_content(body)
+    host = cfg.get("host", "")
+    port = int(cfg.get("port") or 587)
+    timeout = 20
+    if int(cfg.get("port") or 587) == 465:
+        ctx = ssl.create_default_context()
+        with smtplib.SMTP_SSL(host, port, timeout=timeout, context=ctx) as s:
+            if cfg.get("username"):
+                s.login(cfg["username"], cfg.get("password", ""))
+            s.send_message(msg)
+    else:
+        with smtplib.SMTP(host, port, timeout=timeout) as s:
+            s.ehlo()
+            try:
+                s.starttls(context=ssl.create_default_context())
+                s.ehlo()
+            except Exception:
+                pass
+            if cfg.get("username"):
+                s.login(cfg["username"], cfg.get("password", ""))
+            s.send_message(msg)
+
+
+def import_all_history(state, store, on_alert=None, alert_state=None):
+    """
+    Import new visits for every human user into `store`. If monitoring is on,
+    invoke on_alert(username, domain, ts) for visits to watched domains
+    (debounced via alert_state dict). Returns number of visits imported.
+    """
+    with state.lock:
+        mon = dict(state.monitor)
+    watch = {normalize_domain(d) for d in mon.get("watch", []) if d}
+    total = 0
+    for username, _uid in list_human_users():
+        try:
+            home = pwd.getpwnam(username).pw_dir
+        except KeyError:
+            continue
+        if not os.path.isdir(home):
+            continue
+        for label, kind, db in iter_history_sources(home):
+            source = f"{username}|{db}"
+            since = store.get_cursor(source)
+            rows, last_native = _read_browser_history(kind, db, since)
+            if not rows:
+                continue
+            total += store.add_visits(username, rows, source, last_native)
+            if on_alert and watch:
+                for epoch, url, _title in rows:
+                    dom = domain_of(url)
+                    if dom and (dom in watch or any(
+                            dom == w or dom.endswith("." + w) for w in watch)):
+                        key = (username, dom)
+                        now = time.time()
+                        if alert_state is None or \
+                                now - alert_state.get(key, 0) > ALERT_DEBOUNCE:
+                            if alert_state is not None:
+                                alert_state[key] = now
+                            on_alert(username, dom, epoch)
+    return total
+
+
+class HistoryMonitor(threading.Thread):
+    """Daemon thread: periodically import browser history and send alerts."""
+
+    def __init__(self, state):
+        super().__init__(daemon=True)
+        self.state = state
+        self._stop = threading.Event()
+        self._alert_state = {}
+
+    def stop(self):
+        self._stop.set()
+
+    def run(self):
+        store = HistoryStore()
+        while not self._stop.is_set():
+            try:
+                self.state.reload_if_changed()
+                with self.state.lock:
+                    mon = dict(self.state.monitor)
+                if mon.get("enabled"):
+                    import_all_history(self.state, store,
+                                       on_alert=self._alert,
+                                       alert_state=self._alert_state)
+            except Exception as exc:
+                sys.stderr.write(f"[monitor] sweep error: {exc}\n")
+            self._stop.wait(MONITOR_HISTORY_INTERVAL)
+
+    def _alert(self, username, domain, ts):
+        with self.state.lock:
+            cfg = dict(self.state.monitor.get("email") or {})
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+        msg = (f"AppBlocker alert\n\nUser '{username}' visited a watched site:\n"
+               f"  {domain}\n  at {when}\n")
+        sys.stderr.write(f"[monitor] ALERT: {username} -> {domain}\n")
+        if cfg.get("enabled") and cfg.get("host") and cfg.get("to"):
+            try:
+                send_email(cfg, f"[AppBlocker] {username} visited {domain}", msg)
+            except Exception as exc:
+                sys.stderr.write(f"[monitor] email failed: {exc}\n")
+
+
+# --------------------------------------------------------------------------- #
 # Process monitor — kills blocked apps in the background.
 # --------------------------------------------------------------------------- #
 class ProcessMonitor(threading.Thread):
@@ -636,8 +991,30 @@ class AppState:
         self.apps = []
         self.rules = []   # auto-block trigger rules (see _normalize_rules)
         self.websites = []  # blocked website domains (machine-wide)
+        self.monitor = self._default_monitor()  # website-visit monitoring config
         self._mtime = None
         self.load()
+
+    @staticmethod
+    def _default_monitor():
+        return {
+            "enabled": False,
+            "watch": [],            # domains that trigger an alert
+            "email": {"enabled": False, "host": "", "port": 587,
+                      "username": "", "password": "", "from": "", "to": ""},
+        }
+
+    def _normalize_monitor(self, value):
+        mon = self._default_monitor()
+        if isinstance(value, dict):
+            mon["enabled"] = bool(value.get("enabled"))
+            mon["watch"] = [normalize_domain(d) for d in value.get("watch", [])
+                            if normalize_domain(d)]
+            email = value.get("email") or {}
+            if isinstance(email, dict):
+                mon["email"].update({k: email.get(k, mon["email"][k])
+                                     for k in mon["email"]})
+        return mon
 
     # -- persistence -------------------------------------------------------- #
     @staticmethod
@@ -706,11 +1083,13 @@ class AppState:
             self.apps = self._normalize(data["apps"])
             self.rules = self._normalize_rules(data.get("rules"))
             self.websites = self._normalize_websites(data.get("websites"))
+            self.monitor = self._normalize_monitor(data.get("monitor"))
             self._mtime = self._file_mtime()
         else:
             self.apps = self._default_apps()
             self.rules = []
             self.websites = []
+            self.monitor = self._default_monitor()
             self.save()
 
     def reload_if_changed(self):
@@ -728,6 +1107,7 @@ class AppState:
                 self.apps = self._normalize(data["apps"])
                 self.rules = self._normalize_rules(data.get("rules"))
                 self.websites = self._normalize_websites(data.get("websites"))
+                self.monitor = self._normalize_monitor(data.get("monitor"))
                 self._mtime = mtime
             return True
         return False
@@ -738,7 +1118,8 @@ class AppState:
 
     def save_locked(self):
         save_json(BLOCKED_FILE, {"apps": self.apps, "rules": self.rules,
-                                 "websites": self.websites})
+                                 "websites": self.websites,
+                                 "monitor": self.monitor})
         self._mtime = self._file_mtime()
 
     @staticmethod
@@ -865,6 +1246,13 @@ class AppState:
             self.websites = self._normalize_websites(domains)
             self.save_locked()
             return list(self.websites)
+
+    # -- monitoring --------------------------------------------------------- #
+    def set_monitor(self, monitor):
+        with self.lock:
+            self.monitor = self._normalize_monitor(monitor)
+            self.save_locked()
+            return dict(self.monitor)
 
 
 # --------------------------------------------------------------------------- #
@@ -1021,6 +1409,11 @@ class AppBlockerUI:
                       bg="#16a085", fg="white", activebackground="#0e6655",
                       font=("Helvetica", 11), relief="flat",
                       padx=12, pady=8, cursor="hand2").pack(side="right")
+            tk.Button(bar, text="📊 Activity",
+                      command=self.activity_dialog,
+                      bg="#2c3e50", fg="white", activebackground="#1b2631",
+                      font=("Helvetica", 11), relief="flat",
+                      padx=12, pady=8, cursor="hand2").pack(side="right", padx=8)
 
     def _build_list(self):
         container = tk.Frame(self.root, bg=COLOR_BG)
@@ -1585,6 +1978,190 @@ class AppBlockerUI:
         tk.Button(bar, text="Cancel", command=win.destroy, relief="flat",
                   padx=12, pady=6, cursor="hand2").pack(side="right", padx=8)
 
+    # -- website monitoring UI --------------------------------------------- #
+    def activity_dialog(self):
+        store = HistoryStore()
+        win = tk.Toplevel(self.root)
+        win.title("Website Activity")
+        win.configure(bg=COLOR_BG)
+        win.geometry("760x600")
+        win.transient(self.root)
+
+        # Filters row
+        top = tk.Frame(win, bg=COLOR_BG)
+        top.pack(fill="x", padx=12, pady=(12, 4))
+        tk.Label(top, text="User:", bg=COLOR_BG).pack(side="left")
+        users = ["All users"] + store.users()
+        user_var = tk.StringVar(value="All users")
+        ttk.Combobox(top, textvariable=user_var, values=users, width=14,
+                     state="readonly").pack(side="left", padx=(2, 10))
+        tk.Label(top, text="Day (YYYY-MM-DD):", bg=COLOR_BG).pack(side="left")
+        day_var = tk.StringVar(value=time.strftime("%Y-%m-%d"))
+        tk.Entry(top, textvariable=day_var, width=12).pack(side="left", padx=2)
+        tk.Label(top, text="Site:", bg=COLOR_BG).pack(side="left", padx=(10, 0))
+        site_var = tk.StringVar()
+        tk.Entry(top, textvariable=site_var, width=16).pack(side="left", padx=2)
+
+        # Stats (top sites by approx time) + detailed visit list
+        mid = tk.Frame(win, bg=COLOR_BG)
+        mid.pack(fill="both", expand=True, padx=12, pady=6)
+
+        tk.Label(mid, text="Time per site (approx.)", bg=COLOR_BG,
+                 fg=COLOR_HEADER, font=("Helvetica", 10, "bold")).pack(
+                     anchor="w")
+        stats = ttk.Treeview(mid, columns=("site", "visits", "time"),
+                             show="headings", height=7)
+        for c, t, w in (("site", "Site", 320), ("visits", "Visits", 80),
+                        ("time", "Approx. time", 120)):
+            stats.heading(c, text=t)
+            stats.column(c, width=w, anchor="w")
+        stats.pack(fill="x")
+
+        tk.Label(mid, text="Visits (most recent first)", bg=COLOR_BG,
+                 fg=COLOR_HEADER, font=("Helvetica", 10, "bold")).pack(
+                     anchor="w", pady=(8, 0))
+        cols = ("when", "user", "site")
+        tree = ttk.Treeview(mid, columns=cols, show="headings")
+        for c, t, w in (("when", "When", 150), ("user", "User", 110),
+                        ("site", "Site", 420)):
+            tree.heading(c, text=t)
+            tree.column(c, width=w, anchor="w")
+        sb = ttk.Scrollbar(mid, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=sb.set)
+        tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+
+        def fmt_dur(sec):
+            m = sec // 60
+            if m >= 60:
+                return f"{m // 60}h {m % 60}m"
+            return f"{m}m" if m else "<1m"
+
+        def refresh():
+            day = day_var.get().strip() or None
+            user = user_var.get()
+            try:
+                rows = store.query(username=user, domain_like=site_var.get().strip(),
+                                   day=day)
+                durs = store.site_durations(username=user, day=day)
+            except Exception as exc:
+                messagebox.showerror("Query error", str(exc), parent=win)
+                return
+            stats.delete(*stats.get_children())
+            for dom, cnt, sec in durs[:30]:
+                stats.insert("", "end", values=(dom, cnt, fmt_dur(sec)))
+            tree.delete(*tree.get_children())
+            for username, domain, url, ts in rows:
+                when = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+                tree.insert("", "end", values=(when, username, url[:200]))
+
+        for v in (user_var, day_var, site_var):
+            v.trace_add("write", lambda *_: refresh())
+
+        bar = tk.Frame(win, bg=COLOR_BG)
+        bar.pack(fill="x", padx=12, pady=10)
+        tk.Button(bar, text="🔔 Alerts & Email…", command=self.monitor_settings_dialog,
+                  bg=COLOR_ACCENT, fg="white", relief="flat", padx=12, pady=6,
+                  cursor="hand2").pack(side="left")
+        tk.Button(bar, text="Refresh now", command=lambda: (
+            self._import_history_now(), refresh()), relief="flat",
+            padx=12, pady=6, cursor="hand2").pack(side="left", padx=8)
+        tk.Button(bar, text="Close", command=win.destroy, relief="flat",
+                  padx=12, pady=6, cursor="hand2").pack(side="right")
+        refresh()
+
+    def _import_history_now(self):
+        try:
+            import_all_history(self.state, HistoryStore())
+        except Exception as exc:
+            messagebox.showerror("Import error", str(exc), parent=self.root)
+
+    def monitor_settings_dialog(self):
+        with self.state.lock:
+            mon = dict(self.state.monitor)
+            email = dict(mon.get("email") or {})
+        win = tk.Toplevel(self.root)
+        win.title("Monitoring — Alerts & Email")
+        win.configure(bg=COLOR_BG)
+        win.geometry("500x600")
+        win.transient(self.root)
+        win.grab_set()
+
+        enabled = tk.BooleanVar(value=mon.get("enabled", False))
+        tk.Checkbutton(win, text="Enable website-visit monitoring & alerts",
+                       variable=enabled, bg=COLOR_BG,
+                       font=("Helvetica", 11, "bold")).pack(
+                           anchor="w", padx=16, pady=(14, 4))
+
+        tk.Label(win, text="Alert me when these sites are visited "
+                 "(one per line):", bg=COLOR_BG, fg=COLOR_HEADER).pack(
+                     anchor="w", padx=16)
+        watch = tk.Text(win, height=5, width=46, font=("monospace", 11))
+        watch.pack(fill="x", padx=16)
+        watch.insert("1.0", "\n".join(mon.get("watch", [])))
+
+        em_on = tk.BooleanVar(value=email.get("enabled", False))
+        tk.Checkbutton(win, text="Send email alerts (SMTP)", variable=em_on,
+                       bg=COLOR_BG, font=("Helvetica", 11, "bold")).pack(
+                           anchor="w", padx=16, pady=(10, 2))
+        form = tk.Frame(win, bg=COLOR_BG)
+        form.pack(fill="x", padx=16)
+        fields = [("SMTP server", "host"), ("Port", "port"),
+                  ("Username", "username"), ("Password", "password"),
+                  ("From address", "from"), ("Send alerts to", "to")]
+        vars_ = {}
+        for i, (label, key) in enumerate(fields):
+            tk.Label(form, text=label + ":", bg=COLOR_BG).grid(
+                row=i, column=0, sticky="w", pady=2)
+            v = tk.StringVar(value=str(email.get(key, "") or ""))
+            show = "*" if key == "password" else None
+            tk.Entry(form, textvariable=v, width=34, show=show).grid(
+                row=i, column=1, sticky="we", pady=2)
+            vars_[key] = v
+        form.columnconfigure(1, weight=1)
+        tk.Label(win, text="Tip: for Gmail use smtp.gmail.com, port 587, and an "
+                 "app password (not your normal password).", bg=COLOR_BG,
+                 fg="#7f8c8d", wraplength=460, justify="left").pack(
+                     padx=16, pady=(4, 0))
+
+        def collect():
+            mon["enabled"] = enabled.get()
+            mon["watch"] = [ln for ln in watch.get("1.0", tk.END).splitlines()
+                            if ln.strip()]
+            em = {"enabled": em_on.get()}
+            for key, v in vars_.items():
+                em[key] = v.get().strip()
+            mon["email"] = em
+            return mon
+
+        def save():
+            self.state.set_monitor(collect())
+            messagebox.showinfo("Saved", "Monitoring settings saved.", parent=win)
+            win.destroy()
+
+        def test():
+            self.state.set_monitor(collect())
+            with self.state.lock:
+                cfg = dict(self.state.monitor.get("email") or {})
+            try:
+                send_email(cfg, "[AppBlocker] Test email",
+                           "This is a test from AppBlocker. Email alerts work.")
+                messagebox.showinfo("Sent", f"Test email sent to {cfg.get('to')}.",
+                                    parent=win)
+            except Exception as exc:
+                messagebox.showerror("Email failed", str(exc), parent=win)
+
+        bar = tk.Frame(win, bg=COLOR_BG)
+        bar.pack(side="bottom", fill="x", padx=16, pady=14)
+        tk.Button(bar, text="Save", command=save, bg=COLOR_ACTIVE, fg="white",
+                  relief="flat", padx=16, pady=6, cursor="hand2").pack(
+                      side="right")
+        tk.Button(bar, text="Send test email", command=test, bg=COLOR_ACCENT,
+                  fg="white", relief="flat", padx=12, pady=6,
+                  cursor="hand2").pack(side="right", padx=8)
+        tk.Button(bar, text="Cancel", command=win.destroy, relief="flat",
+                  padx=12, pady=6, cursor="hand2").pack(side="left")
+
     # -- blocked websites UI ------------------------------------------------ #
     def websites_dialog(self):
         win = tk.Toplevel(self.root)
@@ -1987,11 +2564,13 @@ def run_daemon():
     ensure_app_dir()
     state = AppState()
     monitor = ProcessMonitor(state)
+    history = HistoryMonitor(state)  # browser-history logging + email alerts
 
     # Run the sweep loop in the foreground so systemd supervises this process
     # directly (Type=simple). Translate SIGTERM into a clean stop.
     def _handle_term(signum, frame):
         monitor.stop()
+        history.stop()
 
     signal.signal(signal.SIGTERM, _handle_term)
     signal.signal(signal.SIGINT, _handle_term)
@@ -2001,9 +2580,11 @@ def run_daemon():
         f"blocklist={BLOCKED_FILE})\n")
     sys.stderr.flush()
 
+    history.start()  # background thread
     # ProcessMonitor.run() is the same sweep loop the GUI uses in a thread; we
     # just call it inline here so the daemon has no extra moving parts.
     monitor.run()
+    history.stop()
     sys.stderr.write("[daemon] stopped\n")
 
 
@@ -2065,7 +2646,35 @@ def main():
     parser.add_argument(
         "--web-status", action="store_true",
         help="print the currently blocked websites and exit")
+    parser.add_argument(
+        "--email-test", action="store_true",
+        help="send a test email using the saved monitoring settings")
+    parser.add_argument(
+        "--import-history", action="store_true",
+        help="import browser history once now (normally the daemon does this)")
     args = parser.parse_args()
+
+    if args.email_test:
+        configure_paths(system_mode=True)
+        st = AppState()
+        cfg = st.monitor.get("email") or {}
+        if not cfg.get("host") or not cfg.get("to"):
+            print("No email settings saved. Configure them in the app first.")
+            return
+        try:
+            send_email(cfg, "[AppBlocker] Test email",
+                       "This is a test from AppBlocker. Email alerts work.")
+            print(f"Test email sent to {cfg.get('to')}.")
+        except Exception as exc:
+            print(f"Failed to send test email: {exc}")
+        return
+
+    if args.import_history:
+        configure_paths(system_mode=True)
+        st = AppState()
+        n = import_all_history(st, HistoryStore())
+        print(f"Imported {n} new visit(s).")
+        return
 
     if args.web_clear:
         changed = sync_blocked_websites([])
