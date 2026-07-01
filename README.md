@@ -150,10 +150,12 @@ Notes and limits:
 
 ## Website-visit monitoring & alerts
 
-Open **📊 Activity** (admin window). AppBlocker reads each user's **browser
-history** (Firefox / Chrome / Chromium / Brave) and keeps a per-user log you can
-filter by **user, day, and site**, with an approximate **time-per-site** summary
-— so you skim a table, not a wall of text.
+Open **📊 Activity** (admin window). Browsing history is **recorded
+automatically** whenever the machine is on — the daemon reads each user's
+**browser history** (Firefox / Chrome / Chromium / Brave). The window pulls the
+latest data as soon as you open it, and you can filter by **user, date range,
+and site**, with an approximate **time-per-site** summary — so you skim a table,
+not a wall of text. (No master switch to remember; recording is always on.)
 
 Click **🔔 Alerts & Email** to:
 
