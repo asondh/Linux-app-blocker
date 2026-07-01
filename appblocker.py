@@ -46,7 +46,7 @@ import tempfile
 import threading
 import subprocess
 from email.message import EmailMessage
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 # tkinter is only needed for the GUI. The root daemon (--daemon) runs headless,
 # possibly on a machine without python3-tk, so import it lazily/guarded.
@@ -430,6 +430,100 @@ def sync_blocked_websites(domains):
 
 
 # --------------------------------------------------------------------------- #
+# Browser lockdown — disable private/incognito browsing and (Chromium) block
+# history deletion, via each browser's managed-policy mechanism. Root only.
+# --------------------------------------------------------------------------- #
+POLICY_BASE = "/"                    # overridable in tests
+POLICY_MARKER = "appblocker"
+CHROMIUM_POLICY_DIRS = {
+    "chrome": "etc/opt/chrome/policies/managed",
+    "chromium": "etc/chromium/policies/managed",
+    "brave": "etc/brave/policies/managed",
+}
+FIREFOX_POLICY_REL = "etc/firefox/policies"
+_BROWSER_CMDS = {
+    "chrome": ["google-chrome", "google-chrome-stable", "chrome"],
+    "chromium": ["chromium", "chromium-browser"],
+    "brave": ["brave-browser", "brave", "brave-browser-stable"],
+    "firefox": ["firefox", "firefox-esr"],
+}
+
+
+def _browser_installed(key):
+    return any(which(n) for n in _BROWSER_CMDS.get(key, []))
+
+
+def _write_json_file(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(data, fh, indent=2)
+    os.replace(tmp, path)
+
+
+def _file_is_ours(path):
+    try:
+        with open(path) as fh:
+            return json.load(fh).get("_managed_by") == POLICY_MARKER
+    except Exception:
+        return False
+
+
+def apply_browser_lockdown(enabled):
+    """
+    Enable/disable the incognito + history-deletion lockdown by writing (or
+    removing) managed-policy files for each installed browser. Only files we
+    created (marked) are ever removed or overwritten. Returns changed paths.
+    """
+    changed = []
+    chromium_policy = {
+        "IncognitoModeAvailability": 1,      # 1 = incognito disabled
+        "AllowDeletingBrowserHistory": False,
+        "_managed_by": POLICY_MARKER,
+    }
+    for key, rel in CHROMIUM_POLICY_DIRS.items():
+        path = os.path.join(POLICY_BASE, rel, "appblocker.json")
+        want = enabled and _browser_installed(key)
+        try:
+            if want:
+                if not (os.path.exists(path) and _file_is_ours(path) and
+                        json.load(open(path)) == chromium_policy):
+                    _write_json_file(path, chromium_policy)
+                    changed.append(path)
+            elif os.path.exists(path) and _file_is_ours(path):
+                os.remove(path)
+                changed.append(path)
+        except Exception as exc:
+            sys.stderr.write(f"[lockdown] {path}: {exc}\n")
+
+    # Firefox: single policies.json. Only manage it if it's absent or ours, so
+    # we never clobber a policy file an admin created for other reasons.
+    ff_path = os.path.join(POLICY_BASE, FIREFOX_POLICY_REL, "policies.json")
+    ff_policy = {"policies": {"DisablePrivateBrowsing": True},
+                 "_managed_by": POLICY_MARKER}
+    try:
+        want = enabled and _browser_installed("firefox")
+        exists = os.path.exists(ff_path)
+        if want:
+            if exists and _file_is_ours(ff_path) and \
+                    json.load(open(ff_path)) == ff_policy:
+                pass  # already correct — leave it (keeps this idempotent)
+            elif not exists or _file_is_ours(ff_path):
+                _write_json_file(ff_path, ff_policy)
+                changed.append(ff_path)
+            else:
+                sys.stderr.write(
+                    "[lockdown] firefox policies.json exists and is not ours; "
+                    "leaving it alone.\n")
+        elif exists and _file_is_ours(ff_path):
+            os.remove(ff_path)
+            changed.append(ff_path)
+    except Exception as exc:
+        sys.stderr.write(f"[lockdown] {ff_path}: {exc}\n")
+    return changed
+
+
+# --------------------------------------------------------------------------- #
 # Website-visit monitoring.
 # Reads each user's browser history (Firefox / Chrome / Chromium / Brave),
 # records visits into a small SQLite log, supports per-user/site/day queries
@@ -457,6 +551,28 @@ def domain_of(url):
     if host.startswith("www."):
         host = host[4:]
     return host
+
+
+# Query-string parameters that carry a user's search terms on common sites
+# (Google/DuckDuckGo=q, YouTube=search_query, Yahoo=p, Amazon=k, eBay=_nkw, ...).
+SEARCH_PARAMS = ("q", "search_query", "query", "search", "p", "k", "_nkw",
+                 "wd", "text")
+
+
+def extract_search_query(url):
+    """Return the search terms embedded in a URL, or '' if it isn't a search."""
+    try:
+        p = urlparse(url)
+    except Exception:
+        return ""
+    if p.scheme not in ("http", "https") or not p.query:
+        return ""
+    qs = parse_qs(p.query)
+    for key in SEARCH_PARAMS:
+        vals = qs.get(key)
+        if vals and vals[0].strip():
+            return vals[0].strip()
+    return ""
 
 
 def iter_history_sources(home):
@@ -612,7 +728,18 @@ class HistoryStore:
         finally:
             conn.close()
 
-    def query(self, username=None, domain_like=None, day=None, limit=2000):
+    @staticmethod
+    def _range(start_day, end_day):
+        """Convert (YYYY-MM-DD, YYYY-MM-DD) to an inclusive epoch [lo, hi)."""
+        lo = hi = None
+        if start_day:
+            lo = int(time.mktime(time.strptime(start_day, "%Y-%m-%d")))
+        if end_day:
+            hi = int(time.mktime(time.strptime(end_day, "%Y-%m-%d"))) + 86400
+        return lo, hi
+
+    def query(self, username=None, domain_like=None, start_day=None,
+              end_day=None, limit=5000):
         """Return visit rows (username, domain, url, ts) matching filters."""
         sql = "SELECT username, domain, url, ts FROM visits WHERE 1=1"
         args = []
@@ -622,10 +749,13 @@ class HistoryStore:
         if domain_like:
             sql += " AND domain LIKE ?"
             args.append(f"%{domain_like.lower()}%")
-        if day:  # 'YYYY-MM-DD' local
-            start = int(time.mktime(time.strptime(day, "%Y-%m-%d")))
-            sql += " AND ts >= ? AND ts < ?"
-            args += [start, start + 86400]
+        lo, hi = self._range(start_day, end_day)
+        if lo is not None:
+            sql += " AND ts >= ?"
+            args.append(lo)
+        if hi is not None:
+            sql += " AND ts < ?"
+            args.append(hi)
         sql += " ORDER BY ts DESC LIMIT ?"
         args.append(limit)
         conn = self._connect()
@@ -634,7 +764,7 @@ class HistoryStore:
         finally:
             conn.close()
 
-    def site_durations(self, username=None, day=None):
+    def site_durations(self, username=None, start_day=None, end_day=None):
         """
         Approximate time-on-site per domain: sum the gaps between a user's
         consecutive visits, capping each gap at VISIT_IDLE_CAP. Returns a list
@@ -645,10 +775,13 @@ class HistoryStore:
         if username and username != "All users":
             sql += " AND username=?"
             args.append(username)
-        if day:
-            start = int(time.mktime(time.strptime(day, "%Y-%m-%d")))
-            sql += " AND ts >= ? AND ts < ?"
-            args += [start, start + 86400]
+        lo, hi = self._range(start_day, end_day)
+        if lo is not None:
+            sql += " AND ts >= ?"
+            args.append(lo)
+        if hi is not None:
+            sql += " AND ts < ?"
+            args.append(hi)
         sql += " ORDER BY username, ts"
         conn = self._connect()
         try:
@@ -667,12 +800,24 @@ class HistoryStore:
         return out
 
 
+def _split_recipients(text):
+    """Split a recipients string on comma/semicolon/whitespace."""
+    out = []
+    for part in (text or "").replace(";", ",").replace(" ", ",").split(","):
+        part = part.strip()
+        if part and part not in out:
+            out.append(part)
+    return out
+
+
 def send_email(cfg, subject, body):
     """Send an email using the SMTP config dict. Raises on failure."""
+    # Allow several recipients separated by comma, semicolon or space.
+    recipients = _split_recipients(cfg.get("to", ""))
     msg = EmailMessage()
     msg["Subject"] = subject
     msg["From"] = cfg.get("from") or cfg.get("username", "")
-    msg["To"] = cfg.get("to", "")
+    msg["To"] = ", ".join(recipients)
     msg.set_content(body)
     host = cfg.get("host", "")
     port = int(cfg.get("port") or 587)
@@ -699,13 +844,27 @@ def send_email(cfg, subject, body):
 def import_all_history(state, store, on_alert=None, alert_state=None):
     """
     Import new visits for every human user into `store`. If monitoring is on,
-    invoke on_alert(username, domain, ts) for visits to watched domains
-    (debounced via alert_state dict). Returns number of visits imported.
+    invoke on_alert(username, kind, detail, ts) for:
+      * kind "site"   -> visit to a watched domain (detail = domain)
+      * kind "search" -> a search containing a watched keyword (detail = query)
+    Alerts are debounced via alert_state. Returns number of visits imported.
     """
     with state.lock:
         mon = dict(state.monitor)
     watch = {normalize_domain(d) for d in mon.get("watch", []) if d}
+    keywords = [k.lower() for k in mon.get("keywords", []) if k.strip()]
     total = 0
+
+    def maybe_alert(username, kind, detail, epoch):
+        if not on_alert:
+            return
+        key = (username, kind, detail)
+        now = time.time()
+        if alert_state is None or now - alert_state.get(key, 0) > ALERT_DEBOUNCE:
+            if alert_state is not None:
+                alert_state[key] = now
+            on_alert(username, kind, detail, epoch)
+
     for username, _uid in list_human_users():
         try:
             home = pwd.getpwnam(username).pw_dir
@@ -720,19 +879,31 @@ def import_all_history(state, store, on_alert=None, alert_state=None):
             if not rows:
                 continue
             total += store.add_visits(username, rows, source, last_native)
-            if on_alert and watch:
-                for epoch, url, _title in rows:
-                    dom = domain_of(url)
-                    if dom and (dom in watch or any(
-                            dom == w or dom.endswith("." + w) for w in watch)):
-                        key = (username, dom)
-                        now = time.time()
-                        if alert_state is None or \
-                                now - alert_state.get(key, 0) > ALERT_DEBOUNCE:
-                            if alert_state is not None:
-                                alert_state[key] = now
-                            on_alert(username, dom, epoch)
+            if not on_alert:
+                continue
+            for epoch, url, _title in rows:
+                dom = domain_of(url)
+                if dom and watch and (dom in watch or any(
+                        dom == w or dom.endswith("." + w) for w in watch)):
+                    maybe_alert(username, "site", dom, epoch)
+                if keywords:
+                    q = extract_search_query(url)
+                    if q and any(kw in q.lower() for kw in keywords):
+                        maybe_alert(username, "search", q, epoch)
     return total
+
+
+def _within_quiet_hours(cfg, now=None):
+    """True if the current local time is inside the email quiet-hours window."""
+    start = _parse_hhmm(cfg.get("quiet_start", ""))
+    end = _parse_hhmm(cfg.get("quiet_end", ""))
+    if start is None or end is None or start == end:
+        return False
+    lt = now or time.localtime()
+    cur = lt.tm_hour * 60 + lt.tm_min
+    if start < end:
+        return start <= cur < end
+    return cur >= start or cur < end   # overnight window (e.g. 21:00–07:00)
 
 
 class HistoryMonitor(threading.Thread):
@@ -762,16 +933,25 @@ class HistoryMonitor(threading.Thread):
                 sys.stderr.write(f"[monitor] sweep error: {exc}\n")
             self._stop.wait(MONITOR_HISTORY_INTERVAL)
 
-    def _alert(self, username, domain, ts):
+    def _alert(self, username, kind, detail, ts):
         with self.state.lock:
             cfg = dict(self.state.monitor.get("email") or {})
         when = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
-        msg = (f"AppBlocker alert\n\nUser '{username}' visited a watched site:\n"
-               f"  {domain}\n  at {when}\n")
-        sys.stderr.write(f"[monitor] ALERT: {username} -> {domain}\n")
+        if kind == "search":
+            subject = f"[AppBlocker] {username} searched for flagged terms"
+            body = (f"AppBlocker alert\n\nUser '{username}' ran a search that "
+                    f"matched your watch keywords:\n  \"{detail}\"\n  at {when}\n")
+        else:
+            subject = f"[AppBlocker] {username} visited {detail}"
+            body = (f"AppBlocker alert\n\nUser '{username}' visited a watched "
+                    f"site:\n  {detail}\n  at {when}\n")
+        sys.stderr.write(f"[monitor] ALERT ({kind}): {username} -> {detail}\n")
         if cfg.get("enabled") and cfg.get("host") and cfg.get("to"):
+            if _within_quiet_hours(cfg):
+                sys.stderr.write("[monitor] quiet hours — email suppressed\n")
+                return
             try:
-                send_email(cfg, f"[AppBlocker] {username} visited {domain}", msg)
+                send_email(cfg, subject, body)
             except Exception as exc:
                 sys.stderr.write(f"[monitor] email failed: {exc}\n")
 
@@ -880,8 +1060,11 @@ class ProcessMonitor(threading.Thread):
         if SYSTEM_MODE:
             with self.state.lock:
                 domains = set(self.state.websites)
+                lockdown_on = self.state.lockdown.get("enabled")
             domains |= dynamic_sites
             sync_blocked_websites(sorted(domains))
+            # Keep the browser incognito/history-deletion lockdown in sync too.
+            apply_browser_lockdown(lockdown_on)
 
         if (changed_timer or reloaded) and self.on_change:
             self.on_change()
@@ -992,6 +1175,7 @@ class AppState:
         self.rules = []   # auto-block trigger rules (see _normalize_rules)
         self.websites = []  # blocked website domains (machine-wide)
         self.monitor = self._default_monitor()  # website-visit monitoring config
+        self.lockdown = {"enabled": False}      # browser incognito lockdown
         self._mtime = None
         self.load()
 
@@ -1000,8 +1184,10 @@ class AppState:
         return {
             "enabled": False,
             "watch": [],            # domains that trigger an alert
+            "keywords": [],         # search terms that trigger a safety alert
             "email": {"enabled": False, "host": "", "port": 587,
-                      "username": "", "password": "", "from": "", "to": ""},
+                      "username": "", "password": "", "from": "", "to": "",
+                      "quiet_start": "", "quiet_end": ""},
         }
 
     def _normalize_monitor(self, value):
@@ -1010,6 +1196,8 @@ class AppState:
             mon["enabled"] = bool(value.get("enabled"))
             mon["watch"] = [normalize_domain(d) for d in value.get("watch", [])
                             if normalize_domain(d)]
+            mon["keywords"] = [k.strip() for k in value.get("keywords", [])
+                               if k and k.strip()]
             email = value.get("email") or {}
             if isinstance(email, dict):
                 mon["email"].update({k: email.get(k, mon["email"][k])
@@ -1084,12 +1272,15 @@ class AppState:
             self.rules = self._normalize_rules(data.get("rules"))
             self.websites = self._normalize_websites(data.get("websites"))
             self.monitor = self._normalize_monitor(data.get("monitor"))
+            self.lockdown = {"enabled": bool(
+                (data.get("lockdown") or {}).get("enabled"))}
             self._mtime = self._file_mtime()
         else:
             self.apps = self._default_apps()
             self.rules = []
             self.websites = []
             self.monitor = self._default_monitor()
+            self.lockdown = {"enabled": False}
             self.save()
 
     def reload_if_changed(self):
@@ -1108,6 +1299,8 @@ class AppState:
                 self.rules = self._normalize_rules(data.get("rules"))
                 self.websites = self._normalize_websites(data.get("websites"))
                 self.monitor = self._normalize_monitor(data.get("monitor"))
+                self.lockdown = {"enabled": bool(
+                    (data.get("lockdown") or {}).get("enabled"))}
                 self._mtime = mtime
             return True
         return False
@@ -1119,7 +1312,8 @@ class AppState:
     def save_locked(self):
         save_json(BLOCKED_FILE, {"apps": self.apps, "rules": self.rules,
                                  "websites": self.websites,
-                                 "monitor": self.monitor})
+                                 "monitor": self.monitor,
+                                 "lockdown": self.lockdown})
         self._mtime = self._file_mtime()
 
     @staticmethod
@@ -1253,6 +1447,12 @@ class AppState:
             self.monitor = self._normalize_monitor(monitor)
             self.save_locked()
             return dict(self.monitor)
+
+    def set_lockdown(self, enabled):
+        with self.lock:
+            self.lockdown = {"enabled": bool(enabled)}
+            self.save_locked()
+            return dict(self.lockdown)
 
 
 # --------------------------------------------------------------------------- #
@@ -1414,6 +1614,11 @@ class AppBlockerUI:
                       bg="#2c3e50", fg="white", activebackground="#1b2631",
                       font=("Helvetica", 11), relief="flat",
                       padx=12, pady=8, cursor="hand2").pack(side="right", padx=8)
+            tk.Button(bar, text="🔒 Lockdown",
+                      command=self.lockdown_dialog,
+                      bg="#7f8c8d", fg="white", activebackground="#616a6b",
+                      font=("Helvetica", 11), relief="flat",
+                      padx=12, pady=8, cursor="hand2").pack(side="right")
 
     def _build_list(self):
         container = tk.Frame(self.root, bg=COLOR_BG)
@@ -1979,6 +2184,49 @@ class AppBlockerUI:
                   padx=12, pady=6, cursor="hand2").pack(side="right", padx=8)
 
     # -- website monitoring UI --------------------------------------------- #
+    def lockdown_dialog(self):
+        with self.state.lock:
+            cur = self.state.lockdown.get("enabled", False)
+        win = tk.Toplevel(self.root)
+        win.title("Browser Lockdown")
+        win.configure(bg=COLOR_BG)
+        win.geometry("460x300")
+        win.transient(self.root)
+        win.grab_set()
+
+        tk.Label(win, text="🔒 Browser Lockdown", bg=COLOR_BG, fg=COLOR_HEADER,
+                 font=("Helvetica", 14, "bold")).pack(pady=(14, 6))
+        var = tk.BooleanVar(value=cur)
+        tk.Checkbutton(
+            win, variable=var, bg=COLOR_BG, anchor="w",
+            font=("Helvetica", 11),
+            text="Disable private/incognito browsing and block clearing of "
+                 "history").pack(fill="x", padx=20)
+        tk.Label(win, text="Applies to Chrome, Chromium, Brave and Firefox on "
+                 "this computer, for all users, using each browser's official "
+                 "policy system. Takes effect after the browser is restarted. "
+                 "Blocking history-deletion applies to Chrome/Chromium/Brave.\n\n"
+                 "This makes the Activity monitoring reliable — a child can't "
+                 "hide browsing with incognito or by clearing history.",
+                 bg=COLOR_BG, fg="#7f8c8d", wraplength=410,
+                 justify="left").pack(padx=20, pady=(8, 0))
+
+        def save():
+            self.state.set_lockdown(var.get())
+            apply_browser_lockdown(var.get())  # apply immediately (we are root)
+            messagebox.showinfo(
+                "Saved", "Lockdown " + ("enabled." if var.get() else "disabled.")
+                + "\nRestart open browsers for it to take effect.", parent=win)
+            win.destroy()
+
+        bar = tk.Frame(win, bg=COLOR_BG)
+        bar.pack(side="bottom", fill="x", padx=20, pady=14)
+        tk.Button(bar, text="Save", command=save, bg=COLOR_ACTIVE, fg="white",
+                  relief="flat", padx=16, pady=6, cursor="hand2").pack(
+                      side="right")
+        tk.Button(bar, text="Cancel", command=win.destroy, relief="flat",
+                  padx=12, pady=6, cursor="hand2").pack(side="right", padx=8)
+
     def activity_dialog(self):
         store = HistoryStore()
         win = tk.Toplevel(self.root)
@@ -1993,16 +2241,22 @@ class AppBlockerUI:
         tk.Label(top, text="User:", bg=COLOR_BG).pack(side="left")
         users = ["All users"] + store.users()
         user_var = tk.StringVar(value="All users")
-        ttk.Combobox(top, textvariable=user_var, values=users, width=14,
-                     state="readonly").pack(side="left", padx=(2, 10))
-        tk.Label(top, text="Day (YYYY-MM-DD):", bg=COLOR_BG).pack(side="left")
-        day_var = tk.StringVar(value=time.strftime("%Y-%m-%d"))
-        tk.Entry(top, textvariable=day_var, width=12).pack(side="left", padx=2)
-        tk.Label(top, text="Site:", bg=COLOR_BG).pack(side="left", padx=(10, 0))
+        ttk.Combobox(top, textvariable=user_var, values=users, width=12,
+                     state="readonly").pack(side="left", padx=(2, 8))
+        today = time.strftime("%Y-%m-%d")
+        tk.Label(top, text="From:", bg=COLOR_BG).pack(side="left")
+        from_var = tk.StringVar(value=today)
+        tk.Entry(top, textvariable=from_var, width=11).pack(side="left", padx=2)
+        tk.Label(top, text="To:", bg=COLOR_BG).pack(side="left")
+        to_var = tk.StringVar(value=today)
+        tk.Entry(top, textvariable=to_var, width=11).pack(side="left", padx=2)
+        tk.Label(top, text="Site:", bg=COLOR_BG).pack(side="left", padx=(8, 0))
         site_var = tk.StringVar()
-        tk.Entry(top, textvariable=site_var, width=16).pack(side="left", padx=2)
+        tk.Entry(top, textvariable=site_var, width=14).pack(side="left", padx=2)
+        tk.Label(top, text="(dates blank = all time)", bg=COLOR_BG,
+                 fg="#95a5a6", font=("Helvetica", 8)).pack(side="left", padx=6)
 
-        # Stats (top sites by approx time) + detailed visit list
+        # Stats (top sites by approx time) + searches + detailed visit list
         mid = tk.Frame(win, bg=COLOR_BG)
         mid.pack(fill="both", expand=True, padx=12, pady=6)
 
@@ -2010,12 +2264,22 @@ class AppBlockerUI:
                  fg=COLOR_HEADER, font=("Helvetica", 10, "bold")).pack(
                      anchor="w")
         stats = ttk.Treeview(mid, columns=("site", "visits", "time"),
-                             show="headings", height=7)
+                             show="headings", height=6)
         for c, t, w in (("site", "Site", 320), ("visits", "Visits", 80),
                         ("time", "Approx. time", 120)):
             stats.heading(c, text=t)
             stats.column(c, width=w, anchor="w")
         stats.pack(fill="x")
+
+        tk.Label(mid, text="Searches", bg=COLOR_BG, fg=COLOR_HEADER,
+                 font=("Helvetica", 10, "bold")).pack(anchor="w", pady=(8, 0))
+        searches = ttk.Treeview(mid, columns=("when", "user", "site", "q"),
+                                show="headings", height=5)
+        for c, t, w in (("when", "When", 130), ("user", "User", 90),
+                        ("site", "Where", 130), ("q", "Searched for", 340)):
+            searches.heading(c, text=t)
+            searches.column(c, width=w, anchor="w")
+        searches.pack(fill="x")
 
         tk.Label(mid, text="Visits (most recent first)", bg=COLOR_BG,
                  fg=COLOR_HEADER, font=("Helvetica", 10, "bold")).pack(
@@ -2023,7 +2287,7 @@ class AppBlockerUI:
         cols = ("when", "user", "site")
         tree = ttk.Treeview(mid, columns=cols, show="headings")
         for c, t, w in (("when", "When", 150), ("user", "User", 110),
-                        ("site", "Site", 420)):
+                        ("site", "Page", 420)):
             tree.heading(c, text=t)
             tree.column(c, width=w, anchor="w")
         sb = ttk.Scrollbar(mid, orient="vertical", command=tree.yview)
@@ -2038,24 +2302,32 @@ class AppBlockerUI:
             return f"{m}m" if m else "<1m"
 
         def refresh():
-            day = day_var.get().strip() or None
             user = user_var.get()
+            start = from_var.get().strip() or None
+            end = to_var.get().strip() or None
             try:
-                rows = store.query(username=user, domain_like=site_var.get().strip(),
-                                   day=day)
-                durs = store.site_durations(username=user, day=day)
+                rows = store.query(username=user,
+                                   domain_like=site_var.get().strip(),
+                                   start_day=start, end_day=end)
+                durs = store.site_durations(username=user, start_day=start,
+                                            end_day=end)
             except Exception as exc:
                 messagebox.showerror("Query error", str(exc), parent=win)
                 return
             stats.delete(*stats.get_children())
-            for dom, cnt, sec in durs[:30]:
+            for dom, cnt, sec in durs[:40]:
                 stats.insert("", "end", values=(dom, cnt, fmt_dur(sec)))
+            searches.delete(*searches.get_children())
             tree.delete(*tree.get_children())
             for username, domain, url, ts in rows:
                 when = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
                 tree.insert("", "end", values=(when, username, url[:200]))
+                q = extract_search_query(url)
+                if q:
+                    searches.insert("", "end",
+                                    values=(when, username, domain, q[:200]))
 
-        for v in (user_var, day_var, site_var):
+        for v in (user_var, from_var, to_var, site_var):
             v.trace_add("write", lambda *_: refresh())
 
         bar = tk.Frame(win, bg=COLOR_BG)
@@ -2083,7 +2355,7 @@ class AppBlockerUI:
         win = tk.Toplevel(self.root)
         win.title("Monitoring — Alerts & Email")
         win.configure(bg=COLOR_BG)
-        win.geometry("500x600")
+        win.geometry("520x760")
         win.transient(self.root)
         win.grab_set()
 
@@ -2096,9 +2368,16 @@ class AppBlockerUI:
         tk.Label(win, text="Alert me when these sites are visited "
                  "(one per line):", bg=COLOR_BG, fg=COLOR_HEADER).pack(
                      anchor="w", padx=16)
-        watch = tk.Text(win, height=5, width=46, font=("monospace", 11))
+        watch = tk.Text(win, height=4, width=46, font=("monospace", 11))
         watch.pack(fill="x", padx=16)
         watch.insert("1.0", "\n".join(mon.get("watch", [])))
+
+        tk.Label(win, text="Alert me when a search contains these words "
+                 "(one per line):", bg=COLOR_BG, fg=COLOR_HEADER).pack(
+                     anchor="w", padx=16, pady=(8, 0))
+        keywords = tk.Text(win, height=4, width=46, font=("monospace", 11))
+        keywords.pack(fill="x", padx=16)
+        keywords.insert("1.0", "\n".join(mon.get("keywords", [])))
 
         em_on = tk.BooleanVar(value=email.get("enabled", False))
         tk.Checkbutton(win, text="Send email alerts (SMTP)", variable=em_on,
@@ -2108,26 +2387,32 @@ class AppBlockerUI:
         form.pack(fill="x", padx=16)
         fields = [("SMTP server", "host"), ("Port", "port"),
                   ("Username", "username"), ("Password", "password"),
-                  ("From address", "from"), ("Send alerts to", "to")]
+                  ("From address", "from"),
+                  ("Send alerts to (comma-sep)", "to"),
+                  ("Quiet hours start (HH:MM)", "quiet_start"),
+                  ("Quiet hours end (HH:MM)", "quiet_end")]
         vars_ = {}
         for i, (label, key) in enumerate(fields):
             tk.Label(form, text=label + ":", bg=COLOR_BG).grid(
                 row=i, column=0, sticky="w", pady=2)
             v = tk.StringVar(value=str(email.get(key, "") or ""))
             show = "*" if key == "password" else None
-            tk.Entry(form, textvariable=v, width=34, show=show).grid(
+            tk.Entry(form, textvariable=v, width=32, show=show).grid(
                 row=i, column=1, sticky="we", pady=2)
             vars_[key] = v
         form.columnconfigure(1, weight=1)
-        tk.Label(win, text="Tip: for Gmail use smtp.gmail.com, port 587, and an "
-                 "app password (not your normal password).", bg=COLOR_BG,
-                 fg="#7f8c8d", wraplength=460, justify="left").pack(
-                     padx=16, pady=(4, 0))
+        tk.Label(win, text="Tip: Gmail = smtp.gmail.com, port 587, app password. "
+                 "You can send alerts to two parents by separating addresses "
+                 "with commas. Quiet hours mute emails overnight (leave blank "
+                 "for none).", bg=COLOR_BG, fg="#7f8c8d", wraplength=470,
+                 justify="left").pack(padx=16, pady=(4, 0))
 
         def collect():
             mon["enabled"] = enabled.get()
             mon["watch"] = [ln for ln in watch.get("1.0", tk.END).splitlines()
                             if ln.strip()]
+            mon["keywords"] = [ln for ln in keywords.get(
+                "1.0", tk.END).splitlines() if ln.strip()]
             em = {"enabled": em_on.get()}
             for key, v in vars_.items():
                 em[key] = v.get().strip()
@@ -2652,7 +2937,16 @@ def main():
     parser.add_argument(
         "--import-history", action="store_true",
         help="import browser history once now (normally the daemon does this)")
+    parser.add_argument(
+        "--lockdown-clear", action="store_true",
+        help="emergency: remove AppBlocker's browser incognito-lockdown policies")
     args = parser.parse_args()
+
+    if args.lockdown_clear:
+        changed = apply_browser_lockdown(False)
+        print(f"Removed {len(changed)} lockdown policy file(s)." if changed
+              else "No AppBlocker lockdown policies were present.")
+        return
 
     if args.email_test:
         configure_paths(system_mode=True)
