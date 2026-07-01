@@ -728,6 +728,36 @@ class HistoryStore:
         finally:
             conn.close()
 
+    # Alert watermark: the newest visit timestamp we've already checked for
+    # alerts. Kept separate from the per-browser import cursors so that a GUI
+    # "Refresh" (which imports but doesn't alert) can't hide visits from the
+    # alerting pass. Stored in the cursors table under a reserved key.
+    ALERT_KEY = "__alert_watermark__"
+
+    def get_alert_watermark(self):
+        return self.get_cursor(self.ALERT_KEY)
+
+    def set_alert_watermark(self, ts):
+        conn = self._connect()
+        try:
+            conn.execute(
+                "INSERT INTO cursors(source,last) VALUES(?,?) "
+                "ON CONFLICT(source) DO UPDATE SET last=excluded.last",
+                (self.ALERT_KEY, int(ts)))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def visits_since(self, ts):
+        """(username, domain, url, ts) for visits strictly newer than `ts`."""
+        conn = self._connect()
+        try:
+            return conn.execute(
+                "SELECT username, domain, url, ts FROM visits WHERE ts > ? "
+                "ORDER BY ts", (int(ts),)).fetchall()
+        finally:
+            conn.close()
+
     @staticmethod
     def _range(start_day, end_day):
         """Convert (YYYY-MM-DD, YYYY-MM-DD) to an inclusive epoch [lo, hi)."""
@@ -841,30 +871,13 @@ def send_email(cfg, subject, body):
             s.send_message(msg)
 
 
-def import_all_history(state, store, on_alert=None, alert_state=None):
+def import_all_history(state, store):
     """
-    Import new visits for every human user into `store`. If monitoring is on,
-    invoke on_alert(username, kind, detail, ts) for:
-      * kind "site"   -> visit to a watched domain (detail = domain)
-      * kind "search" -> a search containing a watched keyword (detail = query)
-    Alerts are debounced via alert_state. Returns number of visits imported.
+    Import new visits for every human user into `store` (logging only). This
+    always runs when the daemon is up so the Activity log is never empty.
+    Returns the number of visits imported.
     """
-    with state.lock:
-        mon = dict(state.monitor)
-    watch = {normalize_domain(d) for d in mon.get("watch", []) if d}
-    keywords = [k.lower() for k in mon.get("keywords", []) if k.strip()]
     total = 0
-
-    def maybe_alert(username, kind, detail, epoch):
-        if not on_alert:
-            return
-        key = (username, kind, detail)
-        now = time.time()
-        if alert_state is None or now - alert_state.get(key, 0) > ALERT_DEBOUNCE:
-            if alert_state is not None:
-                alert_state[key] = now
-            on_alert(username, kind, detail, epoch)
-
     for username, _uid in list_human_users():
         try:
             home = pwd.getpwnam(username).pw_dir
@@ -879,18 +892,55 @@ def import_all_history(state, store, on_alert=None, alert_state=None):
             if not rows:
                 continue
             total += store.add_visits(username, rows, source, last_native)
-            if not on_alert:
-                continue
-            for epoch, url, _title in rows:
-                dom = domain_of(url)
-                if dom and watch and (dom in watch or any(
-                        dom == w or dom.endswith("." + w) for w in watch)):
-                    maybe_alert(username, "site", dom, epoch)
-                if keywords:
-                    q = extract_search_query(url)
-                    if q and any(kw in q.lower() for kw in keywords):
-                        maybe_alert(username, "search", q, epoch)
     return total
+
+
+def scan_and_alert(state, store, on_alert, alert_state=None):
+    """
+    Scan visits newer than the alert watermark and fire on_alert for watched
+    sites / keywords. Independent of the import cursors, so a GUI refresh can't
+    hide a visit from alerting. On first run it just sets the watermark to now,
+    so we never email a flood of pre-existing history. Returns alerts fired.
+    """
+    with state.lock:
+        mon = dict(state.monitor)
+    watch = {normalize_domain(d) for d in mon.get("watch", []) if d}
+    keywords = [k.lower() for k in mon.get("keywords", []) if k.strip()]
+
+    wm = store.get_alert_watermark()
+    if wm <= 0:
+        store.set_alert_watermark(int(time.time()))
+        return 0
+    if not watch and not keywords:
+        store.set_alert_watermark(int(time.time()))
+        return 0
+
+    fired = 0
+    max_ts = wm
+
+    def maybe_alert(username, kind, detail, epoch):
+        nonlocal fired
+        key = (username, kind, detail)
+        now = time.time()
+        if alert_state is None or now - alert_state.get(key, 0) > ALERT_DEBOUNCE:
+            if alert_state is not None:
+                alert_state[key] = now
+            on_alert(username, kind, detail, epoch)
+            fired += 1
+
+    for username, dom, url, ts in store.visits_since(wm):
+        max_ts = max(max_ts, ts)
+        if dom and watch and (dom in watch or any(
+                dom == w or dom.endswith("." + w) for w in watch)):
+            maybe_alert(username, "site", dom, ts)
+        if keywords:
+            q = extract_search_query(url)
+            if q and any(kw in q.lower() for kw in keywords):
+                maybe_alert(username, "search", q, ts)
+
+    if max_ts > wm:
+        store.set_alert_watermark(max_ts)
+    return fired
 
 
 def _within_quiet_hours(cfg, now=None):
@@ -923,12 +973,12 @@ class HistoryMonitor(threading.Thread):
         while not self._stop.is_set():
             try:
                 self.state.reload_if_changed()
-                with self.state.lock:
-                    mon = dict(self.state.monitor)
-                if mon.get("enabled"):
-                    import_all_history(self.state, store,
-                                       on_alert=self._alert,
-                                       alert_state=self._alert_state)
+                # Always record history so the Activity log is never empty, then
+                # run the alert scan (which no-ops unless email + watch/keywords
+                # are configured).
+                import_all_history(self.state, store)
+                scan_and_alert(self.state, store, self._alert,
+                               self._alert_state)
             except Exception as exc:
                 sys.stderr.write(f"[monitor] sweep error: {exc}\n")
             self._stop.wait(MONITOR_HISTORY_INTERVAL)
@@ -1182,7 +1232,7 @@ class AppState:
     @staticmethod
     def _default_monitor():
         return {
-            "enabled": False,
+            "enabled": True,        # history is always recorded by the daemon
             "watch": [],            # domains that trigger an alert
             "keywords": [],         # search terms that trigger a safety alert
             "email": {"enabled": False, "host": "", "port": 587,
@@ -2340,7 +2390,11 @@ class AppBlockerUI:
             padx=12, pady=6, cursor="hand2").pack(side="left", padx=8)
         tk.Button(bar, text="Close", command=win.destroy, relief="flat",
                   padx=12, pady=6, cursor="hand2").pack(side="right")
+
+        # Draw the window immediately, then pull the latest history and refresh
+        # so it's never empty on open (no need to hit Refresh manually).
         refresh()
+        win.after(50, lambda: (self._import_history_now(), refresh()))
 
     def _import_history_now(self):
         try:
@@ -2359,11 +2413,10 @@ class AppBlockerUI:
         win.transient(self.root)
         win.grab_set()
 
-        enabled = tk.BooleanVar(value=mon.get("enabled", False))
-        tk.Checkbutton(win, text="Enable website-visit monitoring & alerts",
-                       variable=enabled, bg=COLOR_BG,
-                       font=("Helvetica", 11, "bold")).pack(
-                           anchor="w", padx=16, pady=(14, 4))
+        tk.Label(win, text="Browsing history is always recorded (see "
+                 "📊 Activity). Set watched sites / keywords + email below to "
+                 "get alerts.", bg=COLOR_BG, fg="#7f8c8d", wraplength=470,
+                 justify="left").pack(anchor="w", padx=16, pady=(12, 6))
 
         tk.Label(win, text="Alert me when these sites are visited "
                  "(one per line):", bg=COLOR_BG, fg=COLOR_HEADER).pack(
@@ -2408,7 +2461,7 @@ class AppBlockerUI:
                  justify="left").pack(padx=16, pady=(4, 0))
 
         def collect():
-            mon["enabled"] = enabled.get()
+            mon["enabled"] = True  # recording is always on now
             mon["watch"] = [ln for ln in watch.get("1.0", tk.END).splitlines()
                             if ln.strip()]
             mon["keywords"] = [ln for ln in keywords.get(
