@@ -171,8 +171,33 @@ Honest limits:
 - It is **not** affected by secure-DNS/VPN — the browser records its own
   history regardless.
 
+**Searches** — the Activity window shows a **Searches** table that pulls the
+query out of search URLs (Google, YouTube, Bing, Amazon, etc.), and you can
+**alert on search keywords**: under 🔔 Alerts & Email, list words (e.g.
+self-harm terms) and get emailed when any user's search matches.
+
+**Filters** — filter the log by **user**, a **custom date range** (From/To;
+blank = all time), and **site**. **Quiet hours** mute alert emails overnight,
+and alerts can go to **multiple recipients** (comma-separate the addresses).
+
 Useful from a terminal: `sudo appblocker --email-test` (send a test alert) and
 `sudo appblocker --import-history` (import history once now).
+
+## Browser lockdown (disable incognito)
+
+Click **🔒 Lockdown** (admin window) → *"Disable private/incognito browsing and
+block clearing of history."* This writes each browser's official **managed
+policy** (as root) so:
+
+- **Incognito/private browsing is turned off** in Chrome, Chromium, Brave and
+  Firefox, and
+- **history deletion is blocked** in Chrome/Chromium/Brave.
+
+It applies to all users, takes effect after a browser restart, and **can't be
+undone by a child** without your admin password. This makes the Activity
+monitoring reliable — browsing can't be hidden with incognito or a history
+wipe. Emergency off switch: `sudo appblocker --lockdown-clear` (uninstalling
+also clears it). Only policy files AppBlocker created are ever touched.
 
 ## Auto-block rules (conditional blocking)
 

@@ -7,8 +7,9 @@ case "$1" in
         if [ -d /run/systemd/system ]; then
             systemctl disable --now appblocker.service || true
         fi
-        # Remove any website blocks we added to /etc/hosts.
+        # Remove website blocks from /etc/hosts and browser lockdown policies.
         [ -x /usr/bin/appblocker ] && /usr/bin/appblocker --web-clear || true
+        [ -x /usr/bin/appblocker ] && /usr/bin/appblocker --lockdown-clear || true
         ;;
     upgrade)
         if [ -d /run/systemd/system ]; then
