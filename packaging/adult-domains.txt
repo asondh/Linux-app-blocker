@@ -1,0 +1,48 @@
+# AppBlocker built-in adult-content blocklist (starter list).
+# One domain per line; www. and the bare domain are both blocked automatically.
+# This is a curated starter set of well-known adult sites — NOT exhaustive.
+# For comprehensive category filtering, pair it with a DNS filter (e.g. a
+# family DNS resolver). Lines starting with # are ignored.
+pornhub.com
+xvideos.com
+xnxx.com
+xhamster.com
+redtube.com
+youporn.com
+tube8.com
+spankbang.com
+youjizz.com
+porn.com
+brazzers.com
+onlyfans.com
+chaturbate.com
+livejasmin.com
+cam4.com
+bongacams.com
+stripchat.com
+myfreecams.com
+adultfriendfinder.com
+ashleymadison.com
+fansly.com
+manyvids.com
+clips4sale.com
+motherless.com
+eporner.com
+txxx.com
+hclips.com
+hqporner.com
+porntrex.com
+thumbzilla.com
+tnaflix.com
+empflix.com
+drtuber.com
+nuvid.com
+sunporno.com
+porn300.com
+porndig.com
+4tube.com
+fapello.com
+rule34.xxx
+e-hentai.org
+nhentai.net
+hentaihaven.xxx

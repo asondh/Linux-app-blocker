@@ -219,6 +219,30 @@ The dashboard has filterable tables (by user / date range / site) for **visits**
 **searches**, and **time-per-site**. Everything stays private to your GitHub
 account and your browser; keep the tokens secret (both are revocable anytime).
 
+## Blocked-attempt alerts, digests, tamper alerts, adult blocklist
+
+- **Blocked-attempt log & alerts** — every time a child tries to open a blocked
+  app, it's logged (see the **Blocked-app attempts** table in 📊 Activity and on
+  the dashboard) and, if enabled in 🔔 Alerts & Email, you get an email:
+  *"Sam tried to open Brave at 3:12pm."*
+- **Daily summary email (digest)** — in 🔔 Alerts & Email, tick *"Email me a
+  summary every N hours"*. It's **opportunistic**: it sends the next time the
+  machine is online after the interval elapses (not tied to a fixed clock time),
+  so a machine that's only on briefly still sends it.
+- **Tamper / "monitoring was off" alert** — if the service was stopped or the
+  machine was off for more than ~15 minutes, you get an email when it comes back
+  (*"AppBlocker was not running from … to …"*), so blocking/monitoring can't be
+  quietly disabled without you knowing.
+- **One-toggle adult-content blocklist** — in 🌐 Block Websites, tick *"Also
+  block a built-in adult-content list"* to merge a curated set of well-known
+  adult domains into the website blocking. (Starter list — pair with a family
+  DNS filter for comprehensive coverage.)
+
+> Note on timing: watched-site/keyword and blocked-attempt **alerts are not tied
+> to the digest** — they're sent the next time the machine is online (and
+> immediately on boot), because the browser saves history to disk, so a visit
+> made just before logging off or shutting down is still caught.
+
 ## Browser lockdown (disable incognito)
 
 Click **🔒 Lockdown** (admin window) → *"Disable private/incognito browsing and

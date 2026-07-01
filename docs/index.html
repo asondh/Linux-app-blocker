@@ -100,6 +100,7 @@
     <button data-tab="visits" class="active">Visits</button>
     <button data-tab="searches">Searches</button>
     <button data-tab="time">Time per site</button>
+    <button data-tab="blocked">Blocked attempts</button>
   </div>
 
   <div class="card" id="panel-visits">
@@ -127,6 +128,15 @@
       <th data-sort="secs">Approx. time</th></tr></thead>
       <tbody id="tb-time"></tbody></table>
     <div id="e-time" class="empty hidden">No data.</div>
+  </div>
+
+  <div class="card hidden" id="panel-blocked">
+    <h2>Blocked-app attempts <span id="c-blocked" class="muted"></span></h2>
+    <table><thead><tr>
+      <th data-sort="ts">When</th><th data-sort="user">User</th>
+      <th data-sort="app">Tried to open</th></tr></thead>
+      <tbody id="tb-blocked"></tbody></table>
+    <div id="e-blocked" class="empty hidden">No blocked attempts.</div>
   </div>
 </div>
 
@@ -281,6 +291,23 @@ function render(){
                  `<td>${fmtDur(d.secs)}</td>`; tbT.appendChild(tr); });
   $("c-time").textContent="("+durs.length+")";
   $("e-time").classList.toggle("hidden", durs.length>0);
+
+  // Blocked-app attempts (filtered by user + date; site filter doesn't apply)
+  const u=$("fx-user").value;
+  const from=$("fx-from").value?Date.parse($("fx-from").value)/1000:null;
+  const to=$("fx-to").value?Date.parse($("fx-to").value)/1000+86400:null;
+  let att=(DATA.attempts||[]).filter(a=>{
+    if(u!=="All users"&&a.u!==u) return false;
+    if(from!==null&&a.ts<from) return false;
+    if(to!==null&&a.ts>=to) return false;
+    return true; });
+  att=sortRows(att.map(a=>({ts:a.ts,user:a.u,app:a.app})),"blocked");
+  const tbB=$("tb-blocked"); tbB.innerHTML="";
+  att.forEach(a=>{ const tr=document.createElement("tr");
+    tr.innerHTML=`<td>${fmtWhen(a.ts)}</td><td>${esc(a.user)}</td>`+
+                 `<td>${esc(a.app)}</td>`; tbB.appendChild(tr); });
+  $("c-blocked").textContent="("+att.length+")";
+  $("e-blocked").classList.toggle("hidden", att.length>0);
 }
 
 function esc(s){ return (s==null?"":String(s)).replace(/[&<>"]/g,
@@ -290,7 +317,7 @@ function esc(s){ return (s==null?"":String(s)).replace(/[&<>"]/g,
 document.querySelectorAll(".tabs button").forEach(b=>{
   b.onclick=()=>{ document.querySelectorAll(".tabs button")
       .forEach(x=>x.classList.remove("active")); b.classList.add("active");
-    ["visits","searches","time"].forEach(t=>
+    ["visits","searches","time","blocked"].forEach(t=>
       $("panel-"+t).classList.toggle("hidden", t!==b.dataset.tab)); };
 });
 document.querySelectorAll("th[data-sort]").forEach(th=>{
