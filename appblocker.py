@@ -964,6 +964,7 @@ class HistoryMonitor(threading.Thread):
         self.state = state
         self._stop = threading.Event()
         self._alert_state = {}
+        self._last_sync = 0
 
     def stop(self):
         self._stop.set()
@@ -979,6 +980,16 @@ class HistoryMonitor(threading.Thread):
                 import_all_history(self.state, store)
                 scan_and_alert(self.state, store, self._alert,
                                self._alert_state)
+                # Opportunistically push the remote dashboard data.
+                now = time.time()
+                if now - self._last_sync >= SYNC_INTERVAL:
+                    self._last_sync = now
+                    try:
+                        n = sync_reports(self.state, store)
+                        if n:
+                            sys.stderr.write(f"[sync] pushed {n} bytes\n")
+                    except Exception as exc:
+                        sys.stderr.write(f"[sync] failed: {exc}\n")
             except Exception as exc:
                 sys.stderr.write(f"[monitor] sweep error: {exc}\n")
             self._stop.wait(MONITOR_HISTORY_INTERVAL)
@@ -1004,6 +1015,104 @@ class HistoryMonitor(threading.Thread):
                 send_email(cfg, subject, body)
             except Exception as exc:
                 sys.stderr.write(f"[monitor] email failed: {exc}\n")
+
+
+# --------------------------------------------------------------------------- #
+# Remote dashboard — export the activity as data.json and push it to a private
+# GitHub repo. A static dashboard page (docs/index.html on GitHub Pages) reads
+# it with the parent's own token, so the data is never public.
+# --------------------------------------------------------------------------- #
+import base64                       # noqa: E402 (grouped with the feature)
+import urllib.request              # noqa: E402
+import urllib.error                # noqa: E402
+
+SYNC_INTERVAL = 900                # seconds between opportunistic dashboard syncs
+REPORT_DAYS = 30                   # how many days of history to publish
+REPORT_LIMIT = 6000               # cap visits so data.json stays well under 1 MB
+
+
+def build_report_data(store, days=REPORT_DAYS, limit=REPORT_LIMIT):
+    """Assemble the dashboard payload from the history store."""
+    start_day = time.strftime("%Y-%m-%d",
+                              time.localtime(time.time() - days * 86400))
+    rows = store.query(start_day=start_day, limit=limit + 1)
+    truncated = len(rows) > limit
+    rows = rows[:limit]
+    visits = []
+    for username, domain, url, ts in rows:
+        visits.append({"u": username, "d": domain, "url": url, "ts": int(ts),
+                       "q": extract_search_query(url)})
+    try:
+        machine = os.uname().nodename
+    except Exception:
+        machine = ""
+    now = time.time()
+    return {
+        "generated_at": int(now),
+        "generated_at_str": time.strftime("%Y-%m-%d %H:%M", time.localtime(now)),
+        "machine": machine,
+        "days": days,
+        "truncated": truncated,
+        "users": store.users(),
+        "visits": visits,
+    }
+
+
+def _gh_request(url, token, method="GET", body=None):
+    headers = {
+        "Authorization": "Bearer " + token,
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "AppBlocker",
+    }
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def push_reports_to_github(cfg, data):
+    """
+    PUT data.json into the configured private repo. cfg keys: repo (owner/name),
+    branch, path, token. Raises on failure.
+    """
+    repo = cfg.get("repo", "").strip()
+    token = cfg.get("token", "").strip()
+    path = cfg.get("path", "data.json").strip() or "data.json"
+    branch = cfg.get("branch", "main").strip() or "main"
+    if not repo or not token:
+        raise ValueError("Dashboard repo and token are required.")
+    api = f"https://api.github.com/repos/{repo}/contents/{path}"
+    sha = None
+    try:
+        existing = _gh_request(f"{api}?ref={branch}", token)
+        sha = existing.get("sha")
+    except urllib.error.HTTPError as exc:
+        if exc.code != 404:
+            raise
+    payload = json.dumps(data, separators=(",", ":")).encode("utf-8")
+    body = {
+        "message": f"Update activity {data.get('generated_at_str', '')}",
+        "content": base64.b64encode(payload).decode("ascii"),
+        "branch": branch,
+    }
+    if sha:
+        body["sha"] = sha
+    _gh_request(api, token, method="PUT", body=body)
+    return len(payload)
+
+
+def sync_reports(state, store):
+    """Build and push the dashboard data if sync is enabled. Returns bytes sent."""
+    with state.lock:
+        cfg = dict(state.sync)
+    if not cfg.get("enabled") or not cfg.get("repo") or not cfg.get("token"):
+        return 0
+    data = build_report_data(store)
+    return push_reports_to_github(cfg, data)
 
 
 # --------------------------------------------------------------------------- #
@@ -1226,8 +1335,23 @@ class AppState:
         self.websites = []  # blocked website domains (machine-wide)
         self.monitor = self._default_monitor()  # website-visit monitoring config
         self.lockdown = {"enabled": False}      # browser incognito lockdown
+        self.sync = self._default_sync()        # remote dashboard (GitHub) sync
         self._mtime = None
         self.load()
+
+    @staticmethod
+    def _default_sync():
+        return {"enabled": False, "repo": "", "branch": "main",
+                "path": "data.json", "token": ""}
+
+    def _normalize_sync(self, value):
+        cfg = self._default_sync()
+        if isinstance(value, dict):
+            cfg["enabled"] = bool(value.get("enabled"))
+            for k in ("repo", "branch", "path", "token"):
+                if value.get(k):
+                    cfg[k] = str(value[k]).strip()
+        return cfg
 
     @staticmethod
     def _default_monitor():
@@ -1324,6 +1448,7 @@ class AppState:
             self.monitor = self._normalize_monitor(data.get("monitor"))
             self.lockdown = {"enabled": bool(
                 (data.get("lockdown") or {}).get("enabled"))}
+            self.sync = self._normalize_sync(data.get("sync"))
             self._mtime = self._file_mtime()
         else:
             self.apps = self._default_apps()
@@ -1331,6 +1456,7 @@ class AppState:
             self.websites = []
             self.monitor = self._default_monitor()
             self.lockdown = {"enabled": False}
+            self.sync = self._default_sync()
             self.save()
 
     def reload_if_changed(self):
@@ -1351,6 +1477,7 @@ class AppState:
                 self.monitor = self._normalize_monitor(data.get("monitor"))
                 self.lockdown = {"enabled": bool(
                     (data.get("lockdown") or {}).get("enabled"))}
+                self.sync = self._normalize_sync(data.get("sync"))
                 self._mtime = mtime
             return True
         return False
@@ -1363,7 +1490,8 @@ class AppState:
         save_json(BLOCKED_FILE, {"apps": self.apps, "rules": self.rules,
                                  "websites": self.websites,
                                  "monitor": self.monitor,
-                                 "lockdown": self.lockdown})
+                                 "lockdown": self.lockdown,
+                                 "sync": self.sync})
         self._mtime = self._file_mtime()
 
     @staticmethod
@@ -1503,6 +1631,12 @@ class AppState:
             self.lockdown = {"enabled": bool(enabled)}
             self.save_locked()
             return dict(self.lockdown)
+
+    def set_sync(self, cfg):
+        with self.lock:
+            self.sync = self._normalize_sync(cfg)
+            self.save_locked()
+            return dict(self.sync)
 
 
 # --------------------------------------------------------------------------- #
@@ -2277,6 +2411,87 @@ class AppBlockerUI:
         tk.Button(bar, text="Cancel", command=win.destroy, relief="flat",
                   padx=12, pady=6, cursor="hand2").pack(side="right", padx=8)
 
+    def sync_dialog(self):
+        with self.state.lock:
+            cfg = dict(self.state.sync)
+        win = tk.Toplevel(self.root)
+        win.title("Remote Dashboard (GitHub)")
+        win.configure(bg=COLOR_BG)
+        win.geometry("520x520")
+        win.transient(self.root)
+        win.grab_set()
+
+        tk.Label(win, text="☁ Remote Dashboard", bg=COLOR_BG, fg=COLOR_HEADER,
+                 font=("Helvetica", 14, "bold")).pack(pady=(14, 2))
+        tk.Label(win, text="This machine pushes the activity to a PRIVATE GitHub "
+                 "repo as data.json. Open the dashboard page (GitHub Pages) on "
+                 "your phone/PC and it reads that data with your own token — the "
+                 "data is never public.", bg=COLOR_BG, fg="#7f8c8d",
+                 wraplength=470, justify="left").pack(padx=16, pady=(0, 8))
+
+        enabled = tk.BooleanVar(value=cfg.get("enabled", False))
+        tk.Checkbutton(win, text="Enable pushing activity to GitHub",
+                       variable=enabled, bg=COLOR_BG,
+                       font=("Helvetica", 11, "bold")).pack(anchor="w", padx=16)
+
+        form = tk.Frame(win, bg=COLOR_BG)
+        form.pack(fill="x", padx=16, pady=(6, 0))
+        fields = [("Private repo (owner/name)", "repo"), ("Branch", "branch"),
+                  ("File path", "path"), ("Write token", "token")]
+        vars_ = {}
+        for i, (label, key) in enumerate(fields):
+            tk.Label(form, text=label + ":", bg=COLOR_BG).grid(
+                row=i, column=0, sticky="w", pady=3)
+            v = tk.StringVar(value=str(cfg.get(key, "") or ""))
+            show = "*" if key == "token" else None
+            tk.Entry(form, textvariable=v, width=34, show=show).grid(
+                row=i, column=1, sticky="we", pady=3)
+            vars_[key] = v
+        form.columnconfigure(1, weight=1)
+        tk.Label(win, text="Token: a fine-grained GitHub token limited to that "
+                 "one private repo with Contents: Read and write. Keep it secret; "
+                 "it's stored root-only on this machine.", bg=COLOR_BG,
+                 fg="#7f8c8d", wraplength=470, justify="left").pack(
+                     padx=16, pady=(6, 0))
+
+        status = tk.Label(win, text="", bg=COLOR_BG, fg=COLOR_HEADER,
+                          wraplength=470, justify="left")
+        status.pack(padx=16, pady=(8, 0))
+
+        def collect():
+            return {"enabled": enabled.get(),
+                    "repo": vars_["repo"].get().strip(),
+                    "branch": vars_["branch"].get().strip() or "main",
+                    "path": vars_["path"].get().strip() or "data.json",
+                    "token": vars_["token"].get().strip()}
+
+        def save():
+            self.state.set_sync(collect())
+            messagebox.showinfo("Saved", "Dashboard settings saved.", parent=win)
+            win.destroy()
+
+        def sync_now():
+            self.state.set_sync(collect())
+            status.config(text="Pushing…")
+            win.update_idletasks()
+            try:
+                n = push_reports_to_github(collect(),
+                                           build_report_data(HistoryStore()))
+                status.config(text=f"✓ Pushed {n} bytes to {collect()['repo']}.")
+            except Exception as exc:
+                status.config(text=f"✗ {exc}")
+
+        bar = tk.Frame(win, bg=COLOR_BG)
+        bar.pack(side="bottom", fill="x", padx=16, pady=14)
+        tk.Button(bar, text="Save", command=save, bg=COLOR_ACTIVE, fg="white",
+                  relief="flat", padx=16, pady=6, cursor="hand2").pack(
+                      side="right")
+        tk.Button(bar, text="Sync now", command=sync_now, bg=COLOR_ACCENT,
+                  fg="white", relief="flat", padx=12, pady=6,
+                  cursor="hand2").pack(side="right", padx=8)
+        tk.Button(bar, text="Cancel", command=win.destroy, relief="flat",
+                  padx=12, pady=6, cursor="hand2").pack(side="left")
+
     def activity_dialog(self):
         store = HistoryStore()
         win = tk.Toplevel(self.root)
@@ -2385,6 +2600,9 @@ class AppBlockerUI:
         tk.Button(bar, text="🔔 Alerts & Email…", command=self.monitor_settings_dialog,
                   bg=COLOR_ACCENT, fg="white", relief="flat", padx=12, pady=6,
                   cursor="hand2").pack(side="left")
+        tk.Button(bar, text="☁ Remote Dashboard…", command=self.sync_dialog,
+                  bg="#8e44ad", fg="white", relief="flat", padx=12, pady=6,
+                  cursor="hand2").pack(side="left", padx=8)
         tk.Button(bar, text="Refresh now", command=lambda: (
             self._import_history_now(), refresh()), relief="flat",
             padx=12, pady=6, cursor="hand2").pack(side="left", padx=8)
@@ -2993,12 +3211,28 @@ def main():
     parser.add_argument(
         "--lockdown-clear", action="store_true",
         help="emergency: remove AppBlocker's browser incognito-lockdown policies")
+    parser.add_argument(
+        "--sync-now", action="store_true",
+        help="build and push the remote dashboard data to GitHub once")
     args = parser.parse_args()
 
     if args.lockdown_clear:
         changed = apply_browser_lockdown(False)
         print(f"Removed {len(changed)} lockdown policy file(s)." if changed
               else "No AppBlocker lockdown policies were present.")
+        return
+
+    if args.sync_now:
+        configure_paths(system_mode=True)
+        st = AppState()
+        if not st.sync.get("repo") or not st.sync.get("token"):
+            print("No dashboard settings saved. Configure them in the app first.")
+            return
+        try:
+            n = push_reports_to_github(st.sync, build_report_data(HistoryStore()))
+            print(f"Pushed {n} bytes to {st.sync['repo']}.")
+        except Exception as exc:
+            print(f"Sync failed: {exc}")
         return
 
     if args.email_test:

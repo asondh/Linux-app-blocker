@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>AppBlocker Dashboard</title>
+<style>
+  :root { --bg:#f4f6f7; --card:#fff; --head:#2c3e50; --accent:#2980b9;
+          --line:#dfe4ea; --muted:#7f8c8d; --red:#c0392b; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+         background:var(--bg); color:#2c3e50; }
+  header { background:var(--head); color:#fff; padding:14px 18px;
+           display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+  header h1 { font-size:18px; margin:0; }
+  header .meta { color:#bdc3c7; font-size:12px; margin-left:auto; text-align:right; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:6px;
+           padding:8px 12px; font-size:14px; cursor:pointer; }
+  button.ghost { background:#7f8c8d; }
+  .wrap { padding:14px 18px; max-width:1100px; margin:0 auto; }
+  .filters { display:flex; gap:10px; flex-wrap:wrap; align-items:center;
+             background:var(--card); border:1px solid var(--line);
+             border-radius:8px; padding:12px; margin-bottom:14px; }
+  .filters label { font-size:12px; color:var(--muted); display:flex;
+                   flex-direction:column; gap:2px; }
+  .filters input, .filters select { padding:6px 8px; border:1px solid var(--line);
+           border-radius:6px; font-size:14px; min-width:120px; }
+  .tabs { display:flex; gap:8px; margin-bottom:10px; }
+  .tabs button { background:#ecf0f1; color:#2c3e50; }
+  .tabs button.active { background:var(--head); color:#fff; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:8px;
+          padding:0; margin-bottom:16px; overflow:hidden; }
+  .card h2 { font-size:14px; margin:0; padding:10px 14px; background:#f8f9fa;
+             border-bottom:1px solid var(--line); }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:left; padding:8px 12px; border-bottom:1px solid var(--line);
+           vertical-align:top; }
+  th { background:#fbfcfc; cursor:pointer; user-select:none; white-space:nowrap; }
+  td.url { word-break:break-all; color:#34495e; }
+  .muted { color:var(--muted); }
+  .empty { padding:22px; text-align:center; color:var(--muted); }
+  .setup { max-width:520px; margin:40px auto; background:var(--card);
+           border:1px solid var(--line); border-radius:10px; padding:22px; }
+  .setup h2 { margin-top:0; }
+  .setup label { display:block; margin:10px 0 2px; font-size:13px; }
+  .setup input { width:100%; padding:8px; border:1px solid var(--line);
+                 border-radius:6px; font-size:14px; }
+  .setup .hint { color:var(--muted); font-size:12px; margin-top:4px; }
+  .err { color:var(--red); font-size:13px; margin-top:10px; }
+  .hidden { display:none; }
+  .pill { display:inline-block; background:#eafaf1; color:#1e8449;
+          border-radius:10px; padding:1px 8px; font-size:12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🔒 AppBlocker</h1>
+  <button id="btn-refresh" class="hidden">Refresh</button>
+  <button id="btn-settings" class="ghost hidden">Settings</button>
+  <div class="meta" id="meta"></div>
+</header>
+
+<!-- Setup / settings form -->
+<div id="setup" class="setup hidden">
+  <h2>Connect to your data</h2>
+  <p class="hint">The dashboard reads a private <code>data.json</code> that the
+  monitored machine pushes to a private GitHub repo. Your token stays in this
+  browser only (nothing is sent anywhere except GitHub's API).</p>
+  <label>Repository (owner/name)</label>
+  <input id="f-repo" placeholder="yourname/appblocker-data">
+  <label>Branch</label>
+  <input id="f-branch" placeholder="main" value="main">
+  <label>File path</label>
+  <input id="f-path" placeholder="data.json" value="data.json">
+  <label>GitHub token (read access to that repo)</label>
+  <input id="f-token" type="password" placeholder="github_pat_...">
+  <div class="hint">Use a fine-grained token limited to that one private repo
+  with <b>Contents: Read-only</b>. Revoke it anytime from GitHub.</div>
+  <div style="margin-top:16px; display:flex; gap:10px;">
+    <button id="f-save">Save &amp; Load</button>
+    <button id="f-cancel" class="ghost">Cancel</button>
+  </div>
+  <div id="setup-err" class="err"></div>
+</div>
+
+<!-- Main dashboard -->
+<div id="app" class="wrap hidden">
+  <div class="filters">
+    <label>User
+      <select id="fx-user"><option>All users</option></select>
+    </label>
+    <label>From <input id="fx-from" type="date"></label>
+    <label>To <input id="fx-to" type="date"></label>
+    <label>Site contains <input id="fx-site" placeholder="e.g. youtube"></label>
+    <button id="fx-clear" class="ghost" style="align-self:flex-end;">Clear</button>
+  </div>
+
+  <div class="tabs">
+    <button data-tab="visits" class="active">Visits</button>
+    <button data-tab="searches">Searches</button>
+    <button data-tab="time">Time per site</button>
+  </div>
+
+  <div class="card" id="panel-visits">
+    <h2>Visits <span id="c-visits" class="muted"></span></h2>
+    <table><thead><tr>
+      <th data-sort="ts">When</th><th data-sort="user">User</th>
+      <th data-sort="url">Page</th></tr></thead>
+      <tbody id="tb-visits"></tbody></table>
+    <div id="e-visits" class="empty hidden">No visits match.</div>
+  </div>
+
+  <div class="card hidden" id="panel-searches">
+    <h2>Searches <span id="c-searches" class="muted"></span></h2>
+    <table><thead><tr>
+      <th data-sort="ts">When</th><th data-sort="user">User</th>
+      <th data-sort="domain">Where</th><th data-sort="q">Searched for</th>
+      </tr></thead><tbody id="tb-searches"></tbody></table>
+    <div id="e-searches" class="empty hidden">No searches match.</div>
+  </div>
+
+  <div class="card hidden" id="panel-time">
+    <h2>Time per site (approx.) <span id="c-time" class="muted"></span></h2>
+    <table><thead><tr>
+      <th data-sort="domain">Site</th><th data-sort="visits">Visits</th>
+      <th data-sort="secs">Approx. time</th></tr></thead>
+      <tbody id="tb-time"></tbody></table>
+    <div id="e-time" class="empty hidden">No data.</div>
+  </div>
+</div>
+
+<script>
+"use strict";
+const LS = "appblocker.dashboard.cfg";
+const IDLE_CAP = 1800; // seconds; matches the app's time-on-site estimate
+let DATA = null;               // {generated_at_str, machine, visits:[...]}
+let sortState = {};            // per-table sort
+
+const $ = (id) => document.getElementById(id);
+function getCfg(){ try { return JSON.parse(localStorage.getItem(LS)||"null"); }
+                   catch(e){ return null; } }
+function setCfg(c){ localStorage.setItem(LS, JSON.stringify(c)); }
+
+function showSetup(err){
+  const c = getCfg() || {};
+  $("f-repo").value = c.repo || "";
+  $("f-branch").value = c.branch || "main";
+  $("f-path").value = c.path || "data.json";
+  $("f-token").value = c.token || "";
+  $("setup-err").textContent = err || "";
+  $("setup").classList.remove("hidden");
+  $("app").classList.add("hidden");
+  $("btn-refresh").classList.add("hidden");
+  $("btn-settings").classList.toggle("hidden", !getCfg());
+}
+function hideSetup(){ $("setup").classList.add("hidden"); }
+
+async function loadData(){
+  const c = getCfg();
+  if(!c || !c.repo || !c.token){ showSetup(); return; }
+  $("meta").textContent = "Loading…";
+  const url = `https://api.github.com/repos/${c.repo}/contents/${c.path}` +
+              `?ref=${encodeURIComponent(c.branch||"main")}`;
+  try {
+    const res = await fetch(url, { headers: {
+      "Authorization": "Bearer " + c.token,
+      "Accept": "application/vnd.github.raw+json",
+      "X-GitHub-Api-Version": "2022-11-28"
+    }});
+    if(res.status === 401 || res.status === 403){
+      showSetup("Token rejected (401/403). Check the token and its repo access.");
+      return;
+    }
+    if(res.status === 404){
+      showSetup("Not found (404). Check owner/repo, path and branch — and that "
+                + "the machine has pushed data.json at least once."); return;
+    }
+    if(!res.ok){ showSetup("GitHub error: " + res.status); return; }
+    DATA = JSON.parse(await res.text());
+    hideSetup();
+    $("app").classList.remove("hidden");
+    $("btn-refresh").classList.remove("hidden");
+    $("btn-settings").classList.remove("hidden");
+    initFilters();
+    render();
+    const trunc = DATA.truncated ? " · showing most recent " +
+        (DATA.visits||[]).length + " visits" : "";
+    $("meta").textContent = `Updated ${DATA.generated_at_str||"?"}` +
+        (DATA.machine? " · "+DATA.machine : "") + trunc;
+  } catch(e){ showSetup("Could not load: " + e.message); }
+}
+
+function initFilters(){
+  const users = ["All users"].concat(DATA.users || []);
+  const sel = $("fx-user"); const cur = sel.value;
+  sel.innerHTML = "";
+  users.forEach(u => { const o=document.createElement("option");
+                       o.textContent=u; sel.appendChild(o); });
+  if(users.includes(cur)) sel.value = cur;
+}
+
+function activeRows(){
+  const u = $("fx-user").value;
+  const site = ($("fx-site").value||"").toLowerCase().trim();
+  const from = $("fx-from").value ? Date.parse($("fx-from").value)/1000 : null;
+  const to = $("fx-to").value ? Date.parse($("fx-to").value)/1000 + 86400 : null;
+  return (DATA.visits||[]).filter(v => {
+    if(u !== "All users" && v.u !== u) return false;
+    if(site && !(v.d||"").toLowerCase().includes(site)) return false;
+    if(from !== null && v.ts < from) return false;
+    if(to !== null && v.ts >= to) return false;
+    return true;
+  });
+}
+
+function fmtWhen(ts){ const d=new Date(ts*1000);
+  return d.toLocaleString([], {year:"numeric",month:"2-digit",day:"2-digit",
+    hour:"2-digit",minute:"2-digit"}); }
+function fmtDur(s){ const m=Math.floor(s/60);
+  if(m>=60) return Math.floor(m/60)+"h "+(m%60)+"m";
+  return m? m+"m" : "<1m"; }
+
+function computeDurations(rows){
+  // gap-based, same as the app: sum gap to next visit by same user, capped.
+  const byUser = {};
+  rows.slice().sort((a,b)=>a.ts-b.ts).forEach(v=>{
+    (byUser[v.u]=byUser[v.u]||[]).push(v); });
+  const secs={}, cnt={};
+  Object.values(byUser).forEach(list=>{
+    list.forEach((v,i)=>{
+      cnt[v.d]=(cnt[v.d]||0)+1;
+      let dur=0;
+      if(i+1<list.length) dur=Math.min(Math.max(0,list[i+1].ts-v.ts),IDLE_CAP);
+      secs[v.d]=(secs[v.d]||0)+dur;
+    });
+  });
+  return Object.keys(cnt).map(d=>({domain:d,visits:cnt[d],secs:secs[d]||0}))
+         .sort((a,b)=>b.secs-a.secs);
+}
+
+function sortRows(rows, table, keys){
+  const s = sortState[table];
+  if(!s) return rows;
+  const {key,dir} = s;
+  return rows.slice().sort((a,b)=>{
+    let x=a[key], y=b[key];
+    if(typeof x==="string"){x=x.toLowerCase(); y=(y||"").toLowerCase();}
+    return (x<y?-1:x>y?1:0)*dir;
+  });
+}
+
+function render(){
+  const rows = activeRows();
+  // Visits
+  let vs = sortRows(rows.map(v=>({ts:v.ts,user:v.u,url:v.url||v.d})),
+                    "visits");
+  const tbV=$("tb-visits"); tbV.innerHTML="";
+  vs.slice(0,3000).forEach(v=>{ const tr=document.createElement("tr");
+    tr.innerHTML=`<td>${fmtWhen(v.ts)}</td><td>${esc(v.user)}</td>`+
+                 `<td class="url">${esc(v.url)}</td>`; tbV.appendChild(tr); });
+  $("c-visits").textContent="("+rows.length+")";
+  $("e-visits").classList.toggle("hidden", rows.length>0);
+
+  // Searches
+  const sr = rows.filter(v=>v.q).map(v=>({ts:v.ts,user:v.u,domain:v.d,q:v.q}));
+  const srS = sortRows(sr,"searches");
+  const tbS=$("tb-searches"); tbS.innerHTML="";
+  srS.forEach(v=>{ const tr=document.createElement("tr");
+    tr.innerHTML=`<td>${fmtWhen(v.ts)}</td><td>${esc(v.user)}</td>`+
+                 `<td>${esc(v.domain)}</td><td>${esc(v.q)}</td>`;
+    tbS.appendChild(tr); });
+  $("c-searches").textContent="("+sr.length+")";
+  $("e-searches").classList.toggle("hidden", sr.length>0);
+
+  // Time per site
+  const durs = sortRows(computeDurations(rows), "time");
+  const tbT=$("tb-time"); tbT.innerHTML="";
+  durs.forEach(d=>{ const tr=document.createElement("tr");
+    tr.innerHTML=`<td>${esc(d.domain)}</td><td>${d.visits}</td>`+
+                 `<td>${fmtDur(d.secs)}</td>`; tbT.appendChild(tr); });
+  $("c-time").textContent="("+durs.length+")";
+  $("e-time").classList.toggle("hidden", durs.length>0);
+}
+
+function esc(s){ return (s==null?"":String(s)).replace(/[&<>"]/g,
+  c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c])); }
+
+// -- wiring --
+document.querySelectorAll(".tabs button").forEach(b=>{
+  b.onclick=()=>{ document.querySelectorAll(".tabs button")
+      .forEach(x=>x.classList.remove("active")); b.classList.add("active");
+    ["visits","searches","time"].forEach(t=>
+      $("panel-"+t).classList.toggle("hidden", t!==b.dataset.tab)); };
+});
+document.querySelectorAll("th[data-sort]").forEach(th=>{
+  th.onclick=()=>{ const table=th.closest("table").querySelector("tbody").id
+      .replace("tb-",""); const key=th.dataset.sort;
+    const s=sortState[table]; sortState[table]=(s&&s.key===key)?
+      {key,dir:-s.dir}:{key,dir:1}; render(); };
+});
+["fx-user","fx-from","fx-to","fx-site"].forEach(id=>
+  $(id).addEventListener("input", render));
+$("fx-clear").onclick=()=>{ $("fx-user").value="All users"; $("fx-from").value="";
+  $("fx-to").value=""; $("fx-site").value=""; render(); };
+$("btn-refresh").onclick=loadData;
+$("btn-settings").onclick=()=>showSetup("");
+$("f-cancel").onclick=()=>{ if(getCfg()){ hideSetup(); $("app").classList
+  .remove("hidden"); } };
+$("f-save").onclick=()=>{ setCfg({ repo:$("f-repo").value.trim(),
+  branch:$("f-branch").value.trim()||"main", path:$("f-path").value.trim()||"data.json",
+  token:$("f-token").value.trim() }); loadData(); };
+
+loadData();
+</script>
+</body>
+</html>

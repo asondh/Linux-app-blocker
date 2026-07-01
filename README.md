@@ -185,6 +185,40 @@ and alerts can go to **multiple recipients** (comma-separate the addresses).
 Useful from a terminal: `sudo appblocker --email-test` (send a test alert) and
 `sudo appblocker --import-history` (import history once now).
 
+## Remote dashboard (view activity from your phone)
+
+You can view the activity from anywhere — no logging into the monitored machine.
+The machine pushes the data to a **private** GitHub repo, and a static dashboard
+page (`docs/index.html`) reads it **with your own token**, so the data is never
+public.
+
+**One-time setup:**
+
+1. **Create a private repo** for the data, e.g. `you/appblocker-data` (empty is
+   fine).
+2. **Make two fine-grained GitHub tokens** (GitHub → Settings → Developer
+   settings → Fine-grained tokens), each limited to that one repo:
+   - a **write** token (Contents: Read and write) — for the machine, and
+   - a **read** token (Contents: Read-only) — for the dashboard page.
+3. In AppBlocker → **📊 Activity → ☁ Remote Dashboard**, tick *Enable*, enter
+   the repo (`you/appblocker-data`) and the **write** token, then **Sync now**
+   to confirm it pushes `data.json`.
+4. **Host the dashboard page.** Put `docs/index.html` on **GitHub Pages**
+   (repo → Settings → Pages → source = `/docs`). It contains no data, so it's
+   fine for it to be public. *(GitHub Pages from a private repo needs a paid
+   plan — if your data repo is private and on the free plan, just put this one
+   HTML file in a small public repo and enable Pages there.)*
+5. **Open the Pages URL** on your phone/PC, enter the data repo + your **read**
+   token once (saved in that browser), and **bookmark it**.
+
+It refreshes on demand (the page's Refresh button, or **Sync now** on the
+machine) and **opportunistically** on a timer whenever the machine is on — same
+idea as the email digests. Terminal helper: `sudo appblocker --sync-now`.
+
+The dashboard has filterable tables (by user / date range / site) for **visits**,
+**searches**, and **time-per-site**. Everything stays private to your GitHub
+account and your browser; keep the tokens secret (both are revocable anytime).
+
 ## Browser lockdown (disable incognito)
 
 Click **🔒 Lockdown** (admin window) → *"Disable private/incognito browsing and
