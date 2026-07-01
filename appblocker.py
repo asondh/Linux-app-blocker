@@ -399,6 +399,36 @@ def _strip_managed_block(content):
     return content
 
 
+ADULT_LIST_PATHS = [
+    "/usr/share/appblocker/adult-domains.txt",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                 "packaging", "adult-domains.txt"),
+]
+_ADULT_CACHE = None
+
+
+def load_adult_domains():
+    """Load the bundled adult-content blocklist (cached). Returns a set."""
+    global _ADULT_CACHE
+    if _ADULT_CACHE is not None:
+        return _ADULT_CACHE
+    domains = set()
+    for path in ADULT_LIST_PATHS:
+        try:
+            with open(path) as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        d = normalize_domain(line)
+                        if d:
+                            domains.add(d)
+            break
+        except OSError:
+            continue
+    _ADULT_CACHE = domains
+    return domains
+
+
 def sync_blocked_websites(domains):
     """
     Make /etc/hosts reflect `domains` (blocklist mode). Only the managed block
@@ -532,6 +562,8 @@ def apply_browser_lockdown(enabled):
 MONITOR_HISTORY_INTERVAL = 45     # seconds between history imports
 VISIT_IDLE_CAP = 1800             # cap a single visit's duration at 30 min
 ALERT_DEBOUNCE = 600              # don't re-alert same user+site within 10 min
+ATTEMPT_DEBOUNCE = 300            # don't re-log same user+app block within 5 min
+TAMPER_GAP = 900                  # a monitoring gap over 15 min = "was off"
 CHROME_EPOCH_OFFSET = 11644473600  # seconds between 1601-01-01 and 1970-01-01
 
 
@@ -679,7 +711,10 @@ class HistoryStore:
                 "CREATE INDEX IF NOT EXISTS i_visits_user_ts ON visits(username, ts);"
                 "CREATE INDEX IF NOT EXISTS i_visits_domain ON visits(domain);"
                 "CREATE TABLE IF NOT EXISTS cursors ("
-                " source TEXT PRIMARY KEY, last INTEGER);")
+                " source TEXT PRIMARY KEY, last INTEGER);"
+                "CREATE TABLE IF NOT EXISTS attempts ("
+                " username TEXT, app TEXT, ts INTEGER);"
+                "CREATE INDEX IF NOT EXISTS i_attempts_ts ON attempts(ts);")
             conn.commit()
         finally:
             conn.close()
@@ -755,6 +790,52 @@ class HistoryStore:
             return conn.execute(
                 "SELECT username, domain, url, ts FROM visits WHERE ts > ? "
                 "ORDER BY ts", (int(ts),)).fetchall()
+        finally:
+            conn.close()
+
+    # -- generic state (heartbeat, digest timestamp) via the cursors table --
+    def get_state(self, key):
+        return self.get_cursor(key)
+
+    def set_state(self, key, value):
+        conn = self._connect()
+        try:
+            conn.execute(
+                "INSERT INTO cursors(source,last) VALUES(?,?) "
+                "ON CONFLICT(source) DO UPDATE SET last=excluded.last",
+                (key, int(value)))
+            conn.commit()
+        finally:
+            conn.close()
+
+    # -- blocked attempts --------------------------------------------------- #
+    def add_attempt(self, username, app, ts):
+        conn = self._connect()
+        try:
+            conn.execute("INSERT INTO attempts(username,app,ts) VALUES(?,?,?)",
+                         (username, app, int(ts)))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def attempts(self, username=None, start_day=None, end_day=None, limit=5000):
+        sql = "SELECT username, app, ts FROM attempts WHERE 1=1"
+        args = []
+        if username and username != "All users":
+            sql += " AND username=?"
+            args.append(username)
+        lo, hi = self._range(start_day, end_day)
+        if lo is not None:
+            sql += " AND ts >= ?"
+            args.append(lo)
+        if hi is not None:
+            sql += " AND ts < ?"
+            args.append(hi)
+        sql += " ORDER BY ts DESC LIMIT ?"
+        args.append(limit)
+        conn = self._connect()
+        try:
+            return conn.execute(sql, args).fetchall()
         finally:
             conn.close()
 
@@ -895,12 +976,68 @@ def import_all_history(state, store):
     return total
 
 
+def notify_email(email_cfg, subject, body, respect_quiet=True):
+    """Send an alert email if email is configured. Returns True if sent."""
+    if not (email_cfg.get("enabled") and email_cfg.get("host")
+            and email_cfg.get("to")):
+        return False
+    if respect_quiet and _within_quiet_hours(email_cfg):
+        sys.stderr.write("[monitor] quiet hours — email suppressed\n")
+        return False
+    send_email(email_cfg, subject, body)
+    return True
+
+
+def build_digest(store, since_ts):
+    """Compose a per-user activity summary since `since_ts`. Returns (subj, body)."""
+    now = int(time.time())
+    start_day = time.strftime("%Y-%m-%d", time.localtime(since_ts))
+    visits = [v for v in store.query(start_day=start_day, limit=100000)
+              if v[3] >= since_ts]        # (user, domain, url, ts)
+    attempts = [a for a in store.attempts(start_day=start_day, limit=100000)
+                if a[2] >= since_ts]      # (user, app, ts)
+    users = sorted({v[0] for v in visits} | {a[0] for a in attempts})
+    lines = [f"AppBlocker summary — {time.strftime('%Y-%m-%d %H:%M', time.localtime(now))}",
+             f"(activity since {time.strftime('%Y-%m-%d %H:%M', time.localtime(since_ts))})",
+             ""]
+    if not users:
+        lines.append("No activity recorded in this period.")
+    for user in users:
+        uv = [v for v in visits if v[0] == user]
+        ua = [a for a in attempts if a[0] == user]
+        # top sites by approx time
+        durs = store.site_durations(username=user, start_day=start_day)
+        durs = [d for d in durs if d[2] > 0][:5]
+        searches = sum(1 for _u, _d, url, _ts in uv if extract_search_query(url))
+        lines.append(f"== {user} ==")
+        lines.append(f"  {len(uv)} page visits, {searches} searches"
+                     + (f", {len(ua)} blocked-app attempts" if ua else ""))
+        if durs:
+            lines.append("  Most time on:")
+            for dom, cnt, sec in durs:
+                m = sec // 60
+                lines.append(f"    {dom} — ~{m}m ({cnt} visits)")
+        if ua:
+            apps = {}
+            for _u, app, _ts in ua:
+                apps[app] = apps.get(app, 0) + 1
+            lines.append("  Tried to open (blocked): "
+                         + ", ".join(f"{a} x{n}" for a, n in apps.items()))
+        lines.append("")
+    return "AppBlocker daily summary", "\n".join(lines)
+
+
 def scan_and_alert(state, store, on_alert, alert_state=None):
     """
     Scan visits newer than the alert watermark and fire on_alert for watched
     sites / keywords. Independent of the import cursors, so a GUI refresh can't
-    hide a visit from alerting. On first run it just sets the watermark to now,
-    so we never email a flood of pre-existing history. Returns alerts fired.
+    hide a visit from alerting, and alerts survive logoff/shutdown — a visit
+    made just before the machine went offline is picked up the next time it's
+    online (and immediately on boot), because the browser wrote it to disk.
+
+    On the very first run the watermark starts one hour back (not "now"), so a
+    just-made test visit still alerts, while days-old backlog does not flood.
+    Returns the number of alerts fired.
     """
     with state.lock:
         mon = dict(state.monitor)
@@ -909,9 +1046,13 @@ def scan_and_alert(state, store, on_alert, alert_state=None):
 
     wm = store.get_alert_watermark()
     if wm <= 0:
-        store.set_alert_watermark(int(time.time()))
-        return 0
+        # First run: consider the last hour "new" so a fresh visit alerts, but
+        # skip older history.
+        wm = int(time.time()) - 3600
+        store.set_alert_watermark(wm)
     if not watch and not keywords:
+        # Nothing to match; keep the watermark current so enabling later doesn't
+        # replay old history.
         store.set_alert_watermark(int(time.time()))
         return 0
 
@@ -959,27 +1100,37 @@ def _within_quiet_hours(cfg, now=None):
 class HistoryMonitor(threading.Thread):
     """Daemon thread: periodically import browser history and send alerts."""
 
-    def __init__(self, state):
+    def __init__(self, state, store=None):
         super().__init__(daemon=True)
         self.state = state
+        self.store = store
         self._stop = threading.Event()
         self._alert_state = {}
         self._last_sync = 0
+        self._checked_tamper = False
 
     def stop(self):
         self._stop.set()
 
     def run(self):
-        store = HistoryStore()
+        store = self.store or HistoryStore()
         while not self._stop.is_set():
             try:
                 self.state.reload_if_changed()
+                # On the first pass, see if monitoring was off for a while
+                # (machine powered down or the service stopped) and report it.
+                if not self._checked_tamper:
+                    self._checked_tamper = True
+                    self._check_tamper(store)
                 # Always record history so the Activity log is never empty, then
-                # run the alert scan (which no-ops unless email + watch/keywords
-                # are configured).
+                # run the alert scan (fires only if email + watch/keywords set).
+                # This runs immediately on startup, so visits made just before
+                # the machine went offline are alerted as soon as it's back on.
                 import_all_history(self.state, store)
                 scan_and_alert(self.state, store, self._alert,
                                self._alert_state)
+                store.set_state("__heartbeat__", int(time.time()))
+                self._maybe_digest(store)
                 # Opportunistically push the remote dashboard data.
                 now = time.time()
                 if now - self._last_sync >= SYNC_INTERVAL:
@@ -994,9 +1145,11 @@ class HistoryMonitor(threading.Thread):
                 sys.stderr.write(f"[monitor] sweep error: {exc}\n")
             self._stop.wait(MONITOR_HISTORY_INTERVAL)
 
-    def _alert(self, username, kind, detail, ts):
+    def _email_cfg(self):
         with self.state.lock:
-            cfg = dict(self.state.monitor.get("email") or {})
+            return dict(self.state.monitor.get("email") or {})
+
+    def _alert(self, username, kind, detail, ts):
         when = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
         if kind == "search":
             subject = f"[AppBlocker] {username} searched for flagged terms"
@@ -1007,14 +1160,68 @@ class HistoryMonitor(threading.Thread):
             body = (f"AppBlocker alert\n\nUser '{username}' visited a watched "
                     f"site:\n  {detail}\n  at {when}\n")
         sys.stderr.write(f"[monitor] ALERT ({kind}): {username} -> {detail}\n")
-        if cfg.get("enabled") and cfg.get("host") and cfg.get("to"):
-            if _within_quiet_hours(cfg):
-                sys.stderr.write("[monitor] quiet hours — email suppressed\n")
-                return
+        try:
+            notify_email(self._email_cfg(), subject, body)
+        except Exception as exc:
+            sys.stderr.write(f"[monitor] email failed: {exc}\n")
+
+    def block_alert(self, username, app, ts):
+        """Record a blocked-app attempt and (optionally) email it."""
+        try:
+            self.store.add_attempt(username, app, ts)
+        except Exception as exc:
+            sys.stderr.write(f"[monitor] record attempt failed: {exc}\n")
+        with self.state.lock:
+            mon = dict(self.state.monitor)
+        sys.stderr.write(f"[monitor] BLOCKED: {username} tried {app}\n")
+        if not mon.get("alert_blocked", True):
+            return
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+        try:
+            notify_email(mon.get("email") or {},
+                         f"[AppBlocker] {username} tried to open {app}",
+                         f"AppBlocker alert\n\nUser '{username}' tried to open a "
+                         f"blocked app:\n  {app}\n  at {when}\n(It was blocked.)\n")
+        except Exception as exc:
+            sys.stderr.write(f"[monitor] email failed: {exc}\n")
+
+    def _check_tamper(self, store):
+        hb = store.get_state("__heartbeat__")
+        now = int(time.time())
+        if hb and now - hb > TAMPER_GAP:
+            gap_min = (now - hb) // 60
+            frm = time.strftime("%Y-%m-%d %H:%M", time.localtime(hb))
+            to = time.strftime("%Y-%m-%d %H:%M", time.localtime(now))
+            sys.stderr.write(f"[monitor] monitoring gap {gap_min} min\n")
             try:
-                send_email(cfg, subject, body)
+                notify_email(
+                    self._email_cfg(), "[AppBlocker] Monitoring was off",
+                    f"AppBlocker was not running from {frm} to {to} "
+                    f"(~{gap_min} minutes) — the machine was off or the service "
+                    f"was stopped. Monitoring has resumed.\n", respect_quiet=False)
             except Exception as exc:
                 sys.stderr.write(f"[monitor] email failed: {exc}\n")
+
+    def _maybe_digest(self, store):
+        with self.state.lock:
+            mon = dict(self.state.monitor)
+        if not mon.get("digest_enabled"):
+            return
+        interval = max(1, int(mon.get("digest_hours", 24))) * 3600
+        last = store.get_state("__digest__")
+        now = int(time.time())
+        if last <= 0:
+            store.set_state("__digest__", now)   # start the clock, no immediate send
+            return
+        if now - last < interval:
+            return
+        subject, body = build_digest(store, last)
+        try:
+            if notify_email(mon.get("email") or {}, subject, body,
+                            respect_quiet=False):
+                store.set_state("__digest__", now)
+        except Exception as exc:
+            sys.stderr.write(f"[monitor] digest email failed: {exc}\n")
 
 
 # --------------------------------------------------------------------------- #
@@ -1042,19 +1249,23 @@ def build_report_data(store, days=REPORT_DAYS, limit=REPORT_LIMIT):
     for username, domain, url, ts in rows:
         visits.append({"u": username, "d": domain, "url": url, "ts": int(ts),
                        "q": extract_search_query(url)})
+    attempts = [{"u": u, "app": app, "ts": int(ts)}
+                for u, app, ts in store.attempts(start_day=start_day, limit=2000)]
     try:
         machine = os.uname().nodename
     except Exception:
         machine = ""
     now = time.time()
+    users = sorted(set(store.users()) | {a["u"] for a in attempts})
     return {
         "generated_at": int(now),
         "generated_at_str": time.strftime("%Y-%m-%d %H:%M", time.localtime(now)),
         "machine": machine,
         "days": days,
         "truncated": truncated,
-        "users": store.users(),
+        "users": users,
         "visits": visits,
+        "attempts": attempts,
     }
 
 
@@ -1128,10 +1339,12 @@ class ProcessMonitor(threading.Thread):
     `state.lock`.
     """
 
-    def __init__(self, state, on_change=None):
+    def __init__(self, state, on_change=None, on_block=None):
         super().__init__(daemon=True)
         self.state = state
         self.on_change = on_change  # called (from this thread) when state changes
+        self.on_block = on_block    # on_block(username, app_name, ts) on a kill
+        self._block_seen = {}       # (user, app) -> last-reported time (debounce)
         self._stop = threading.Event()
 
     def stop(self):
@@ -1211,6 +1424,7 @@ class ProcessMonitor(threading.Thread):
                     if (uids is None or uid in uids) and \
                             app_matches(app, comm, exe, cmd):
                         self._kill(pid)
+                        self._record_attempt(uid, app)
                         break
 
         # Keep /etc/hosts in sync (system mode, root only). The effective list
@@ -1220,7 +1434,10 @@ class ProcessMonitor(threading.Thread):
             with self.state.lock:
                 domains = set(self.state.websites)
                 lockdown_on = self.state.lockdown.get("enabled")
+                adult_on = self.state.block_adult
             domains |= dynamic_sites
+            if adult_on:
+                domains |= load_adult_domains()
             sync_blocked_websites(sorted(domains))
             # Keep the browser incognito/history-deletion lockdown in sync too.
             apply_browser_lockdown(lockdown_on)
@@ -1290,6 +1507,25 @@ class ProcessMonitor(threading.Thread):
             if comm or exe_base or cmdline:
                 yield pid, comm, uid, exe_base, cmdline
 
+    def _record_attempt(self, uid, app):
+        """Report a blocked-app attempt (debounced per user+app)."""
+        if not self.on_block:
+            return
+        name = app.get("name") or app.get("proc_name") or "app"
+        try:
+            username = pwd.getpwuid(uid).pw_name
+        except (KeyError, OverflowError):
+            username = str(uid)
+        key = (username, name)
+        now = time.time()
+        if now - self._block_seen.get(key, 0) < ATTEMPT_DEBOUNCE:
+            return
+        self._block_seen[key] = now
+        try:
+            self.on_block(username, name, now)
+        except Exception as exc:
+            sys.stderr.write(f"[monitor] on_block error: {exc}\n")
+
     @staticmethod
     def _kill(pid):
         for sig in (signal.SIGTERM, signal.SIGKILL):
@@ -1336,6 +1572,7 @@ class AppState:
         self.monitor = self._default_monitor()  # website-visit monitoring config
         self.lockdown = {"enabled": False}      # browser incognito lockdown
         self.sync = self._default_sync()        # remote dashboard (GitHub) sync
+        self.block_adult = False                # built-in adult-content blocklist
         self._mtime = None
         self.load()
 
@@ -1359,6 +1596,9 @@ class AppState:
             "enabled": True,        # history is always recorded by the daemon
             "watch": [],            # domains that trigger an alert
             "keywords": [],         # search terms that trigger a safety alert
+            "alert_blocked": True,  # email when a child tries a blocked app
+            "digest_enabled": False,   # daily summary email
+            "digest_hours": 24,        # digest interval
             "email": {"enabled": False, "host": "", "port": 587,
                       "username": "", "password": "", "from": "", "to": "",
                       "quiet_start": "", "quiet_end": ""},
@@ -1372,6 +1612,12 @@ class AppState:
                             if normalize_domain(d)]
             mon["keywords"] = [k.strip() for k in value.get("keywords", [])
                                if k and k.strip()]
+            mon["alert_blocked"] = bool(value.get("alert_blocked", True))
+            mon["digest_enabled"] = bool(value.get("digest_enabled", False))
+            try:
+                mon["digest_hours"] = max(1, int(value.get("digest_hours", 24)))
+            except (TypeError, ValueError):
+                mon["digest_hours"] = 24
             email = value.get("email") or {}
             if isinstance(email, dict):
                 mon["email"].update({k: email.get(k, mon["email"][k])
@@ -1449,6 +1695,7 @@ class AppState:
             self.lockdown = {"enabled": bool(
                 (data.get("lockdown") or {}).get("enabled"))}
             self.sync = self._normalize_sync(data.get("sync"))
+            self.block_adult = bool(data.get("block_adult"))
             self._mtime = self._file_mtime()
         else:
             self.apps = self._default_apps()
@@ -1457,6 +1704,7 @@ class AppState:
             self.monitor = self._default_monitor()
             self.lockdown = {"enabled": False}
             self.sync = self._default_sync()
+            self.block_adult = False
             self.save()
 
     def reload_if_changed(self):
@@ -1478,6 +1726,7 @@ class AppState:
                 self.lockdown = {"enabled": bool(
                     (data.get("lockdown") or {}).get("enabled"))}
                 self.sync = self._normalize_sync(data.get("sync"))
+                self.block_adult = bool(data.get("block_adult"))
                 self._mtime = mtime
             return True
         return False
@@ -1491,7 +1740,8 @@ class AppState:
                                  "websites": self.websites,
                                  "monitor": self.monitor,
                                  "lockdown": self.lockdown,
-                                 "sync": self.sync})
+                                 "sync": self.sync,
+                                 "block_adult": self.block_adult})
         self._mtime = self._file_mtime()
 
     @staticmethod
@@ -1637,6 +1887,12 @@ class AppState:
             self.sync = self._normalize_sync(cfg)
             self.save_locked()
             return dict(self.sync)
+
+    def set_block_adult(self, enabled):
+        with self.lock:
+            self.block_adult = bool(enabled)
+            self.save_locked()
+            return self.block_adult
 
 
 # --------------------------------------------------------------------------- #
@@ -2546,6 +2802,16 @@ class AppBlockerUI:
             searches.column(c, width=w, anchor="w")
         searches.pack(fill="x")
 
+        tk.Label(mid, text="Blocked-app attempts", bg=COLOR_BG, fg=COLOR_HEADER,
+                 font=("Helvetica", 10, "bold")).pack(anchor="w", pady=(8, 0))
+        attempts = ttk.Treeview(mid, columns=("when", "user", "app"),
+                                show="headings", height=4)
+        for c, t, w in (("when", "When", 150), ("user", "User", 110),
+                        ("app", "Tried to open", 300)):
+            attempts.heading(c, text=t)
+            attempts.column(c, width=w, anchor="w")
+        attempts.pack(fill="x")
+
         tk.Label(mid, text="Visits (most recent first)", bg=COLOR_BG,
                  fg=COLOR_HEADER, font=("Helvetica", 10, "bold")).pack(
                      anchor="w", pady=(8, 0))
@@ -2576,12 +2842,19 @@ class AppBlockerUI:
                                    start_day=start, end_day=end)
                 durs = store.site_durations(username=user, start_day=start,
                                             end_day=end)
+                atts = store.attempts(username=user, start_day=start,
+                                      end_day=end)
             except Exception as exc:
                 messagebox.showerror("Query error", str(exc), parent=win)
                 return
             stats.delete(*stats.get_children())
             for dom, cnt, sec in durs[:40]:
                 stats.insert("", "end", values=(dom, cnt, fmt_dur(sec)))
+            attempts.delete(*attempts.get_children())
+            for username_a, app, ts in atts:
+                attempts.insert("", "end", values=(
+                    time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)),
+                    username_a, app))
             searches.delete(*searches.get_children())
             tree.delete(*tree.get_children())
             for username, domain, url, ts in rows:
@@ -2650,6 +2923,20 @@ class AppBlockerUI:
         keywords.pack(fill="x", padx=16)
         keywords.insert("1.0", "\n".join(mon.get("keywords", [])))
 
+        alert_blocked = tk.BooleanVar(value=mon.get("alert_blocked", True))
+        tk.Checkbutton(win, variable=alert_blocked, bg=COLOR_BG, anchor="w",
+                       text="Email me when a child tries to open a blocked app"
+                       ).pack(fill="x", padx=16, pady=(6, 0))
+        digest_on = tk.BooleanVar(value=mon.get("digest_enabled", False))
+        drow = tk.Frame(win, bg=COLOR_BG)
+        drow.pack(fill="x", padx=16)
+        tk.Checkbutton(drow, variable=digest_on, bg=COLOR_BG,
+                       text="Email me a summary every").pack(side="left")
+        digest_hours = tk.StringVar(value=str(mon.get("digest_hours", 24)))
+        tk.Spinbox(drow, from_=1, to=168, width=4, textvariable=digest_hours
+                   ).pack(side="left", padx=4)
+        tk.Label(drow, text="hours", bg=COLOR_BG).pack(side="left")
+
         em_on = tk.BooleanVar(value=email.get("enabled", False))
         tk.Checkbutton(win, text="Send email alerts (SMTP)", variable=em_on,
                        bg=COLOR_BG, font=("Helvetica", 11, "bold")).pack(
@@ -2684,6 +2971,12 @@ class AppBlockerUI:
                             if ln.strip()]
             mon["keywords"] = [ln for ln in keywords.get(
                 "1.0", tk.END).splitlines() if ln.strip()]
+            mon["alert_blocked"] = alert_blocked.get()
+            mon["digest_enabled"] = digest_on.get()
+            try:
+                mon["digest_hours"] = max(1, int(digest_hours.get()))
+            except ValueError:
+                mon["digest_hours"] = 24
             em = {"enabled": em_on.get()}
             for key, v in vars_.items():
                 em[key] = v.get().strip()
@@ -2739,6 +3032,13 @@ class AppBlockerUI:
         with self.state.lock:
             txt.insert("1.0", "\n".join(self.state.websites))
 
+        adult_var = tk.BooleanVar(value=self.state.block_adult)
+        n_adult = len(load_adult_domains())
+        tk.Checkbutton(
+            win, variable=adult_var, bg=COLOR_BG, anchor="w",
+            text=f"Also block a built-in adult-content list ({n_adult} sites)"
+        ).pack(fill="x", padx=18, pady=(8, 0))
+
         tk.Label(win, text="Note: this is machine-wide. A browser using "
                  "“secure DNS” (DoH) or a VPN can bypass it.", bg=COLOR_BG,
                  fg="#b9770e", wraplength=440, justify="left").pack(
@@ -2748,12 +3048,17 @@ class AppBlockerUI:
             raw = txt.get("1.0", tk.END)
             domains = [line for line in raw.splitlines() if line.strip()]
             saved = self.state.set_websites(domains)
+            self.state.set_block_adult(adult_var.get())
             # Apply immediately (we are root in system mode); the daemon also
             # keeps it in sync, but this gives instant feedback.
-            sync_blocked_websites(saved)
+            effective = set(saved)
+            if adult_var.get():
+                effective |= load_adult_domains()
+            sync_blocked_websites(sorted(effective))
             messagebox.showinfo(
-                "Saved", f"{len(saved)} website(s) blocked.\n\nChanges take "
-                "effect right away (you may need to reload open tabs).",
+                "Saved", f"{len(saved)} website(s) blocked"
+                + (f" + adult list ({n_adult})" if adult_var.get() else "")
+                + ".\n\nChanges take effect right away (reload open tabs).",
                 parent=win)
             win.destroy()
 
@@ -3119,8 +3424,11 @@ def run_daemon():
 
     ensure_app_dir()
     state = AppState()
-    monitor = ProcessMonitor(state)
-    history = HistoryMonitor(state)  # browser-history logging + email alerts
+    store = HistoryStore()           # shared by the history monitor and kill log
+    history = HistoryMonitor(state, store)  # history logging + alerts + digests
+    # The kill sweep reports blocked-app attempts to the history monitor, which
+    # logs them and (optionally) emails.
+    monitor = ProcessMonitor(state, on_block=history.block_alert)
 
     # Run the sweep loop in the foreground so systemd supervises this process
     # directly (Type=simple). Translate SIGTERM into a clean stop.

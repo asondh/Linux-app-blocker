@@ -29,7 +29,8 @@ mkdir -p "$STAGE/DEBIAN" \
          "$STAGE/usr/bin" \
          "$STAGE/usr/share/applications" \
          "$STAGE/usr/lib/systemd/system" \
-         "$STAGE/usr/share/doc/appblocker"
+         "$STAGE/usr/share/doc/appblocker" \
+         "$STAGE/usr/share/appblocker"
 mkdir -p "$DIST"
 
 # --- control + maintainer scripts ------------------------------------------
@@ -45,6 +46,8 @@ install -m 644 "$ROOT/packaging/appblocker.desktop" \
     "$STAGE/usr/share/applications/appblocker.desktop"
 install -m 644 "$ROOT/appblocker.service" \
     "$STAGE/usr/lib/systemd/system/appblocker.service"
+install -m 644 "$ROOT/packaging/adult-domains.txt" \
+    "$STAGE/usr/share/appblocker/adult-domains.txt"
 
 # --- docs ------------------------------------------------------------------
 install -m 644 "$ROOT/README.md" "$STAGE/usr/share/doc/appblocker/README.md"
