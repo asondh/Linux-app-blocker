@@ -29,13 +29,17 @@
   .tabs { display:flex; gap:8px; margin-bottom:10px; }
   .tabs button { background:#ecf0f1; color:#2c3e50; }
   .tabs button.active { background:var(--head); color:#fff; }
+  /* overflow-x:auto = horizontal-swipe fallback so nothing is ever clipped on
+     a phone; combined with word-wrapping cells below, content usually just
+     wraps and fits. */
   .card { background:var(--card); border:1px solid var(--line); border-radius:8px;
-          padding:0; margin-bottom:16px; overflow:hidden; }
+          padding:0; margin-bottom:16px; overflow-x:auto;
+          -webkit-overflow-scrolling:touch; }
   .card h2 { font-size:14px; margin:0; padding:10px 14px; background:#f8f9fa;
              border-bottom:1px solid var(--line); }
   table { width:100%; border-collapse:collapse; font-size:13px; }
   th, td { text-align:left; padding:8px 12px; border-bottom:1px solid var(--line);
-           vertical-align:top; }
+           vertical-align:top; word-break:break-word; overflow-wrap:anywhere; }
   th { background:#fbfcfc; cursor:pointer; user-select:none; white-space:nowrap; }
   td.url { word-break:break-all; color:#34495e; }
   .muted { color:var(--muted); }
