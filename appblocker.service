@@ -6,7 +6,9 @@ After=multi-user.target
 [Service]
 Type=simple
 # Runs as root so it can enforce blocks for every user on the machine.
-ExecStart=/usr/local/bin/appblocker --daemon
+# The .deb installs the program to /usr/bin/appblocker. The manual install.sh
+# (which installs to /usr/local/bin) rewrites this ExecStart path to match.
+ExecStart=/usr/bin/appblocker --daemon
 Restart=always
 RestartSec=3
 NoNewPrivileges=true
