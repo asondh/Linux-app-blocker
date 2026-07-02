@@ -71,6 +71,10 @@ chmod 644 "$APPS/appblocker.desktop"
 
 echo "==> Installing and starting the background service"
 install -Dm644 "$SCRIPT_DIR/appblocker.service" "$UNIT"
+# The shipped unit points ExecStart at /usr/bin/appblocker (the .deb path);
+# this manual installer puts the program in $BIN, so rewrite it to match or the
+# service would fail to exec (systemd status 203/EXEC).
+sed -i "s#^ExecStart=.*#ExecStart=$BIN/appblocker --daemon#" "$UNIT"
 systemctl daemon-reload
 systemctl enable --now appblocker.service
 
