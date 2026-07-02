@@ -1346,7 +1346,8 @@ def build_report_data(store, days=REPORT_DAYS, limit=REPORT_LIMIT,
     data = {
         "generated_at": int(now),
         "generated_at_str": time.strftime("%Y-%m-%d %H:%M", time.localtime(now)),
-        "machine": machine,
+        "machine": machine or machine_id(),
+        "machine_id": machine_id(),
         "days": days,
         "truncated": truncated,
         "users": users,
@@ -1358,6 +1359,38 @@ def build_report_data(store, days=REPORT_DAYS, limit=REPORT_LIMIT,
     if state is not None:
         data["control"] = _control_snapshot(state)
     return data
+
+
+def machine_id():
+    """A filesystem/URL-safe id for this machine (its data filename in the repo)."""
+    try:
+        host = os.uname().nodename or "machine"
+    except Exception:
+        host = "machine"
+    safe = "".join(c if (c.isalnum() or c in "._-") else "-" for c in host)
+    safe = safe.strip("-._").lower()
+    return safe or "machine"
+
+
+def _sync_base_dir(cfg):
+    """Directory (with trailing slash, or '') the per-machine files live under."""
+    p = (cfg.get("path") or "data.json").strip() or "data.json"
+    return (p.rsplit("/", 1)[0] + "/") if "/" in p else ""
+
+
+def machine_data_path(cfg):
+    """Where THIS machine publishes its data — machines/<id>.json under the base.
+
+    Each machine writes only its own file, so several machines can share one
+    repo without overwriting each other. The dashboard lists the machines/
+    folder to discover them all.
+    """
+    return f"{_sync_base_dir(cfg)}machines/{machine_id()}.json"
+
+
+def machine_commands_path(cfg):
+    """The per-machine command queue the dashboard writes and this machine reads."""
+    return f"{_sync_base_dir(cfg)}machines/{machine_id()}.commands.json"
 
 
 def _gh_request(url, token, method="GET", body=None):
@@ -1383,7 +1416,7 @@ def push_reports_to_github(cfg, data):
     """
     repo = cfg.get("repo", "").strip()
     token = cfg.get("token", "").strip()
-    path = cfg.get("path", "data.json").strip() or "data.json"
+    path = machine_data_path(cfg)   # machines/<this-host>.json — never clobbers others
     branch = cfg.get("branch", "main").strip() or "main"
     if not repo or not token:
         raise ValueError("Dashboard repo and token are required.")
@@ -1426,22 +1459,14 @@ def sync_reports(state, store):
 # highest id it has processed (a watermark in its local store) so each command
 # runs exactly once.
 # --------------------------------------------------------------------------- #
-def _commands_path(cfg):
-    """commands.json sits next to the configured data.json path."""
-    p = (cfg.get("path") or "data.json").strip() or "data.json"
-    if "/" in p:
-        return p.rsplit("/", 1)[0] + "/commands.json"
-    return "commands.json"
-
-
 def fetch_commands(cfg):
-    """Read the pending command list from the repo. Returns a list (maybe empty)."""
+    """Read this machine's pending command list from the repo (maybe empty)."""
     repo = cfg.get("repo", "").strip()
     token = cfg.get("token", "").strip()
     branch = cfg.get("branch", "main").strip() or "main"
     if not repo or not token:
         return []
-    api = f"https://api.github.com/repos/{repo}/contents/{_commands_path(cfg)}"
+    api = f"https://api.github.com/repos/{repo}/contents/{machine_commands_path(cfg)}"
     try:
         obj = _gh_request(f"{api}?ref={branch}", token)
     except urllib.error.HTTPError as exc:
