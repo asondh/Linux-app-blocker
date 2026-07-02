@@ -84,6 +84,15 @@
   #ctl-status { font-size:13px; padding:0 14px 12px; }
   #ctl-status .line { padding:3px 0; }
   .ok { color:#1e8449; } .bad { color:var(--red); } .wait { color:var(--accent); }
+  /* Multi-machine: the Machine column only appears when >1 machine is present. */
+  .col-m { display:none; }
+  body.multi .col-m { display:table-cell; }
+  .mtag { display:inline-block; background:#eef2f7; color:#34495e;
+          border-radius:10px; padding:1px 7px; font-size:11px; white-space:nowrap; }
+  #ctl-machine-row { padding:12px 14px; border-bottom:1px solid var(--line);
+                     display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+  #ctl-machine-row select { padding:8px; border:1px solid var(--line);
+                            border-radius:6px; font-size:14px; }
 </style>
 </head>
 <body>
@@ -97,14 +106,15 @@
 <!-- Setup / settings form -->
 <div id="setup" class="setup hidden">
   <h2>Connect to your data</h2>
-  <p class="hint">The dashboard reads a private <code>data.json</code> that the
-  monitored machine pushes to a private GitHub repo. Your token stays in this
-  browser only (nothing is sent anywhere except GitHub's API).</p>
+  <p class="hint">Each monitored machine publishes a private file to a
+  <code>machines/</code> folder in your private GitHub repo; this dashboard
+  reads them all and shows them together. Your token stays in this browser only
+  (nothing is sent anywhere except GitHub's API).</p>
   <label>Repository (owner/name)</label>
   <input id="f-repo" placeholder="yourname/appblocker-data">
   <label>Branch</label>
   <input id="f-branch" placeholder="main" value="main">
-  <label>File path</label>
+  <label>Folder (leave as data.json)</label>
   <input id="f-path" placeholder="data.json" value="data.json">
   <label>GitHub token</label>
   <input id="f-token" type="password" placeholder="github_pat_...">
@@ -122,6 +132,9 @@
 <!-- Main dashboard -->
 <div id="app" class="wrap hidden">
   <div class="filters">
+    <label class="col-m">Machine
+      <select id="fx-machine"><option>All machines</option></select>
+    </label>
     <label>User
       <select id="fx-user"><option>All users</option></select>
     </label>
@@ -149,6 +162,7 @@
     <h2>Visits <span id="c-visits" class="muted"></span></h2>
     <table><thead><tr>
       <th data-sort="ts">When</th><th data-sort="user">User</th>
+      <th class="col-m" data-sort="m">Machine</th>
       <th data-sort="url">Page</th></tr></thead>
       <tbody id="tb-visits"></tbody></table>
     <div id="e-visits" class="empty hidden">No visits match.</div>
@@ -158,6 +172,7 @@
     <h2>Searches <span id="c-searches" class="muted"></span></h2>
     <table><thead><tr>
       <th data-sort="ts">When</th><th data-sort="user">User</th>
+      <th class="col-m" data-sort="m">Machine</th>
       <th data-sort="domain">Where</th><th data-sort="q">Searched for</th>
       </tr></thead><tbody id="tb-searches"></tbody></table>
     <div id="e-searches" class="empty hidden">No searches match.</div>
@@ -176,6 +191,7 @@
     <h2>Blocked-app attempts <span id="c-blocked" class="muted"></span></h2>
     <table><thead><tr>
       <th data-sort="ts">When</th><th data-sort="user">User</th>
+      <th class="col-m" data-sort="m">Machine</th>
       <th data-sort="app">Tried to open</th></tr></thead>
       <tbody id="tb-blocked"></tbody></table>
     <div id="e-blocked" class="empty hidden">No blocked attempts.</div>
@@ -186,10 +202,12 @@
 "use strict";
 const LS = "appblocker.dashboard.cfg";
 const IDLE_CAP = 1800; // seconds; matches the app's time-on-site estimate
-let DATA = null;               // {generated_at_str, machine, visits:[...]}
+let DATA = null;               // merged view: {visits, attempts, users, machines}
+let MACHINES = [];             // [{id, name, data}] one per machine file
+let SEL_CTL = null;            // Controls tab: selected machine id, or "*" = all
 let sortState = {};            // per-table sort
 let lastId = 0;                // last command id we minted (keep them increasing)
-let SENT = {};                 // id -> {action,label} sent this session (pending UI)
+let SENT = {};                 // id -> {label, targets:[ids]} sent this session
 let CTLMSG = "";               // transient controls status message (HTML)
 
 const $ = (id) => document.getElementById(id);
@@ -211,58 +229,122 @@ function showSetup(err){
 }
 function hideSetup(){ $("setup").classList.add("hidden"); }
 
+function baseDir(){
+  const p = (getCfg().path || "data.json");
+  return p.includes("/") ? p.replace(/\/[^\/]*$/, "/") : "";
+}
+async function ghList(dirPath){
+  const c = getCfg();
+  const url = `https://api.github.com/repos/${c.repo}/contents/${dirPath}` +
+              `?ref=${encodeURIComponent(c.branch||"main")}&t=${Date.now()}`;
+  const res = await fetch(url, { headers: hdr(c,false), cache:"no-store" });
+  if(res.status === 404) return null;                 // no machines/ folder yet
+  if(res.status === 401 || res.status === 403) throw { code: res.status };
+  if(!res.ok) throw new Error("GitHub " + res.status);
+  return await res.json();                            // array of dir entries
+}
+async function ghGetRaw(path){
+  const c = getCfg();
+  const url = `https://api.github.com/repos/${c.repo}/contents/${path}` +
+              `?ref=${encodeURIComponent(c.branch||"main")}&t=${Date.now()}`;
+  const res = await fetch(url, { headers: {
+    "Authorization":"Bearer "+c.token, "Accept":"application/vnd.github.raw+json",
+    "X-GitHub-Api-Version":"2022-11-28" }, cache:"no-store" });
+  if(!res.ok) throw new Error("GitHub " + res.status);
+  return JSON.parse(await res.text());
+}
+function mergeMachines(){
+  const visits=[], attempts=[], users=new Set();
+  MACHINES.forEach(m => {
+    const nm = m.name;
+    (m.data.visits||[]).forEach(v => visits.push(Object.assign({_m:nm}, v)));
+    (m.data.attempts||[]).forEach(a => { attempts.push(Object.assign({_m:nm}, a)); users.add(a.u); });
+    (m.data.users||[]).forEach(u => users.add(u));
+  });
+  DATA = { visits, attempts, users:[...users].sort(),
+           machines: MACHINES.map(m=>({id:m.id, name:m.name})),
+           truncated: MACHINES.some(m=>m.data.truncated) };
+}
 async function loadData(){
   const c = getCfg();
   if(!c || !c.repo || !c.token){ showSetup(); return; }
   $("meta").textContent = "Loading…";
-  const url = `https://api.github.com/repos/${c.repo}/contents/${c.path}` +
-              `?ref=${encodeURIComponent(c.branch||"main")}`;
   try {
-    const res = await fetch(url, { headers: {
-      "Authorization": "Bearer " + c.token,
-      "Accept": "application/vnd.github.raw+json",
-      "X-GitHub-Api-Version": "2022-11-28"
-    }});
-    if(res.status === 401 || res.status === 403){
-      showSetup("Token rejected (401/403). Check the token and its repo access.");
-      return;
+    let entries;
+    try { entries = await ghList(baseDir()+"machines"); }
+    catch(e){
+      if(e && (e.code===401||e.code===403)){
+        showSetup("Token rejected (401/403). Check the token and its repo access.");
+        return;
+      }
+      throw e;
     }
-    if(res.status === 404){
-      showSetup("Not found (404). Check owner/repo, path and branch — and that "
-                + "the machine has pushed data.json at least once."); return;
+    MACHINES = [];
+    if(entries === null){
+      // Backward-compat: no machines/ folder — read the legacy single data.json.
+      try {
+        const d = await ghGetRaw(getCfg().path || "data.json");
+        MACHINES.push({ id:d.machine_id||d.machine||"machine",
+                        name:d.machine||d.machine_id||"machine", data:d });
+      } catch(e){
+        showSetup("No machine data found yet. Update AppBlocker on your "+
+          "machine(s) to the latest version and let one publish once. ("+e.message+")");
+        return;
+      }
+    } else {
+      const files = entries.filter(e => e.type==="file" &&
+        /\.json$/.test(e.name) && !/\.commands\.json$/.test(e.name)).map(e=>e.path);
+      if(!files.length){
+        showSetup("The machines/ folder is empty — no machine has published yet. "+
+          "Update AppBlocker and let a machine push once."); return;
+      }
+      const datas = await Promise.all(files.map(p => ghGetRaw(p).catch(()=>null)));
+      datas.forEach((d,i) => { if(d) MACHINES.push({
+        id: d.machine_id||d.machine||("m"+i),
+        name: d.machine||d.machine_id||("machine "+(i+1)), data:d }); });
+      if(!MACHINES.length){ showSetup("Couldn't read any machine files."); return; }
     }
-    if(!res.ok){ showSetup("GitHub error: " + res.status); return; }
-    DATA = JSON.parse(await res.text());
+    mergeMachines();
     hideSetup();
     $("app").classList.remove("hidden");
     $("btn-refresh").classList.remove("hidden");
     $("btn-settings").classList.remove("hidden");
+    document.body.classList.toggle("multi", MACHINES.length>1);
     initFilters();
     render();
     renderControls();
-    const trunc = DATA.truncated ? " · showing most recent " +
-        (DATA.visits||[]).length + " visits" : "";
-    $("meta").textContent = `Updated ${DATA.generated_at_str||"?"}` +
-        (DATA.machine? " · "+DATA.machine : "") + trunc;
-  } catch(e){ showSetup("Could not load: " + e.message); }
+    const latest = Math.max.apply(null, MACHINES.map(m=>m.data.generated_at||0));
+    const newest = MACHINES.find(m => (m.data.generated_at||0)===latest);
+    const head = MACHINES.length>1 ? (MACHINES.length+" machines") : MACHINES[0].name;
+    const trunc = DATA.truncated ? " · some history truncated" : "";
+    $("meta").textContent = head + " · updated " +
+        ((newest && newest.data.generated_at_str) || "?") + trunc;
+  } catch(e){ showSetup("Could not load: " + (e.message||e)); }
 }
 
 function initFilters(){
-  const users = ["All users"].concat(DATA.users || []);
-  const sel = $("fx-user"); const cur = sel.value;
-  sel.innerHTML = "";
-  users.forEach(u => { const o=document.createElement("option");
-                       o.textContent=u; sel.appendChild(o); });
-  if(users.includes(cur)) sel.value = cur;
+  const usel = $("fx-user"), ucur = usel.value;
+  usel.innerHTML = "";
+  ["All users"].concat(DATA.users||[]).forEach(u => {
+    const o=document.createElement("option"); o.textContent=u; usel.appendChild(o); });
+  if([...usel.options].some(o=>o.value===ucur)) usel.value = ucur;
+
+  const msel = $("fx-machine"), mcur = msel.value;
+  msel.innerHTML = "";
+  ["All machines"].concat((DATA.machines||[]).map(m=>m.name)).forEach(n => {
+    const o=document.createElement("option"); o.textContent=n; msel.appendChild(o); });
+  if([...msel.options].some(o=>o.value===mcur)) msel.value = mcur;
 }
 
 function activeRows(){
   const u = $("fx-user").value;
+  const mac = $("fx-machine").value;
   const site = ($("fx-site").value||"").toLowerCase().trim();
   const from = $("fx-from").value ? Date.parse($("fx-from").value)/1000 : null;
   const to = $("fx-to").value ? Date.parse($("fx-to").value)/1000 + 86400 : null;
   return (DATA.visits||[]).filter(v => {
     if(u !== "All users" && v.u !== u) return false;
+    if(mac !== "All machines" && v._m !== mac) return false;
     if(site && !(v.d||"").toLowerCase().includes(site)) return false;
     if(from !== null && v.ts < from) return false;
     if(to !== null && v.ts >= to) return false;
@@ -307,30 +389,32 @@ function sortRows(rows, table, keys){
   });
 }
 
+function mcell(m){ return `<td class="col-m"><span class="mtag">${esc(m||"")}</span></td>`; }
+
 function render(){
   const rows = activeRows();
   // Visits
-  let vs = sortRows(rows.map(v=>({ts:v.ts,user:v.u,url:v.url||v.d})),
+  let vs = sortRows(rows.map(v=>({ts:v.ts,user:v.u,m:v._m,url:v.url||v.d})),
                     "visits");
   const tbV=$("tb-visits"); tbV.innerHTML="";
   vs.slice(0,3000).forEach(v=>{ const tr=document.createElement("tr");
-    tr.innerHTML=`<td>${fmtWhen(v.ts)}</td><td>${esc(v.user)}</td>`+
+    tr.innerHTML=`<td>${fmtWhen(v.ts)}</td><td>${esc(v.user)}</td>`+mcell(v.m)+
                  `<td class="url">${esc(v.url)}</td>`; tbV.appendChild(tr); });
   $("c-visits").textContent="("+rows.length+")";
   $("e-visits").classList.toggle("hidden", rows.length>0);
 
   // Searches
-  const sr = rows.filter(v=>v.q).map(v=>({ts:v.ts,user:v.u,domain:v.d,q:v.q}));
+  const sr = rows.filter(v=>v.q).map(v=>({ts:v.ts,user:v.u,m:v._m,domain:v.d,q:v.q}));
   const srS = sortRows(sr,"searches");
   const tbS=$("tb-searches"); tbS.innerHTML="";
   srS.forEach(v=>{ const tr=document.createElement("tr");
-    tr.innerHTML=`<td>${fmtWhen(v.ts)}</td><td>${esc(v.user)}</td>`+
+    tr.innerHTML=`<td>${fmtWhen(v.ts)}</td><td>${esc(v.user)}</td>`+mcell(v.m)+
                  `<td>${esc(v.domain)}</td><td>${esc(v.q)}</td>`;
     tbS.appendChild(tr); });
   $("c-searches").textContent="("+sr.length+")";
   $("e-searches").classList.toggle("hidden", sr.length>0);
 
-  // Time per site
+  // Time per site (aggregated across the filtered rows / selected machine)
   const durs = sortRows(computeDurations(rows), "time");
   const tbT=$("tb-time"); tbT.innerHTML="";
   durs.forEach(d=>{ const tr=document.createElement("tr");
@@ -339,19 +423,20 @@ function render(){
   $("c-time").textContent="("+durs.length+")";
   $("e-time").classList.toggle("hidden", durs.length>0);
 
-  // Blocked-app attempts (filtered by user + date; site filter doesn't apply)
-  const u=$("fx-user").value;
+  // Blocked-app attempts (user + machine + date; site filter doesn't apply)
+  const u=$("fx-user").value, mac=$("fx-machine").value;
   const from=$("fx-from").value?Date.parse($("fx-from").value)/1000:null;
   const to=$("fx-to").value?Date.parse($("fx-to").value)/1000+86400:null;
   let att=(DATA.attempts||[]).filter(a=>{
     if(u!=="All users"&&a.u!==u) return false;
+    if(mac!=="All machines"&&a._m!==mac) return false;
     if(from!==null&&a.ts<from) return false;
     if(to!==null&&a.ts>=to) return false;
     return true; });
-  att=sortRows(att.map(a=>({ts:a.ts,user:a.u,app:a.app})),"blocked");
+  att=sortRows(att.map(a=>({ts:a.ts,user:a.u,m:a._m,app:a.app})),"blocked");
   const tbB=$("tb-blocked"); tbB.innerHTML="";
   att.forEach(a=>{ const tr=document.createElement("tr");
-    tr.innerHTML=`<td>${fmtWhen(a.ts)}</td><td>${esc(a.user)}</td>`+
+    tr.innerHTML=`<td>${fmtWhen(a.ts)}</td><td>${esc(a.user)}</td>`+mcell(a.m)+
                  `<td>${esc(a.app)}</td>`; tbB.appendChild(tr); });
   $("c-blocked").textContent="("+att.length+")";
   $("e-blocked").classList.toggle("hidden", att.length>0);
@@ -368,10 +453,8 @@ function hdr(c, write){
   if(write) h["Content-Type"]="application/json";
   return h;
 }
-function commandsPath(){
-  const p=(getCfg().path||"data.json");
-  return p.includes("/") ? p.replace(/\/[^\/]*$/,"/commands.json") : "commands.json";
-}
+function machineById(id){ return MACHINES.find(m=>m.id===id); }
+function commandsPathFor(id){ return baseDir()+"machines/"+id+".commands.json"; }
 async function ghGetCommands(path){
   const c=getCfg();
   const url=`https://api.github.com/repos/${c.repo}/contents/${path}`+
@@ -388,37 +471,52 @@ async function ghGetCommands(path){
   }catch(e){ commands=[]; }
   return {sha:j.sha, commands};
 }
-async function sendCommand(cmd, label){
+async function sendToMachine(id, cmd){
+  const c=getCfg(); const path=commandsPathFor(id);
+  const m=machineById(id); const wm=(m&&m.data&&m.data.cmd_ts)||0;
+  for(let attempt=0; attempt<2; attempt++){
+    const cur=await ghGetCommands(path);
+    // Drop commands this machine already processed so the file stays small.
+    let list=(cur.commands||[]).filter(x=>Number(x.id||0)>wm);
+    list.push(cmd);
+    const body={ message:"appblocker command "+cmd.action,
+      content:btoa(unescape(encodeURIComponent(JSON.stringify({commands:list})))),
+      branch:c.branch||"main" };
+    if(cur.sha) body.sha=cur.sha;
+    const res=await fetch(`https://api.github.com/repos/${c.repo}/contents/${path}`,
+      {method:"PUT",headers:hdr(c,true),body:JSON.stringify(body)});
+    if(res.status===409) continue;                 // sha race — re-read and retry
+    if(res.status===401||res.status===403) throw {code:res.status};
+    if(!res.ok) throw new Error("GitHub "+res.status);
+    return true;
+  }
+  throw new Error("repo busy");
+}
+async function sendCommand(baseCmd, label){
   const c=getCfg();
   if(!c||!c.repo||!c.token){ ctlMsg("Not connected.","bad"); return; }
-  const path=commandsPath();
-  const wm=(DATA&&DATA.cmd_ts)||0;
-  let id=Date.now(); if(id<=lastId) id=lastId+1; lastId=id; cmd.id=id;
+  const targets = SEL_CTL==="*" ? MACHINES.map(m=>m.id) : [SEL_CTL];
+  if(!targets.length){ ctlMsg("No machine selected.","bad"); return; }
+  let id=Date.now(); if(id<=lastId) id=lastId+1; lastId=id;
   ctlMsg("Sending “"+label+"”…","wait");
-  for(let attempt=0; attempt<2; attempt++){
-    try{
-      const cur=await ghGetCommands(path);
-      // Drop commands the machine already processed so the file stays small.
-      let list=(cur.commands||[]).filter(x=>Number(x.id||0)>wm);
-      list.push(cmd);
-      const body={ message:"appblocker command "+cmd.action,
-        content:btoa(unescape(encodeURIComponent(JSON.stringify({commands:list})))),
-        branch:c.branch||"main" };
-      if(cur.sha) body.sha=cur.sha;
-      const res=await fetch(`https://api.github.com/repos/${c.repo}/contents/${path}`,
-        {method:"PUT",headers:hdr(c,true),body:JSON.stringify(body)});
-      if(res.status===409) continue;   // sha race — re-read and retry once
-      if(res.status===401||res.status===403){
-        ctlMsg("Token can’t write here — it needs Contents: Read and write on "+
-               "this repo. Update the token in Settings.","bad"); return; }
-      if(!res.ok){ ctlMsg("Send failed: GitHub "+res.status,"bad"); return; }
-      SENT[id]={action:cmd.action,label};
-      ctlMsg("Sent “"+label+"”. Applies within ~1 min — press Refresh to "+
-             "confirm.","wait");
-      return;
-    }catch(e){ if(attempt===1){ ctlMsg("Send failed: "+e.message,"bad"); return; } }
+  let ok=0, failMsg="";
+  for(const t of targets){
+    try{ await sendToMachine(t, Object.assign({}, baseCmd, {id})); ok++; }
+    catch(e){
+      if(e && (e.code===401||e.code===403)){
+        failMsg="token needs Contents: Read and write"; break; }
+      failMsg=(e.message||"failed");
+    }
   }
-  ctlMsg("Send failed: the repo was busy — try again.","bad");
+  if(ok>0){
+    SENT[id]={label, targets};
+    const scope = targets.length>1 ? (" to "+ok+"/"+targets.length+" machines") : "";
+    ctlMsg("Sent “"+label+"”"+scope+". Applies within ~1 min — press Refresh to "+
+           "confirm."+(failMsg?(" (some failed: "+failMsg+")"):""),
+           failMsg?"bad":"wait");
+  } else {
+    ctlMsg("Send failed: "+failMsg,"bad");
+  }
 }
 function onCtlButton(b){
   const act=b.dataset.act;
@@ -440,12 +538,25 @@ function renderCtlStatus(){
   const el=$("ctl-status"); if(!el) return;
   let h="";
   if(CTLMSG) h+='<div class="line">'+CTLMSG+'</div>';
-  const wm=(DATA&&DATA.cmd_ts)||0;
-  Object.keys(SENT).map(Number).filter(id=>id>wm).forEach(id=>{
-    h+='<div class="line wait">⏳ '+esc(SENT[id].label)+' — waiting for the machine…</div>'; });
-  const res=(DATA&&DATA.control_results)||[];
-  res.slice(-6).reverse().forEach(r=>{
-    h+='<div class="line '+(r.ok?"ok":"bad")+'">'+(r.ok?"✓":"✗")+' '+
+  // Pending: any command not yet processed by all the machines it targeted.
+  Object.keys(SENT).map(Number).forEach(id=>{
+    const s=SENT[id]||{}; const targets=s.targets||[];
+    const waiting=targets.filter(t=>{ const m=machineById(t);
+      return !m || ((m.data.cmd_ts||0) < id); });
+    if(waiting.length){
+      const scope = targets.length>1 ? (" ("+waiting.length+"/"+targets.length+" machines)") : "";
+      h+='<div class="line wait">⏳ '+esc(s.label)+' — waiting'+scope+'…</div>';
+    }
+  });
+  // Recent results from the selected machine(s).
+  const machs = SEL_CTL==="*" ? MACHINES : [machineById(SEL_CTL)].filter(Boolean);
+  let results=[];
+  machs.forEach(m => (m.data.control_results||[]).forEach(r =>
+    results.push(Object.assign({_m:m.name}, r))));
+  results.sort((a,b)=>(a.id||0)-(b.id||0));
+  results.slice(-8).reverse().forEach(r=>{
+    const tag = MACHINES.length>1 ? ('['+esc(r._m)+'] ') : '';
+    h+='<div class="line '+(r.ok?"ok":"bad")+'">'+(r.ok?"✓":"✗")+' '+tag+
        esc(r.action)+': '+esc(r.msg)+'</div>'; });
   el.innerHTML=h;
 }
@@ -454,19 +565,41 @@ function ctlRowBtn(act, cls, txt, extra){
 }
 function renderControls(){
   const body=$("ctl-body"); if(!body) return;
-  const ctl=DATA&&DATA.control;
-  if(!ctl){
-    body.innerHTML='<div class="ctl-warn">This machine hasn’t sent a control '+
-      'snapshot yet. Update AppBlocker on the machine, then press Refresh.</div>';
+  if(!MACHINES.length){
+    body.innerHTML='<div class="ctl-warn">No machines connected yet.</div>';
     renderCtlStatus(); return;
   }
-  let h="";
-  if(!ctl.remote_enabled){
-    h+='<div class="ctl-warn">Remote control is <b>OFF</b> on the machine. In '+
+  // Default: broadcast when several machines, else the single machine.
+  if(SEL_CTL===null || (SEL_CTL!=="*" && !machineById(SEL_CTL)))
+    SEL_CTL = MACHINES.length>1 ? "*" : MACHINES[0].id;
+  const broadcast = SEL_CTL==="*";
+  const mach = broadcast ? null : machineById(SEL_CTL);
+  const ctl  = broadcast ? null : (mach && mach.data.control);
+
+  // Machine picker.
+  let h='<div id="ctl-machine-row"><label for="ctl-machine"><b>Control:</b></label>'+
+        '<select id="ctl-machine"><option value="*"'+(broadcast?" selected":"")+
+        '>All machines (broadcast)</option>';
+  MACHINES.forEach(m=>{ h+='<option value="'+esc(m.id)+'"'+
+    (SEL_CTL===m.id?" selected":"")+'>'+esc(m.name)+'</option>'; });
+  h+='</select></div>';
+
+  // Remote-enabled warnings.
+  if(broadcast){
+    const off=MACHINES.filter(m=>!(m.data.control&&m.data.control.remote_enabled))
+                      .map(m=>m.name);
+    if(off.length) h+='<div class="ctl-warn">Remote control is OFF on: <b>'+
+      off.map(esc).join(", ")+'</b>. Enable “Allow remote control” in AppBlocker '+
+      'on those machines. Commands still queue and apply once enabled.</div>';
+  } else if(ctl && !ctl.remote_enabled){
+    h+='<div class="ctl-warn">Remote control is <b>OFF</b> on this machine. In '+
        'AppBlocker open <b>📊 Activity → ☁ Remote Dashboard</b> and tick '+
-       '“Allow remote control” (and make sure the token here has write access). '+
-       'You can still queue commands below — they apply once it’s enabled.</div>';
+       '“Allow remote control”. Commands still queue until then.</div>';
+  } else if(!broadcast && !ctl){
+    h+='<div class="ctl-warn">This machine hasn’t sent a control snapshot yet.</div>';
   }
+
+  // Block duration.
   h+='<div class="ctl-sec"><h3>Block duration</h3><div class="ctl-row">'+
      '<span class="ctl-note" style="margin:0">Applied by the Block buttons below.</span>'+
      '<select id="ctl-mode" class="ctl-in spacer">'+
@@ -475,49 +608,78 @@ function renderControls(){
      '<option value="60">1 hour</option>'+
      '<option value="120">2 hours</option></select></div></div>';
 
+  // Apps — per-machine only (each machine has its own app list).
   h+='<div class="ctl-sec"><h3>Apps</h3>';
-  (ctl.apps||[]).forEach(a=>{
-    const st=a.blocked?'<span class="pill red">blocked</span>':'<span class="pill">active</span>';
-    const btn=a.blocked
-      ? ctlRowBtn("unblock_app","green small","Unblock",' data-app="'+esc(a.proc)+'"')
-      : ctlRowBtn("block_app","red small","Block",' data-app="'+esc(a.proc)+'"');
-    h+='<div class="ctl-row"><span class="name">'+esc(a.name)+'</span> '+st+
-       '<span class="spacer"></span>'+btn+'</div>';
-  });
-  if(!(ctl.apps||[]).length) h+='<div class="ctl-note">No apps in the list.</div>';
+  if(broadcast){
+    h+='<div class="ctl-note">Pick a specific machine above to block or unblock '+
+       'individual apps. (Use the quick actions below to hit every machine at once.)</div>';
+  } else if(ctl){
+    (ctl.apps||[]).forEach(a=>{
+      const st=a.blocked?'<span class="pill red">blocked</span>':'<span class="pill">active</span>';
+      const btn=a.blocked
+        ? ctlRowBtn("unblock_app","green small","Unblock",' data-app="'+esc(a.proc)+'"')
+        : ctlRowBtn("block_app","red small","Block",' data-app="'+esc(a.proc)+'"');
+      h+='<div class="ctl-row"><span class="name">'+esc(a.name)+'</span> '+st+
+         '<span class="spacer"></span>'+btn+'</div>';
+    });
+    if(!(ctl.apps||[]).length) h+='<div class="ctl-note">No apps in the list.</div>';
+  }
   h+='</div>';
 
-  h+='<div class="ctl-sec"><h3>Quick actions</h3><div class="ctl-row">'+
+  // Quick actions — work in broadcast or single mode.
+  h+='<div class="ctl-sec"><h3>Quick actions'+(broadcast?" (all machines)":"")+'</h3>'+
+     '<div class="ctl-row">'+
      ctlRowBtn("quick_block","red","⚡ Block all browsers")+
      ctlRowBtn("unblock_all","green","🔓 Unblock everything")+'</div></div>';
 
+  // Websites.
   h+='<div class="ctl-sec"><h3>Blocked websites</h3>';
-  (ctl.websites||[]).forEach(d=>{
-    h+='<div class="ctl-row"><span class="name">'+esc(d)+'</span>'+
-       '<span class="spacer"></span>'+
-       ctlRowBtn("remove_website","green small","Unblock",' data-dom="'+esc(d)+'"')+'</div>';
-  });
+  if(broadcast){
+    h+='<div class="ctl-note">Adding a site here blocks it on every machine. Pick '+
+       'a specific machine to see and remove its current list.</div>';
+  } else if(ctl){
+    (ctl.websites||[]).forEach(d=>{
+      h+='<div class="ctl-row"><span class="name">'+esc(d)+'</span>'+
+         '<span class="spacer"></span>'+
+         ctlRowBtn("remove_website","green small","Unblock",' data-dom="'+esc(d)+'"')+'</div>';
+    });
+  }
   h+='<div class="ctl-row"><input id="ctl-site" class="ctl-in" '+
      'placeholder="e.g. tiktok.com">'+
      ctlRowBtn("add_website","red small","Block site")+'</div>'+
-     '<div class="ctl-note">Blocks machine-wide, for every user.</div></div>';
+     '<div class="ctl-note">Blocks machine-wide'+(broadcast?", on every machine":"")+
+     '.</div></div>';
 
-  h+='<div class="ctl-sec"><h3>Protection</h3>'+
-     '<div class="ctl-row"><span class="name">Adult-content blocklist</span> '+
-     (ctl.block_adult?'<span class="pill">on</span>':'<span class="pill red">off</span>')+
-     '<span class="spacer"></span>'+
-     (ctl.block_adult
-       ? ctlRowBtn("set_block_adult","ghost small","Turn off",' data-en="0"')
-       : ctlRowBtn("set_block_adult","red small","Turn on",' data-en="1"'))+'</div>'+
-     '<div class="ctl-row"><span class="name">Browser lockdown '+
-     '(no incognito / no history-wipe)</span> '+
-     (ctl.lockdown?'<span class="pill">on</span>':'<span class="pill red">off</span>')+
-     '<span class="spacer"></span>'+
-     (ctl.lockdown
-       ? ctlRowBtn("set_lockdown","ghost small","Turn off",' data-en="0"')
-       : ctlRowBtn("set_lockdown","red small","Turn on",' data-en="1"'))+'</div></div>';
+  // Protection.
+  h+='<div class="ctl-sec"><h3>Protection'+(broadcast?" (all machines)":"")+'</h3>';
+  if(broadcast){
+    h+='<div class="ctl-row"><span class="name">Adult-content blocklist</span>'+
+       '<span class="spacer"></span>'+
+       ctlRowBtn("set_block_adult","red small","Turn on",' data-en="1"')+
+       ctlRowBtn("set_block_adult","ghost small","Turn off",' data-en="0"')+'</div>'+
+       '<div class="ctl-row"><span class="name">Browser lockdown '+
+       '(no incognito / no history-wipe)</span><span class="spacer"></span>'+
+       ctlRowBtn("set_lockdown","red small","Turn on",' data-en="1"')+
+       ctlRowBtn("set_lockdown","ghost small","Turn off",' data-en="0"')+'</div>';
+  } else if(ctl){
+    h+='<div class="ctl-row"><span class="name">Adult-content blocklist</span> '+
+       (ctl.block_adult?'<span class="pill">on</span>':'<span class="pill red">off</span>')+
+       '<span class="spacer"></span>'+
+       (ctl.block_adult
+         ? ctlRowBtn("set_block_adult","ghost small","Turn off",' data-en="0"')
+         : ctlRowBtn("set_block_adult","red small","Turn on",' data-en="1"'))+'</div>'+
+       '<div class="ctl-row"><span class="name">Browser lockdown '+
+       '(no incognito / no history-wipe)</span> '+
+       (ctl.lockdown?'<span class="pill">on</span>':'<span class="pill red">off</span>')+
+       '<span class="spacer"></span>'+
+       (ctl.lockdown
+         ? ctlRowBtn("set_lockdown","ghost small","Turn off",' data-en="0"')
+         : ctlRowBtn("set_lockdown","red small","Turn on",' data-en="1"'))+'</div>';
+  }
+  h+='</div>';
 
   body.innerHTML=h;
+  $("ctl-machine").onchange=(e)=>{ SEL_CTL=e.target.value; renderControls(); };
   body.querySelectorAll("button[data-act]").forEach(b=>{ b.onclick=()=>onCtlButton(b); });
   renderCtlStatus();
 }
@@ -535,9 +697,10 @@ document.querySelectorAll("th[data-sort]").forEach(th=>{
     const s=sortState[table]; sortState[table]=(s&&s.key===key)?
       {key,dir:-s.dir}:{key,dir:1}; render(); };
 });
-["fx-user","fx-from","fx-to","fx-site"].forEach(id=>
+["fx-machine","fx-user","fx-from","fx-to","fx-site"].forEach(id=>
   $(id).addEventListener("input", render));
-$("fx-clear").onclick=()=>{ $("fx-user").value="All users"; $("fx-from").value="";
+$("fx-clear").onclick=()=>{ $("fx-machine").value="All machines";
+  $("fx-user").value="All users"; $("fx-from").value="";
   $("fx-to").value=""; $("fx-site").value=""; render(); };
 $("btn-refresh").onclick=loadData;
 $("btn-settings").onclick=()=>showSetup("");
