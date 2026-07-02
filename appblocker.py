@@ -1989,8 +1989,56 @@ class AppBlockerUI:
         self.refresh()
         self._tick()  # start countdown / status refresher
 
+        # Make sure the window comes to the foreground on launch (some desktops,
+        # especially under pkexec, open it behind other windows).
+        self.root.after(80, lambda: self._to_front(self.root))
+
         if HAS_TRAY:
             self._setup_tray()
+
+    @staticmethod
+    def _to_front(win):
+        """Force a window to the foreground and give it focus."""
+        try:
+            win.deiconify()
+            win.lift()
+            win.attributes("-topmost", True)
+            win.after(400, lambda: win.attributes("-topmost", False))
+            win.focus_force()
+        except Exception:
+            pass
+
+    def _present(self, win, grab=True):
+        """Standard setup for a dialog: modal, on top, focused, foreground."""
+        try:
+            win.transient(self.root)
+            if grab:
+                win.grab_set()
+        except Exception:
+            pass
+        self._to_front(win)
+
+    @staticmethod
+    def _scroll_body(win):
+        """
+        Return a frame inside a vertical-scroll area filling `win`. Pack the
+        bottom action bar BEFORE calling this so it stays pinned; put the form
+        content into the returned frame so it scrolls if it's taller than the
+        window (keeps everything reachable on small screens).
+        """
+        outer = tk.Frame(win, bg=COLOR_BG)
+        outer.pack(fill="both", expand=True)
+        canvas = tk.Canvas(outer, bg=COLOR_BG, highlightthickness=0)
+        vsb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        body = tk.Frame(canvas, bg=COLOR_BG)
+        body.bind("<Configure>",
+                  lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        bid = canvas.create_window((0, 0), window=body, anchor="nw")
+        canvas.bind("<Configure>", lambda e: canvas.itemconfig(bid, width=e.width))
+        canvas.configure(yscrollcommand=vsb.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        return body
 
     # -- styling ------------------------------------------------------------ #
     def _build_styles(self):
@@ -2019,46 +2067,50 @@ class AppBlockerUI:
         self.status_lbl.pack(side="right", padx=16)
 
     def _build_toolbar(self):
+        # A flow layout that wraps buttons onto more rows when the window is
+        # narrow, so no button is ever cut off regardless of window size.
         bar = tk.Frame(self.root, bg=COLOR_BG)
-        bar.pack(fill="x", padx=14, pady=(12, 4))
+        bar.pack(fill="x", padx=10, pady=(10, 2))
+        self._toolbar = bar
+        self._toolbar_buttons = []
+        self._toolbar_width = 0
 
-        tk.Button(bar, text="⚡ Quick Block: Browsers",
-                  command=self.quick_block_browsers,
-                  bg=COLOR_BLOCKED, fg="white", activebackground="#922b21",
-                  font=("Helvetica", 11, "bold"), relief="flat",
-                  padx=12, pady=8, cursor="hand2").pack(side="left")
+        def mk(text, cmd, color, active):
+            b = tk.Button(bar, text=text, command=cmd, bg=color, fg="white",
+                          activebackground=active, font=("Helvetica", 11),
+                          relief="flat", padx=10, pady=7, cursor="hand2")
+            self._toolbar_buttons.append(b)
 
-        tk.Button(bar, text="🔓 Unblock All", command=self.unblock_all,
-                  bg=COLOR_ACTIVE, fg="white", activebackground="#1e8449",
-                  font=("Helvetica", 11, "bold"), relief="flat",
-                  padx=12, pady=8, cursor="hand2").pack(side="left", padx=8)
-
-        tk.Button(bar, text="➕ Add App", command=self.add_app_dialog,
-                  bg=COLOR_ACCENT, fg="white", activebackground="#1f618d",
-                  font=("Helvetica", 11), relief="flat",
-                  padx=12, pady=8, cursor="hand2").pack(side="right")
-
-        tk.Button(bar, text="⛓ Auto-Block Rules", command=self.rules_dialog,
-                  bg="#8e44ad", fg="white", activebackground="#6c3483",
-                  font=("Helvetica", 11), relief="flat",
-                  padx=12, pady=8, cursor="hand2").pack(side="right", padx=8)
-
+        mk("⚡ Quick Block: Browsers", self.quick_block_browsers,
+           COLOR_BLOCKED, "#922b21")
+        mk("🔓 Unblock All", self.unblock_all, COLOR_ACTIVE, "#1e8449")
+        mk("➕ Add App", self.add_app_dialog, COLOR_ACCENT, "#1f618d")
+        mk("⛓ Auto-Block Rules", self.rules_dialog, "#8e44ad", "#6c3483")
         if SYSTEM_MODE:
-            tk.Button(bar, text="🌐 Block Websites",
-                      command=self.websites_dialog,
-                      bg="#16a085", fg="white", activebackground="#0e6655",
-                      font=("Helvetica", 11), relief="flat",
-                      padx=12, pady=8, cursor="hand2").pack(side="right")
-            tk.Button(bar, text="📊 Activity",
-                      command=self.activity_dialog,
-                      bg="#2c3e50", fg="white", activebackground="#1b2631",
-                      font=("Helvetica", 11), relief="flat",
-                      padx=12, pady=8, cursor="hand2").pack(side="right", padx=8)
-            tk.Button(bar, text="🔒 Lockdown",
-                      command=self.lockdown_dialog,
-                      bg="#7f8c8d", fg="white", activebackground="#616a6b",
-                      font=("Helvetica", 11), relief="flat",
-                      padx=12, pady=8, cursor="hand2").pack(side="right")
+            mk("🌐 Block Websites", self.websites_dialog, "#16a085", "#0e6655")
+            mk("📊 Activity", self.activity_dialog, "#2c3e50", "#1b2631")
+            mk("🔒 Lockdown", self.lockdown_dialog, "#7f8c8d", "#616a6b")
+
+        bar.bind("<Configure>", lambda e: self._reflow_toolbar(e.width))
+        self.root.after(0, lambda: self._reflow_toolbar(bar.winfo_width()))
+
+    def _reflow_toolbar(self, width):
+        if width <= 1 or abs(width - self._toolbar_width) < 4:
+            return  # avoid needless reflow loops
+        self._toolbar_width = width
+        row = col = 0
+        used = 0
+        for b in self._toolbar_buttons:
+            b.grid_forget()
+        for b in self._toolbar_buttons:
+            bw = b.winfo_reqwidth() + 8
+            if col > 0 and used + bw > width:
+                row += 1
+                col = 0
+                used = 0
+            b.grid(row=row, column=col, padx=3, pady=3, sticky="w")
+            col += 1
+            used += bw
 
     def _build_list(self):
         container = tk.Frame(self.root, bg=COLOR_BG)
@@ -2147,6 +2199,11 @@ class AppBlockerUI:
         strip = tk.Frame(card, bg=color, width=6)
         strip.pack(side="left", fill="y")
 
+        # right: status + buttons — packed BEFORE the expanding info block so
+        # they are always reserved space and never pushed off a narrow window.
+        right = tk.Frame(card, bg="white")
+        right.pack(side="right", padx=10)
+
         # name + path + (target/schedule detail)
         info = tk.Frame(card, bg="white")
         info.pack(side="left", fill="x", expand=True, padx=10, pady=4)
@@ -2161,10 +2218,6 @@ class AppBlockerUI:
         if detail:
             tk.Label(info, text=detail, bg="white", fg="#7f8c8d",
                      font=("Helvetica", 9, "italic"), anchor="w").pack(fill="x")
-
-        # right: status + buttons
-        right = tk.Frame(card, bg="white")
-        right.pack(side="right", padx=10)
 
         status_lbl = tk.Label(
             right, text=self._status_text(app),
@@ -2311,16 +2364,22 @@ class AppBlockerUI:
         win = tk.Toplevel(self.root)
         win.title("Add Application")
         win.configure(bg=COLOR_BG)
-        win.geometry("500x420")
-        win.transient(self.root)
-        win.grab_set()
+        win.geometry("500x460")
+        win.minsize(420, 360)
+        self._present(win)
 
-        tk.Label(win, text="Add a custom app to block", bg=COLOR_BG,
+        # Pin the action bar to the bottom first, then a scrollable body so the
+        # Add/Cancel buttons are always reachable regardless of window size.
+        btnbar = tk.Frame(win, bg=COLOR_BG)
+        btnbar.pack(side="bottom", fill="x", padx=18, pady=14)
+        outer = self._scroll_body(win)
+
+        tk.Label(outer, text="Add a custom app to block", bg=COLOR_BG,
                  fg=COLOR_HEADER, font=("Helvetica", 13, "bold")).pack(
                      pady=(14, 6))
 
         kind = tk.StringVar(value="process")
-        body = tk.Frame(win, bg=COLOR_BG)
+        body = tk.Frame(outer, bg=COLOR_BG)
         body.pack(fill="x", padx=18)
 
         tk.Label(body, text="Name:", bg=COLOR_BG).grid(
@@ -2330,11 +2389,11 @@ class AppBlockerUI:
             row=0, column=1, columnspan=2, pady=4, sticky="we")
         body.columnconfigure(1, weight=1)
 
-        tk.Radiobutton(win, text="An installed program (pick its file)",
+        tk.Radiobutton(outer, text="An installed program (pick its file)",
                        variable=kind, value="process", bg=COLOR_BG,
                        anchor="w").pack(fill="x", padx=18, pady=(8, 0))
 
-        prog = tk.Frame(win, bg=COLOR_BG)
+        prog = tk.Frame(outer, bg=COLOR_BG)
         prog.pack(fill="x", padx=36)
         path_var = tk.StringVar()
         tk.Entry(prog, textvariable=path_var).pack(
@@ -2352,14 +2411,14 @@ class AppBlockerUI:
                   bg=COLOR_ACCENT, fg="white", cursor="hand2").pack(
                       side="left", padx=(6, 0))
 
-        tk.Radiobutton(win, text="A web app / PWA, or a custom command",
+        tk.Radiobutton(outer, text="A web app / PWA, or a custom command",
                        variable=kind, value="commandline", bg=COLOR_BG,
                        anchor="w").pack(fill="x", padx=18, pady=(10, 0))
-        cmd = tk.Frame(win, bg=COLOR_BG)
+        cmd = tk.Frame(outer, bg=COLOR_BG)
         cmd.pack(fill="x", padx=36)
         match_var = tk.StringVar()
         tk.Entry(cmd, textvariable=match_var).pack(fill="x")
-        tk.Label(win, text="Enter the web address (or any unique text from the "
+        tk.Label(outer, text="Enter the web address (or any unique text from the "
                  "launch command). A PWA on the desktop is your browser opened "
                  "with a web address, so paste that address here — e.g. "
                  "youtube.com or app.roblox.com.", bg=COLOR_BG, fg="#7f8c8d",
@@ -2390,8 +2449,7 @@ class AppBlockerUI:
             win.destroy()
             self.refresh()
 
-        btnbar = tk.Frame(win, bg=COLOR_BG)
-        btnbar.pack(side="bottom", fill="x", padx=18, pady=14)
+        # `btnbar` was pinned to the bottom before the scrollable body above.
         tk.Button(btnbar, text="Add", command=save, bg=COLOR_ACTIVE,
                   fg="white", relief="flat", padx=16, pady=6,
                   cursor="hand2").pack(side="right")
@@ -2425,8 +2483,7 @@ class AppBlockerUI:
         win.title("Auto-Block Rules")
         win.configure(bg=COLOR_BG)
         win.geometry("560x460")
-        win.transient(self.root)
-        win.grab_set()
+        self._present(win)
 
         tk.Label(win, text="Auto-Block Rules", bg=COLOR_BG, fg=COLOR_HEADER,
                  font=("Helvetica", 14, "bold")).pack(pady=(14, 2))
@@ -2435,8 +2492,25 @@ class AppBlockerUI:
                  fg="#7f8c8d", wraplength=520, justify="left").pack(
                      padx=16, pady=(0, 8))
 
-        listwrap = tk.Frame(win, bg=COLOR_BG)
-        listwrap.pack(fill="both", expand=True, padx=14)
+        # Pin the action bar to the bottom FIRST so "Add Rule"/"Close" are
+        # always visible regardless of how many rules are listed.
+        bar = tk.Frame(win, bg=COLOR_BG)
+        bar.pack(side="bottom", fill="x", padx=14, pady=12)
+
+        # Scrollable list so many rules never push the buttons off-screen.
+        container = tk.Frame(win, bg=COLOR_BG)
+        container.pack(fill="both", expand=True, padx=14)
+        canvas = tk.Canvas(container, bg=COLOR_BG, highlightthickness=0)
+        vsb = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+        listwrap = tk.Frame(canvas, bg=COLOR_BG)
+        listwrap.bind("<Configure>",
+                      lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        win_id = canvas.create_window((0, 0), window=listwrap, anchor="nw")
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfig(win_id, width=e.width))
+        canvas.configure(yscrollcommand=vsb.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
 
         def render():
             for c in listwrap.winfo_children():
@@ -2456,10 +2530,8 @@ class AppBlockerUI:
                     card, variable=en, bg="white",
                     command=lambda idx=i, v=en: self._toggle_rule(idx, v, render)
                 ).pack(side="left", padx=4)
-                tk.Label(card, text=self._rule_summary(rule), bg="white",
-                         fg=COLOR_HEADER, justify="left", anchor="w",
-                         font=("Helvetica", 10)).pack(
-                             side="left", fill="x", expand=True, padx=6, pady=6)
+                # Pack the fixed action buttons BEFORE the expanding summary so
+                # they can never be squeezed off the right edge.
                 tk.Button(card, text="✕", relief="flat", bg="white", fg="#95a5a6",
                           cursor="hand2",
                           command=lambda idx=i: self._delete_rule(idx, render)
@@ -2468,9 +2540,11 @@ class AppBlockerUI:
                           fg=COLOR_ACCENT, cursor="hand2",
                           command=lambda idx=i: self._edit_rule(win, idx, render)
                           ).pack(side="right")
+                tk.Label(card, text=self._rule_summary(rule), bg="white",
+                         fg=COLOR_HEADER, justify="left", anchor="w",
+                         font=("Helvetica", 10)).pack(
+                             side="left", fill="x", expand=True, padx=6, pady=6)
 
-        bar = tk.Frame(win, bg=COLOR_BG)
-        bar.pack(fill="x", padx=14, pady=12)
         tk.Button(bar, text="＋ Add Rule",
                   command=lambda: self._edit_rule(win, None, render),
                   bg="#8e44ad", fg="white", relief="flat", padx=14, pady=6,
@@ -2508,25 +2582,31 @@ class AppBlockerUI:
         win = tk.Toplevel(parent)
         win.title("Edit Rule" if index is not None else "New Rule")
         win.configure(bg=COLOR_BG)
-        win.geometry("460x680")
-        win.transient(parent)
-        win.grab_set()
+        win.geometry("460x600")
+        win.minsize(380, 360)
+        self._present(win)
 
-        tk.Label(win, text="When this app is running…", bg=COLOR_BG,
+        # Pin the Save/Cancel bar to the bottom, then put the (potentially long)
+        # form in a scrollable body so Save is always reachable.
+        bar = tk.Frame(win, bg=COLOR_BG)
+        bar.pack(side="bottom", fill="x", padx=18, pady=14)
+        body = self._scroll_body(win)
+
+        tk.Label(body, text="When this app is running…", bg=COLOR_BG,
                  fg=COLOR_HEADER, font=("Helvetica", 11, "bold")).pack(
                      anchor="w", padx=18, pady=(14, 2))
         trigger_var = tk.StringVar()
         cur_trig = existing.get("trigger", "")
         trigger_var.set(proc_to_name.get(cur_trig.lower(),
                                           choices[0][0] if choices else ""))
-        ttk.Combobox(win, textvariable=trigger_var,
+        ttk.Combobox(body, textvariable=trigger_var,
                      values=[n for n, _ in choices], state="readonly").pack(
                          fill="x", padx=18)
 
-        tk.Label(win, text="…automatically block these apps:", bg=COLOR_BG,
+        tk.Label(body, text="…automatically block these apps:", bg=COLOR_BG,
                  fg=COLOR_HEADER, font=("Helvetica", 11, "bold")).pack(
                      anchor="w", padx=18, pady=(12, 2))
-        tgt_wrap = tk.Frame(win, bg=COLOR_BG)
+        tgt_wrap = tk.Frame(body, bg=COLOR_BG)
         tgt_wrap.pack(fill="x", padx=24)
         cur_targets = {t.lower() for t in existing.get("targets", [])}
         target_vars = []
@@ -2538,14 +2618,14 @@ class AppBlockerUI:
 
         sites_var = None
         if SYSTEM_MODE:
-            tk.Label(win, text="…and block these websites (comma-separated):",
+            tk.Label(body, text="…and block these websites (comma-separated):",
                      bg=COLOR_BG, fg=COLOR_HEADER,
                      font=("Helvetica", 11, "bold")).pack(
                          anchor="w", padx=18, pady=(12, 2))
             sites_var = tk.StringVar(
                 value=", ".join(existing.get("block_sites") or []))
-            tk.Entry(win, textvariable=sites_var).pack(fill="x", padx=24)
-            tk.Label(win, text="e.g. youtube.com, tiktok.com — blocked for the "
+            tk.Entry(body, textvariable=sites_var).pack(fill="x", padx=24)
+            tk.Label(body, text="e.g. youtube.com, tiktok.com — blocked for the "
                      "whole computer while the trigger runs.", bg=COLOR_BG,
                      fg="#7f8c8d", wraplength=400, justify="left").pack(
                          anchor="w", padx=24)
@@ -2553,7 +2633,7 @@ class AppBlockerUI:
         # users (system mode)
         user_vars = {}
         if SYSTEM_MODE:
-            tk.Label(win, text="For these users:", bg=COLOR_BG, fg=COLOR_HEADER,
+            tk.Label(body, text="For these users:", bg=COLOR_BG, fg=COLOR_HEADER,
                      font=("Helvetica", 11, "bold")).pack(
                          anchor="w", padx=18, pady=(12, 2))
             cur_users = set(existing.get("users") or [])
@@ -2564,10 +2644,10 @@ class AppBlockerUI:
                     for v in user_vars.values():
                         v.set(False)
 
-            tk.Checkbutton(win, text="Any user", variable=any_var,
+            tk.Checkbutton(body, text="Any user", variable=any_var,
                            command=toggle_any, bg=COLOR_BG, anchor="w").pack(
                                fill="x", padx=24)
-            ufr = tk.Frame(win, bg=COLOR_BG)
+            ufr = tk.Frame(body, bg=COLOR_BG)
             ufr.pack(fill="x", padx=40)
             for uname, _uid in self.users:
                 v = tk.BooleanVar(value=uname in cur_users)
@@ -2577,7 +2657,7 @@ class AppBlockerUI:
                 user_vars[uname] = v
 
         name_var = tk.StringVar(value=existing.get("name", ""))
-        nfr = tk.Frame(win, bg=COLOR_BG)
+        nfr = tk.Frame(body, bg=COLOR_BG)
         nfr.pack(fill="x", padx=18, pady=(12, 0))
         tk.Label(nfr, text="Label (optional):", bg=COLOR_BG).pack(side="left")
         tk.Entry(nfr, textvariable=name_var).pack(side="left", fill="x",
@@ -2615,8 +2695,7 @@ class AppBlockerUI:
             win.destroy()
             on_done()
 
-        bar = tk.Frame(win, bg=COLOR_BG)
-        bar.pack(side="bottom", fill="x", padx=18, pady=14)
+        # `bar` was pinned to the bottom before the scrollable body above.
         tk.Button(bar, text="Save Rule", command=save, bg=COLOR_ACTIVE,
                   fg="white", relief="flat", padx=16, pady=6,
                   cursor="hand2").pack(side="right")
@@ -2630,9 +2709,9 @@ class AppBlockerUI:
         win = tk.Toplevel(self.root)
         win.title("Browser Lockdown")
         win.configure(bg=COLOR_BG)
-        win.geometry("460x300")
-        win.transient(self.root)
-        win.grab_set()
+        win.geometry("460x340")
+        win.minsize(400, 300)
+        self._present(win)
 
         tk.Label(win, text="🔒 Browser Lockdown", bg=COLOR_BG, fg=COLOR_HEADER,
                  font=("Helvetica", 14, "bold")).pack(pady=(14, 6))
@@ -2673,24 +2752,30 @@ class AppBlockerUI:
         win = tk.Toplevel(self.root)
         win.title("Remote Dashboard (GitHub)")
         win.configure(bg=COLOR_BG)
-        win.geometry("520x520")
-        win.transient(self.root)
-        win.grab_set()
+        win.geometry("520x540")
+        win.minsize(440, 380)
+        self._present(win)
 
-        tk.Label(win, text="☁ Remote Dashboard", bg=COLOR_BG, fg=COLOR_HEADER,
+        # Pin the action bar first, then a scrollable body so Save/Sync/Cancel
+        # stay reachable at any window size.
+        bar = tk.Frame(win, bg=COLOR_BG)
+        bar.pack(side="bottom", fill="x", padx=16, pady=14)
+        body = self._scroll_body(win)
+
+        tk.Label(body, text="☁ Remote Dashboard", bg=COLOR_BG, fg=COLOR_HEADER,
                  font=("Helvetica", 14, "bold")).pack(pady=(14, 2))
-        tk.Label(win, text="This machine pushes the activity to a PRIVATE GitHub "
+        tk.Label(body, text="This machine pushes the activity to a PRIVATE GitHub "
                  "repo as data.json. Open the dashboard page (GitHub Pages) on "
                  "your phone/PC and it reads that data with your own token — the "
                  "data is never public.", bg=COLOR_BG, fg="#7f8c8d",
                  wraplength=470, justify="left").pack(padx=16, pady=(0, 8))
 
         enabled = tk.BooleanVar(value=cfg.get("enabled", False))
-        tk.Checkbutton(win, text="Enable pushing activity to GitHub",
+        tk.Checkbutton(body, text="Enable pushing activity to GitHub",
                        variable=enabled, bg=COLOR_BG,
                        font=("Helvetica", 11, "bold")).pack(anchor="w", padx=16)
 
-        form = tk.Frame(win, bg=COLOR_BG)
+        form = tk.Frame(body, bg=COLOR_BG)
         form.pack(fill="x", padx=16, pady=(6, 0))
         fields = [("Private repo (owner/name)", "repo"), ("Branch", "branch"),
                   ("File path", "path"), ("Write token", "token")]
@@ -2704,13 +2789,13 @@ class AppBlockerUI:
                 row=i, column=1, sticky="we", pady=3)
             vars_[key] = v
         form.columnconfigure(1, weight=1)
-        tk.Label(win, text="Token: a fine-grained GitHub token limited to that "
+        tk.Label(body, text="Token: a fine-grained GitHub token limited to that "
                  "one private repo with Contents: Read and write. Keep it secret; "
                  "it's stored root-only on this machine.", bg=COLOR_BG,
                  fg="#7f8c8d", wraplength=470, justify="left").pack(
                      padx=16, pady=(6, 0))
 
-        status = tk.Label(win, text="", bg=COLOR_BG, fg=COLOR_HEADER,
+        status = tk.Label(body, text="", bg=COLOR_BG, fg=COLOR_HEADER,
                           wraplength=470, justify="left")
         status.pack(padx=16, pady=(8, 0))
 
@@ -2737,8 +2822,7 @@ class AppBlockerUI:
             except Exception as exc:
                 status.config(text=f"✗ {exc}")
 
-        bar = tk.Frame(win, bg=COLOR_BG)
-        bar.pack(side="bottom", fill="x", padx=16, pady=14)
+        # `bar` was pinned to the bottom before the scrollable body above.
         tk.Button(bar, text="Save", command=save, bg=COLOR_ACTIVE, fg="white",
                   relief="flat", padx=16, pady=6, cursor="hand2").pack(
                       side="right")
@@ -2753,8 +2837,14 @@ class AppBlockerUI:
         win = tk.Toplevel(self.root)
         win.title("Website Activity")
         win.configure(bg=COLOR_BG)
-        win.geometry("760x600")
-        win.transient(self.root)
+        win.geometry("820x640")
+        win.minsize(560, 420)
+        self._present(win, grab=False)  # non-modal so filters stay interactive
+
+        # Bottom action bar is packed FIRST (side=bottom) so it is always
+        # visible even when the tables above are tall / the window is small.
+        bar = tk.Frame(win, bg=COLOR_BG)
+        bar.pack(side="bottom", fill="x", padx=12, pady=10)
 
         # Filters row
         top = tk.Frame(win, bg=COLOR_BG)
@@ -2868,8 +2958,7 @@ class AppBlockerUI:
         for v in (user_var, from_var, to_var, site_var):
             v.trace_add("write", lambda *_: refresh())
 
-        bar = tk.Frame(win, bg=COLOR_BG)
-        bar.pack(fill="x", padx=12, pady=10)
+        # `bar` was created and packed at the bottom near the top of this method.
         tk.Button(bar, text="🔔 Alerts & Email…", command=self.monitor_settings_dialog,
                   bg=COLOR_ACCENT, fg="white", relief="flat", padx=12, pady=6,
                   cursor="hand2").pack(side="left")
@@ -2900,35 +2989,39 @@ class AppBlockerUI:
         win = tk.Toplevel(self.root)
         win.title("Monitoring — Alerts & Email")
         win.configure(bg=COLOR_BG)
-        win.geometry("520x760")
-        win.transient(self.root)
-        win.grab_set()
+        win.geometry("520x680")
+        win.minsize(420, 380)
+        self._present(win)
 
-        tk.Label(win, text="Browsing history is always recorded (see "
+        bar = tk.Frame(win, bg=COLOR_BG)
+        bar.pack(side="bottom", fill="x", padx=16, pady=14)
+        body = self._scroll_body(win)
+
+        tk.Label(body, text="Browsing history is always recorded (see "
                  "📊 Activity). Set watched sites / keywords + email below to "
                  "get alerts.", bg=COLOR_BG, fg="#7f8c8d", wraplength=470,
                  justify="left").pack(anchor="w", padx=16, pady=(12, 6))
 
-        tk.Label(win, text="Alert me when these sites are visited "
+        tk.Label(body, text="Alert me when these sites are visited "
                  "(one per line):", bg=COLOR_BG, fg=COLOR_HEADER).pack(
                      anchor="w", padx=16)
-        watch = tk.Text(win, height=4, width=46, font=("monospace", 11))
+        watch = tk.Text(body, height=4, width=46, font=("monospace", 11))
         watch.pack(fill="x", padx=16)
         watch.insert("1.0", "\n".join(mon.get("watch", [])))
 
-        tk.Label(win, text="Alert me when a search contains these words "
+        tk.Label(body, text="Alert me when a search contains these words "
                  "(one per line):", bg=COLOR_BG, fg=COLOR_HEADER).pack(
                      anchor="w", padx=16, pady=(8, 0))
-        keywords = tk.Text(win, height=4, width=46, font=("monospace", 11))
+        keywords = tk.Text(body, height=4, width=46, font=("monospace", 11))
         keywords.pack(fill="x", padx=16)
         keywords.insert("1.0", "\n".join(mon.get("keywords", [])))
 
         alert_blocked = tk.BooleanVar(value=mon.get("alert_blocked", True))
-        tk.Checkbutton(win, variable=alert_blocked, bg=COLOR_BG, anchor="w",
+        tk.Checkbutton(body, variable=alert_blocked, bg=COLOR_BG, anchor="w",
                        text="Email me when a child tries to open a blocked app"
                        ).pack(fill="x", padx=16, pady=(6, 0))
         digest_on = tk.BooleanVar(value=mon.get("digest_enabled", False))
-        drow = tk.Frame(win, bg=COLOR_BG)
+        drow = tk.Frame(body, bg=COLOR_BG)
         drow.pack(fill="x", padx=16)
         tk.Checkbutton(drow, variable=digest_on, bg=COLOR_BG,
                        text="Email me a summary every").pack(side="left")
@@ -2938,10 +3031,10 @@ class AppBlockerUI:
         tk.Label(drow, text="hours", bg=COLOR_BG).pack(side="left")
 
         em_on = tk.BooleanVar(value=email.get("enabled", False))
-        tk.Checkbutton(win, text="Send email alerts (SMTP)", variable=em_on,
+        tk.Checkbutton(body, text="Send email alerts (SMTP)", variable=em_on,
                        bg=COLOR_BG, font=("Helvetica", 11, "bold")).pack(
                            anchor="w", padx=16, pady=(10, 2))
-        form = tk.Frame(win, bg=COLOR_BG)
+        form = tk.Frame(body, bg=COLOR_BG)
         form.pack(fill="x", padx=16)
         fields = [("SMTP server", "host"), ("Port", "port"),
                   ("Username", "username"), ("Password", "password"),
@@ -2959,7 +3052,7 @@ class AppBlockerUI:
                 row=i, column=1, sticky="we", pady=2)
             vars_[key] = v
         form.columnconfigure(1, weight=1)
-        tk.Label(win, text="Tip: Gmail = smtp.gmail.com, port 587, app password. "
+        tk.Label(body, text="Tip: Gmail = smtp.gmail.com, port 587, app password. "
                  "You can send alerts to two parents by separating addresses "
                  "with commas. Quiet hours mute emails overnight (leave blank "
                  "for none).", bg=COLOR_BG, fg="#7f8c8d", wraplength=470,
@@ -3000,8 +3093,7 @@ class AppBlockerUI:
             except Exception as exc:
                 messagebox.showerror("Email failed", str(exc), parent=win)
 
-        bar = tk.Frame(win, bg=COLOR_BG)
-        bar.pack(side="bottom", fill="x", padx=16, pady=14)
+        # `bar` was pinned to the bottom before the scrollable body above.
         tk.Button(bar, text="Save", command=save, bg=COLOR_ACTIVE, fg="white",
                   relief="flat", padx=16, pady=6, cursor="hand2").pack(
                       side="right")
@@ -3017,8 +3109,13 @@ class AppBlockerUI:
         win.title("Block Websites")
         win.configure(bg=COLOR_BG)
         win.geometry("480x520")
-        win.transient(self.root)
-        win.grab_set()
+        win.minsize(420, 380)
+        self._present(win)
+
+        # Pin the Save/Cancel bar to the bottom BEFORE the expanding text box so
+        # it can never be pushed off-screen.
+        bar = tk.Frame(win, bg=COLOR_BG)
+        bar.pack(side="bottom", fill="x", padx=18, pady=14)
 
         tk.Label(win, text="🌐 Blocked Websites", bg=COLOR_BG, fg=COLOR_HEADER,
                  font=("Helvetica", 14, "bold")).pack(pady=(14, 2))
@@ -3027,22 +3124,24 @@ class AppBlockerUI:
                  "(e.g. youtube.com).", bg=COLOR_BG, fg="#7f8c8d",
                  wraplength=440, justify="left").pack(padx=18, pady=(0, 8))
 
-        txt = tk.Text(win, height=14, width=44, font=("monospace", 11))
-        txt.pack(fill="both", expand=True, padx=18)
-        with self.state.lock:
-            txt.insert("1.0", "\n".join(self.state.websites))
+        # Fixed rows below the text box are packed to the bottom first so the
+        # text box only expands into the space that is genuinely left over.
+        note = tk.Label(win, text="Note: this is machine-wide. A browser using "
+                        "“secure DNS” (DoH) or a VPN can bypass it.", bg=COLOR_BG,
+                        fg="#b9770e", wraplength=440, justify="left")
+        note.pack(side="bottom", padx=18, pady=(6, 8))
 
         adult_var = tk.BooleanVar(value=self.state.block_adult)
         n_adult = len(load_adult_domains())
         tk.Checkbutton(
             win, variable=adult_var, bg=COLOR_BG, anchor="w",
             text=f"Also block a built-in adult-content list ({n_adult} sites)"
-        ).pack(fill="x", padx=18, pady=(8, 0))
+        ).pack(side="bottom", fill="x", padx=18, pady=(8, 0))
 
-        tk.Label(win, text="Note: this is machine-wide. A browser using "
-                 "“secure DNS” (DoH) or a VPN can bypass it.", bg=COLOR_BG,
-                 fg="#b9770e", wraplength=440, justify="left").pack(
-                     padx=18, pady=(6, 0))
+        txt = tk.Text(win, height=14, width=44, font=("monospace", 11))
+        txt.pack(fill="both", expand=True, padx=18)
+        with self.state.lock:
+            txt.insert("1.0", "\n".join(self.state.websites))
 
         def save():
             raw = txt.get("1.0", tk.END)
@@ -3062,8 +3161,7 @@ class AppBlockerUI:
                 parent=win)
             win.destroy()
 
-        bar = tk.Frame(win, bg=COLOR_BG)
-        bar.pack(side="bottom", fill="x", padx=18, pady=14)
+        # `bar` was pinned to the bottom before the text box above.
         tk.Button(bar, text="Save", command=save, bg=COLOR_ACTIVE, fg="white",
                   relief="flat", padx=16, pady=6, cursor="hand2").pack(
                       side="right")
@@ -3101,9 +3199,14 @@ class AppBlockerUI:
         win.title(title)
         win.configure(bg=COLOR_BG)
         win.geometry("480x560")
-        win.transient(self.root)
-        win.grab_set()
+        win.minsize(420, 380)
+        self._present(win)
         result = {"value": None}
+
+        # Pin the Block/Cancel bar to the bottom first, then a scrollable body so
+        # the buttons are always reachable no matter how tall the form gets.
+        bar = tk.Frame(win, bg=COLOR_BG)
+        bar.pack(side="bottom", fill="x", padx=20, pady=14)
 
         tk.Label(win, text=title, bg=COLOR_BG, fg=COLOR_HEADER,
                  font=("Helvetica", 14, "bold")).pack(pady=(14, 6))
@@ -3112,8 +3215,7 @@ class AppBlockerUI:
                             if self._is_configured(app) else "manual")
         minutes_var = tk.StringVar(value="30")
 
-        body = tk.Frame(win, bg=COLOR_BG)
-        body.pack(fill="both", expand=True, padx=20)
+        body = self._scroll_body(win)
 
         # --- Mode selection ------------------------------------------------ #
         tk.Label(body, text="When to block", bg=COLOR_BG, fg=COLOR_HEADER,
@@ -3230,8 +3332,7 @@ class AppBlockerUI:
             result["value"] = cfg
             win.destroy()
 
-        bar = tk.Frame(win, bg=COLOR_BG)
-        bar.pack(side="bottom", fill="x", padx=20, pady=14)
+        # `bar` was pinned to the bottom before the scrollable body above.
         tk.Button(bar, text="Block", command=confirm, bg=COLOR_BLOCKED,
                   fg="white", relief="flat", padx=16, pady=6,
                   cursor="hand2").pack(side="right")
@@ -3246,9 +3347,9 @@ class AppBlockerUI:
         win = tk.Toplevel(parent)
         win.title("Schedule window")
         win.configure(bg=COLOR_BG)
-        win.geometry("360x300")
-        win.transient(parent)
-        win.grab_set()
+        win.geometry("360x320")
+        win.minsize(340, 300)
+        self._present(win)
         result = {"value": None}
 
         tk.Label(win, text="Block on these days", bg=COLOR_BG, fg=COLOR_HEADER,
