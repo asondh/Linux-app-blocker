@@ -1108,6 +1108,7 @@ class HistoryMonitor(threading.Thread):
         self._alert_state = {}
         self._last_sync = 0
         self._checked_tamper = False
+        self._cmd_results = []      # recent remote-command outcomes (for the UI)
 
     def stop(self):
         self._stop.set()
@@ -1131,12 +1132,15 @@ class HistoryMonitor(threading.Thread):
                                self._alert_state)
                 store.set_state("__heartbeat__", int(time.time()))
                 self._maybe_digest(store)
+                # Poll for remote-control commands from the dashboard and apply
+                # them (fast — pushes an updated snapshot right after applying).
+                self._poll_commands(store)
                 # Opportunistically push the remote dashboard data.
                 now = time.time()
                 if now - self._last_sync >= SYNC_INTERVAL:
                     self._last_sync = now
                     try:
-                        n = sync_reports(self.state, store)
+                        n = self._push_dashboard(store)
                         if n:
                             sys.stderr.write(f"[sync] pushed {n} bytes\n")
                     except Exception as exc:
@@ -1144,6 +1148,56 @@ class HistoryMonitor(threading.Thread):
             except Exception as exc:
                 sys.stderr.write(f"[monitor] sweep error: {exc}\n")
             self._stop.wait(MONITOR_HISTORY_INTERVAL)
+
+    def _push_dashboard(self, store):
+        """Push data.json including the control snapshot + recent command results."""
+        with self.state.lock:
+            cfg = dict(self.state.sync)
+        if not (cfg.get("enabled") and cfg.get("repo") and cfg.get("token")):
+            return 0
+        data = build_report_data(store, state=self.state,
+                                 cmd_results=self._cmd_results,
+                                 cmd_ts=store.get_state("__cmd_ts__") or 0)
+        return push_reports_to_github(cfg, data)
+
+    def _poll_commands(self, store):
+        """Fetch, apply, and record any new remote-control commands."""
+        with self.state.lock:
+            cfg = dict(self.state.sync)
+        if not (cfg.get("enabled") and cfg.get("control")
+                and cfg.get("repo") and cfg.get("token")):
+            return
+        try:
+            cmds = fetch_commands(cfg)
+        except Exception as exc:
+            sys.stderr.write(f"[control] fetch failed: {exc}\n")
+            return
+        cursor = store.get_state("__cmd_ts__") or 0
+        pending = sorted(
+            (c for c in cmds if isinstance(c, dict) and int(c.get("id", 0)) > cursor),
+            key=lambda c: int(c.get("id", 0)))
+        if not pending:
+            return
+        maxid = cursor
+        for c in pending:
+            cid = int(c.get("id", 0))
+            maxid = max(maxid, cid)
+            try:
+                ok, msg = apply_remote_command(self.state, c)
+            except Exception as exc:
+                ok, msg = False, str(exc)
+            self._cmd_results.append({
+                "id": cid, "action": c.get("action", ""), "ok": bool(ok),
+                "msg": msg, "at": int(time.time())})
+            sys.stderr.write(
+                f"[control] {'OK ' if ok else 'ERR'} {c.get('action')}: {msg}\n")
+        self._cmd_results = self._cmd_results[-40:]
+        store.set_state("__cmd_ts__", maxid)
+        # Push immediately so the phone sees the change and the confirmation.
+        try:
+            self._push_dashboard(store)
+        except Exception as exc:
+            sys.stderr.write(f"[control] push after apply failed: {exc}\n")
 
     def _email_cfg(self):
         with self.state.lock:
@@ -1238,8 +1292,40 @@ REPORT_DAYS = 30                   # how many days of history to publish
 REPORT_LIMIT = 6000               # cap visits so data.json stays well under 1 MB
 
 
-def build_report_data(store, days=REPORT_DAYS, limit=REPORT_LIMIT):
-    """Assemble the dashboard payload from the history store."""
+def _control_snapshot(state):
+    """Current blockable state, so the dashboard can render live controls."""
+    with state.lock:
+        apps = []
+        for a in state.apps:
+            apps.append({
+                "name": a.get("name", ""),
+                "proc": a.get("proc_name", ""),
+                "blocked": effective_blocked(a),
+                "mode": a.get("mode", "manual"),
+                "targets": list(a.get("target_users") or []),
+            })
+        websites = list(state.websites)
+        lockdown = bool(state.lockdown.get("enabled"))
+        adult = bool(state.block_adult)
+        remote_enabled = bool(state.sync.get("control"))
+    try:
+        human_users = [name for name, _uid in list_human_users()]
+    except Exception:
+        human_users = []
+    return {"apps": apps, "websites": websites, "lockdown": lockdown,
+            "block_adult": adult, "human_users": human_users,
+            "remote_enabled": remote_enabled}
+
+
+def build_report_data(store, days=REPORT_DAYS, limit=REPORT_LIMIT,
+                      state=None, cmd_results=None, cmd_ts=0):
+    """Assemble the dashboard payload from the history store.
+
+    When `state` is given, a `control` snapshot (apps / websites / lockdown /
+    users) is included so the dashboard can offer remote controls, along with
+    the results of recently-applied commands and the processed-command
+    watermark so the phone can show confirmations.
+    """
     start_day = time.strftime("%Y-%m-%d",
                               time.localtime(time.time() - days * 86400))
     rows = store.query(start_day=start_day, limit=limit + 1)
@@ -1257,7 +1343,7 @@ def build_report_data(store, days=REPORT_DAYS, limit=REPORT_LIMIT):
         machine = ""
     now = time.time()
     users = sorted(set(store.users()) | {a["u"] for a in attempts})
-    return {
+    data = {
         "generated_at": int(now),
         "generated_at_str": time.strftime("%Y-%m-%d %H:%M", time.localtime(now)),
         "machine": machine,
@@ -1266,7 +1352,12 @@ def build_report_data(store, days=REPORT_DAYS, limit=REPORT_LIMIT):
         "users": users,
         "visits": visits,
         "attempts": attempts,
+        "control_results": list(cmd_results or []),
+        "cmd_ts": int(cmd_ts or 0),
     }
+    if state is not None:
+        data["control"] = _control_snapshot(state)
+    return data
 
 
 def _gh_request(url, token, method="GET", body=None):
@@ -1322,8 +1413,130 @@ def sync_reports(state, store):
         cfg = dict(state.sync)
     if not cfg.get("enabled") or not cfg.get("repo") or not cfg.get("token"):
         return 0
-    data = build_report_data(store)
+    data = build_report_data(store, state=state,
+                             cmd_ts=store.get_state("__cmd_ts__") or 0)
     return push_reports_to_github(cfg, data)
+
+
+# --------------------------------------------------------------------------- #
+# Remote control — the phone (dashboard) appends commands to commands.json in
+# the same private repo; the daemon polls that file and applies them. Only the
+# phone writes commands.json and only the machine writes data.json, so the two
+# never collide. Commands carry a millisecond `id`; the machine remembers the
+# highest id it has processed (a watermark in its local store) so each command
+# runs exactly once.
+# --------------------------------------------------------------------------- #
+def _commands_path(cfg):
+    """commands.json sits next to the configured data.json path."""
+    p = (cfg.get("path") or "data.json").strip() or "data.json"
+    if "/" in p:
+        return p.rsplit("/", 1)[0] + "/commands.json"
+    return "commands.json"
+
+
+def fetch_commands(cfg):
+    """Read the pending command list from the repo. Returns a list (maybe empty)."""
+    repo = cfg.get("repo", "").strip()
+    token = cfg.get("token", "").strip()
+    branch = cfg.get("branch", "main").strip() or "main"
+    if not repo or not token:
+        return []
+    api = f"https://api.github.com/repos/{repo}/contents/{_commands_path(cfg)}"
+    try:
+        obj = _gh_request(f"{api}?ref={branch}", token)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return []            # no commands file yet — nothing queued
+        raise
+    raw = obj.get("content", "")
+    if obj.get("encoding") == "base64":
+        raw = base64.b64decode(raw).decode("utf-8", "replace")
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return []
+    cmds = data.get("commands") if isinstance(data, dict) else data
+    return cmds if isinstance(cmds, list) else []
+
+
+def apply_remote_command(state, cmd):
+    """
+    Apply one command dict to the shared AppState. The 5-second enforcement
+    sweep (which both daemon threads share) then propagates website / lockdown /
+    kill effects, so we only mutate state here. Returns (ok, message).
+    """
+    action = str(cmd.get("action", ""))
+
+    def find_app(proc):
+        key = str(proc or "").lower()
+        with state.lock:
+            for i, a in enumerate(state.apps):
+                if (a.get("proc_name", "") or "").lower() == key:
+                    return i, a.get("name", "")
+        return None, None
+
+    if action in ("block_app", "unblock_app"):
+        idx, name = find_app(cmd.get("app"))
+        if idx is None:
+            return False, f"app '{cmd.get('app')}' not found"
+        if action == "unblock_app":
+            state.unblock(idx)
+            return True, f"unblocked {name}"
+        mode = cmd.get("mode", "manual")
+        if mode not in ("manual", "timer"):
+            return False, "only manual/timer blocks are supported remotely"
+        minutes = cmd.get("minutes")
+        state.apply_block(idx, mode, minutes=minutes,
+                          target_users=cmd.get("users") or [])
+        return True, f"blocked {name}"
+
+    if action == "quick_block":
+        mode = cmd.get("mode", "manual")
+        if mode not in ("manual", "timer"):
+            return False, "only manual/timer blocks are supported remotely"
+        with state.lock:
+            n = len(state.apps)
+        for i in range(n):
+            state.apply_block(i, mode, minutes=cmd.get("minutes"),
+                              target_users=cmd.get("users") or [])
+        return True, f"blocked all {n} app(s)"
+
+    if action == "unblock_all":
+        with state.lock:
+            n = len(state.apps)
+        for i in range(n):
+            state.unblock(i)
+        return True, "unblocked all apps"
+
+    if action == "add_website":
+        dom = normalize_domain(cmd.get("domain", ""))
+        if not dom:
+            return False, "invalid domain"
+        with state.lock:
+            cur = list(state.websites)
+        if dom not in cur:
+            cur.append(dom)
+        state.set_websites(cur)
+        return True, f"blocked website {dom}"
+
+    if action == "remove_website":
+        dom = normalize_domain(cmd.get("domain", ""))
+        with state.lock:
+            cur = [d for d in state.websites if d != dom]
+        state.set_websites(cur)
+        return True, f"unblocked website {dom}"
+
+    if action == "set_lockdown":
+        en = bool(cmd.get("enabled"))
+        state.set_lockdown(en)
+        return True, f"browser lockdown {'on' if en else 'off'}"
+
+    if action == "set_block_adult":
+        en = bool(cmd.get("enabled"))
+        state.set_block_adult(en)
+        return True, f"adult blocklist {'on' if en else 'off'}"
+
+    return False, f"unknown action '{action}'"
 
 
 # --------------------------------------------------------------------------- #
@@ -1579,12 +1792,13 @@ class AppState:
     @staticmethod
     def _default_sync():
         return {"enabled": False, "repo": "", "branch": "main",
-                "path": "data.json", "token": ""}
+                "path": "data.json", "token": "", "control": False}
 
     def _normalize_sync(self, value):
         cfg = self._default_sync()
         if isinstance(value, dict):
             cfg["enabled"] = bool(value.get("enabled"))
+            cfg["control"] = bool(value.get("control"))
             for k in ("repo", "branch", "path", "token"):
                 if value.get(k):
                     cfg[k] = str(value[k]).strip()
@@ -2795,12 +3009,25 @@ class AppBlockerUI:
                  fg="#7f8c8d", wraplength=470, justify="left").pack(
                      padx=16, pady=(6, 0))
 
+        control = tk.BooleanVar(value=cfg.get("control", False))
+        tk.Checkbutton(body, text="Allow remote control from the dashboard",
+                       variable=control, bg=COLOR_BG,
+                       font=("Helvetica", 11, "bold")).pack(
+                           anchor="w", padx=16, pady=(10, 0))
+        tk.Label(body, text="When on, the daemon also checks the repo for "
+                 "commands from the dashboard (block/unblock apps, block "
+                 "websites, panic buttons, lockdown) and applies them within a "
+                 "minute. The dashboard needs the same read+write token. Leave "
+                 "off for a view-only dashboard.", bg=COLOR_BG, fg="#7f8c8d",
+                 wraplength=470, justify="left").pack(padx=16, pady=(0, 4))
+
         status = tk.Label(body, text="", bg=COLOR_BG, fg=COLOR_HEADER,
                           wraplength=470, justify="left")
         status.pack(padx=16, pady=(8, 0))
 
         def collect():
             return {"enabled": enabled.get(),
+                    "control": control.get(),
                     "repo": vars_["repo"].get().strip(),
                     "branch": vars_["branch"].get().strip() or "main",
                     "path": vars_["path"].get().strip() or "data.json",
@@ -2816,8 +3043,8 @@ class AppBlockerUI:
             status.config(text="Pushing…")
             win.update_idletasks()
             try:
-                n = push_reports_to_github(collect(),
-                                           build_report_data(HistoryStore()))
+                n = push_reports_to_github(
+                    collect(), build_report_data(HistoryStore(), state=self.state))
                 status.config(text=f"✓ Pushed {n} bytes to {collect()['repo']}.")
             except Exception as exc:
                 status.config(text=f"✗ {exc}")
@@ -3651,7 +3878,8 @@ def main():
             print("No dashboard settings saved. Configure them in the app first.")
             return
         try:
-            n = push_reports_to_github(st.sync, build_report_data(HistoryStore()))
+            n = push_reports_to_github(
+                st.sync, build_report_data(HistoryStore(), state=st))
             print(f"Pushed {n} bytes to {st.sync['repo']}.")
         except Exception as exc:
             print(f"Sync failed: {exc}")

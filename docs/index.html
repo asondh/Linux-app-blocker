@@ -55,6 +55,30 @@
   .hidden { display:none; }
   .pill { display:inline-block; background:#eafaf1; color:#1e8449;
           border-radius:10px; padding:1px 8px; font-size:12px; }
+  .pill.red { background:#fdecea; color:var(--red); }
+  /* Controls tab */
+  .ctl-sec { padding:12px 14px; border-bottom:1px solid var(--line); }
+  .ctl-sec:last-child { border-bottom:0; }
+  .ctl-sec h3 { font-size:13px; margin:0 0 8px; color:var(--head); }
+  .ctl-row { display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+             padding:8px 0; border-bottom:1px dashed var(--line); }
+  .ctl-row:last-child { border-bottom:0; }
+  .ctl-row .name { font-weight:600; }
+  .ctl-row .spacer { margin-left:auto; }
+  .ctl-row button { padding:7px 12px; }
+  button.red { background:var(--red); }
+  button.green { background:#1e8449; }
+  button.small { padding:5px 9px; font-size:13px; }
+  .ctl-in { padding:8px; border:1px solid var(--line); border-radius:6px;
+            font-size:14px; min-width:150px; flex:1; }
+  select.ctl-in { flex:0 0 auto; min-width:130px; }
+  .ctl-note { color:var(--muted); font-size:12px; margin:2px 0 10px; }
+  .ctl-warn { background:#fef9e7; border:1px solid #f7dc6f; color:#7d6608;
+              border-radius:6px; padding:10px 12px; margin:12px 14px;
+              font-size:13px; }
+  #ctl-status { font-size:13px; padding:0 14px 12px; }
+  #ctl-status .line { padding:3px 0; }
+  .ok { color:#1e8449; } .bad { color:var(--red); } .wait { color:var(--accent); }
 </style>
 </head>
 <body>
@@ -77,10 +101,12 @@
   <input id="f-branch" placeholder="main" value="main">
   <label>File path</label>
   <input id="f-path" placeholder="data.json" value="data.json">
-  <label>GitHub token (read access to that repo)</label>
+  <label>GitHub token</label>
   <input id="f-token" type="password" placeholder="github_pat_...">
-  <div class="hint">Use a fine-grained token limited to that one private repo
-  with <b>Contents: Read-only</b>. Revoke it anytime from GitHub.</div>
+  <div class="hint">Use a fine-grained token limited to that one private repo.
+  <b>Contents: Read-only</b> is enough to view the dashboard; use
+  <b>Contents: Read and write</b> if you want the Controls tab to block/unblock
+  from here. Revoke it anytime from GitHub.</div>
   <div style="margin-top:16px; display:flex; gap:10px;">
     <button id="f-save">Save &amp; Load</button>
     <button id="f-cancel" class="ghost">Cancel</button>
@@ -101,10 +127,17 @@
   </div>
 
   <div class="tabs">
+    <button data-tab="controls">Controls</button>
     <button data-tab="visits" class="active">Visits</button>
     <button data-tab="searches">Searches</button>
     <button data-tab="time">Time per site</button>
     <button data-tab="blocked">Blocked attempts</button>
+  </div>
+
+  <div class="card hidden" id="panel-controls">
+    <h2>Remote controls</h2>
+    <div id="ctl-body"></div>
+    <div id="ctl-status"></div>
   </div>
 
   <div class="card" id="panel-visits">
@@ -150,6 +183,9 @@ const LS = "appblocker.dashboard.cfg";
 const IDLE_CAP = 1800; // seconds; matches the app's time-on-site estimate
 let DATA = null;               // {generated_at_str, machine, visits:[...]}
 let sortState = {};            // per-table sort
+let lastId = 0;                // last command id we minted (keep them increasing)
+let SENT = {};                 // id -> {action,label} sent this session (pending UI)
+let CTLMSG = "";               // transient controls status message (HTML)
 
 const $ = (id) => document.getElementById(id);
 function getCfg(){ try { return JSON.parse(localStorage.getItem(LS)||"null"); }
@@ -198,6 +234,7 @@ async function loadData(){
     $("btn-settings").classList.remove("hidden");
     initFilters();
     render();
+    renderControls();
     const trunc = DATA.truncated ? " · showing most recent " +
         (DATA.visits||[]).length + " visits" : "";
     $("meta").textContent = `Updated ${DATA.generated_at_str||"?"}` +
@@ -317,11 +354,173 @@ function render(){
 function esc(s){ return (s==null?"":String(s)).replace(/[&<>"]/g,
   c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c])); }
 
+// -- remote controls --------------------------------------------------------
+function hdr(c, write){
+  const h={ "Authorization":"Bearer "+c.token,
+    "Accept":"application/vnd.github+json",
+    "X-GitHub-Api-Version":"2022-11-28" };
+  if(write) h["Content-Type"]="application/json";
+  return h;
+}
+function commandsPath(){
+  const p=(getCfg().path||"data.json");
+  return p.includes("/") ? p.replace(/\/[^\/]*$/,"/commands.json") : "commands.json";
+}
+async function ghGetCommands(path){
+  const c=getCfg();
+  const url=`https://api.github.com/repos/${c.repo}/contents/${path}`+
+            `?ref=${encodeURIComponent(c.branch||"main")}&t=${Date.now()}`;
+  const res=await fetch(url,{headers:hdr(c,false),cache:"no-store"});
+  if(res.status===404) return {sha:null, commands:[]};
+  if(!res.ok) throw new Error("GitHub "+res.status);
+  const j=await res.json();
+  let commands=[];
+  try{
+    const raw=decodeURIComponent(escape(atob((j.content||"").replace(/\n/g,""))));
+    const d=JSON.parse(raw);
+    commands=Array.isArray(d.commands)?d.commands:(Array.isArray(d)?d:[]);
+  }catch(e){ commands=[]; }
+  return {sha:j.sha, commands};
+}
+async function sendCommand(cmd, label){
+  const c=getCfg();
+  if(!c||!c.repo||!c.token){ ctlMsg("Not connected.","bad"); return; }
+  const path=commandsPath();
+  const wm=(DATA&&DATA.cmd_ts)||0;
+  let id=Date.now(); if(id<=lastId) id=lastId+1; lastId=id; cmd.id=id;
+  ctlMsg("Sending “"+label+"”…","wait");
+  for(let attempt=0; attempt<2; attempt++){
+    try{
+      const cur=await ghGetCommands(path);
+      // Drop commands the machine already processed so the file stays small.
+      let list=(cur.commands||[]).filter(x=>Number(x.id||0)>wm);
+      list.push(cmd);
+      const body={ message:"appblocker command "+cmd.action,
+        content:btoa(unescape(encodeURIComponent(JSON.stringify({commands:list})))),
+        branch:c.branch||"main" };
+      if(cur.sha) body.sha=cur.sha;
+      const res=await fetch(`https://api.github.com/repos/${c.repo}/contents/${path}`,
+        {method:"PUT",headers:hdr(c,true),body:JSON.stringify(body)});
+      if(res.status===409) continue;   // sha race — re-read and retry once
+      if(res.status===401||res.status===403){
+        ctlMsg("Token can’t write here — it needs Contents: Read and write on "+
+               "this repo. Update the token in Settings.","bad"); return; }
+      if(!res.ok){ ctlMsg("Send failed: GitHub "+res.status,"bad"); return; }
+      SENT[id]={action:cmd.action,label};
+      ctlMsg("Sent “"+label+"”. Applies within ~1 min — press Refresh to "+
+             "confirm.","wait");
+      return;
+    }catch(e){ if(attempt===1){ ctlMsg("Send failed: "+e.message,"bad"); return; } }
+  }
+  ctlMsg("Send failed: the repo was busy — try again.","bad");
+}
+function onCtlButton(b){
+  const act=b.dataset.act;
+  const mv=($("ctl-mode")||{}).value||"manual";
+  const blk = mv==="manual" ? {mode:"manual"} : {mode:"timer",minutes:parseInt(mv,10)};
+  if(act==="block_app")   return sendCommand(Object.assign({action:"block_app",app:b.dataset.app},blk), "block "+b.dataset.app);
+  if(act==="unblock_app") return sendCommand({action:"unblock_app",app:b.dataset.app}, "unblock "+b.dataset.app);
+  if(act==="quick_block") return sendCommand(Object.assign({action:"quick_block"},blk), "block all browsers");
+  if(act==="unblock_all") return sendCommand({action:"unblock_all"}, "unblock everything");
+  if(act==="add_website"){ const d=($("ctl-site").value||"").trim();
+    if(!d){ ctlMsg("Enter a domain first.","bad"); return; }
+    return sendCommand({action:"add_website",domain:d}, "block "+d); }
+  if(act==="remove_website") return sendCommand({action:"remove_website",domain:b.dataset.dom}, "unblock "+b.dataset.dom);
+  if(act==="set_block_adult") return sendCommand({action:"set_block_adult",enabled:b.dataset.en==="1"}, "adult blocklist "+(b.dataset.en==="1"?"on":"off"));
+  if(act==="set_lockdown")    return sendCommand({action:"set_lockdown",enabled:b.dataset.en==="1"}, "lockdown "+(b.dataset.en==="1"?"on":"off"));
+}
+function ctlMsg(t,cls){ CTLMSG=t?('<span class="'+(cls||"")+'">'+esc(t)+'</span>'):""; renderCtlStatus(); }
+function renderCtlStatus(){
+  const el=$("ctl-status"); if(!el) return;
+  let h="";
+  if(CTLMSG) h+='<div class="line">'+CTLMSG+'</div>';
+  const wm=(DATA&&DATA.cmd_ts)||0;
+  Object.keys(SENT).map(Number).filter(id=>id>wm).forEach(id=>{
+    h+='<div class="line wait">⏳ '+esc(SENT[id].label)+' — waiting for the machine…</div>'; });
+  const res=(DATA&&DATA.control_results)||[];
+  res.slice(-6).reverse().forEach(r=>{
+    h+='<div class="line '+(r.ok?"ok":"bad")+'">'+(r.ok?"✓":"✗")+' '+
+       esc(r.action)+': '+esc(r.msg)+'</div>'; });
+  el.innerHTML=h;
+}
+function ctlRowBtn(act, cls, txt, extra){
+  return '<button class="'+cls+'" data-act="'+act+'"'+(extra||"")+'>'+txt+'</button>';
+}
+function renderControls(){
+  const body=$("ctl-body"); if(!body) return;
+  const ctl=DATA&&DATA.control;
+  if(!ctl){
+    body.innerHTML='<div class="ctl-warn">This machine hasn’t sent a control '+
+      'snapshot yet. Update AppBlocker on the machine, then press Refresh.</div>';
+    renderCtlStatus(); return;
+  }
+  let h="";
+  if(!ctl.remote_enabled){
+    h+='<div class="ctl-warn">Remote control is <b>OFF</b> on the machine. In '+
+       'AppBlocker open <b>📊 Activity → ☁ Remote Dashboard</b> and tick '+
+       '“Allow remote control” (and make sure the token here has write access). '+
+       'You can still queue commands below — they apply once it’s enabled.</div>';
+  }
+  h+='<div class="ctl-sec"><h3>Block duration</h3><div class="ctl-row">'+
+     '<span class="ctl-note" style="margin:0">Applied by the Block buttons below.</span>'+
+     '<select id="ctl-mode" class="ctl-in spacer">'+
+     '<option value="manual">Until I unblock</option>'+
+     '<option value="30">30 minutes</option>'+
+     '<option value="60">1 hour</option>'+
+     '<option value="120">2 hours</option></select></div></div>';
+
+  h+='<div class="ctl-sec"><h3>Apps</h3>';
+  (ctl.apps||[]).forEach(a=>{
+    const st=a.blocked?'<span class="pill red">blocked</span>':'<span class="pill">active</span>';
+    const btn=a.blocked
+      ? ctlRowBtn("unblock_app","green small","Unblock",' data-app="'+esc(a.proc)+'"')
+      : ctlRowBtn("block_app","red small","Block",' data-app="'+esc(a.proc)+'"');
+    h+='<div class="ctl-row"><span class="name">'+esc(a.name)+'</span> '+st+
+       '<span class="spacer"></span>'+btn+'</div>';
+  });
+  if(!(ctl.apps||[]).length) h+='<div class="ctl-note">No apps in the list.</div>';
+  h+='</div>';
+
+  h+='<div class="ctl-sec"><h3>Quick actions</h3><div class="ctl-row">'+
+     ctlRowBtn("quick_block","red","⚡ Block all browsers")+
+     ctlRowBtn("unblock_all","green","🔓 Unblock everything")+'</div></div>';
+
+  h+='<div class="ctl-sec"><h3>Blocked websites</h3>';
+  (ctl.websites||[]).forEach(d=>{
+    h+='<div class="ctl-row"><span class="name">'+esc(d)+'</span>'+
+       '<span class="spacer"></span>'+
+       ctlRowBtn("remove_website","green small","Unblock",' data-dom="'+esc(d)+'"')+'</div>';
+  });
+  h+='<div class="ctl-row"><input id="ctl-site" class="ctl-in" '+
+     'placeholder="e.g. tiktok.com">'+
+     ctlRowBtn("add_website","red small","Block site")+'</div>'+
+     '<div class="ctl-note">Blocks machine-wide, for every user.</div></div>';
+
+  h+='<div class="ctl-sec"><h3>Protection</h3>'+
+     '<div class="ctl-row"><span class="name">Adult-content blocklist</span> '+
+     (ctl.block_adult?'<span class="pill">on</span>':'<span class="pill red">off</span>')+
+     '<span class="spacer"></span>'+
+     (ctl.block_adult
+       ? ctlRowBtn("set_block_adult","ghost small","Turn off",' data-en="0"')
+       : ctlRowBtn("set_block_adult","red small","Turn on",' data-en="1"'))+'</div>'+
+     '<div class="ctl-row"><span class="name">Browser lockdown '+
+     '(no incognito / no history-wipe)</span> '+
+     (ctl.lockdown?'<span class="pill">on</span>':'<span class="pill red">off</span>')+
+     '<span class="spacer"></span>'+
+     (ctl.lockdown
+       ? ctlRowBtn("set_lockdown","ghost small","Turn off",' data-en="0"')
+       : ctlRowBtn("set_lockdown","red small","Turn on",' data-en="1"'))+'</div></div>';
+
+  body.innerHTML=h;
+  body.querySelectorAll("button[data-act]").forEach(b=>{ b.onclick=()=>onCtlButton(b); });
+  renderCtlStatus();
+}
+
 // -- wiring --
 document.querySelectorAll(".tabs button").forEach(b=>{
   b.onclick=()=>{ document.querySelectorAll(".tabs button")
       .forEach(x=>x.classList.remove("active")); b.classList.add("active");
-    ["visits","searches","time","blocked"].forEach(t=>
+    ["controls","visits","searches","time","blocked"].forEach(t=>
       $("panel-"+t).classList.toggle("hidden", t!==b.dataset.tab)); };
 });
 document.querySelectorAll("th[data-sort]").forEach(th=>{
