@@ -1233,7 +1233,7 @@ import base64                       # noqa: E402 (grouped with the feature)
 import urllib.request              # noqa: E402
 import urllib.error                # noqa: E402
 
-SYNC_INTERVAL = 900                # seconds between opportunistic dashboard syncs
+SYNC_INTERVAL = 300                # seconds between opportunistic dashboard syncs
 REPORT_DAYS = 30                   # how many days of history to publish
 REPORT_LIMIT = 6000               # cap visits so data.json stays well under 1 MB
 
@@ -3550,6 +3550,19 @@ def run_daemon():
     # just call it inline here so the daemon has no extra moving parts.
     monitor.run()
     history.stop()
+
+    # Final catch-up on shutdown: import any last visits and push the dashboard
+    # once more, so activity right up to power-off shows up without waiting for
+    # the next boot. Best-effort — the network may already be going down, in
+    # which case the push on the next startup is the backstop.
+    try:
+        import_all_history(state, store)
+        n = sync_reports(state, store)
+        sys.stderr.write(f"[sync] shutdown push: {n} bytes\n" if n
+                         else "[sync] shutdown: nothing to push\n")
+    except Exception as exc:
+        sys.stderr.write(f"[sync] shutdown push failed: {exc}\n")
+
     sys.stderr.write("[daemon] stopped\n")
 
 

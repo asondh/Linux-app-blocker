@@ -1,7 +1,11 @@
 [Unit]
 Description=AppBlocker system-wide application blocker
 Documentation=https://github.com/asondh/Linux-app-blocker
-After=multi-user.target
+# Order after the network so the daemon has connectivity at startup, and — since
+# shutdown stops units in reverse order — so it is stopped BEFORE the network
+# goes down, letting the final dashboard push on shutdown reach GitHub.
+Wants=network-online.target
+After=network-online.target multi-user.target
 
 [Service]
 Type=simple
