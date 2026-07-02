@@ -808,6 +808,30 @@ class HistoryStore:
         finally:
             conn.close()
 
+    # -- retention ---------------------------------------------------------- #
+    def prune(self, days):
+        """Delete visits/attempts older than `days`. Returns rows removed.
+
+        The SQLite file itself won't shrink (freed pages are reused), so it
+        settles at roughly one retention-window's worth rather than growing
+        forever. days <= 0 means keep everything.
+        """
+        try:
+            days = int(days)
+        except (TypeError, ValueError):
+            return 0
+        if days <= 0:
+            return 0
+        cutoff = int(time.time()) - days * 86400
+        conn = self._connect()
+        try:
+            n = conn.execute("DELETE FROM visits WHERE ts < ?", (cutoff,)).rowcount or 0
+            n += conn.execute("DELETE FROM attempts WHERE ts < ?", (cutoff,)).rowcount or 0
+            conn.commit()
+            return n
+        finally:
+            conn.close()
+
     # -- blocked attempts --------------------------------------------------- #
     def add_attempt(self, username, app, ts):
         conn = self._connect()
@@ -1132,6 +1156,7 @@ class HistoryMonitor(threading.Thread):
                                self._alert_state)
                 store.set_state("__heartbeat__", int(time.time()))
                 self._maybe_digest(store)
+                self._maybe_prune(store)
                 # Poll for remote-control commands from the dashboard and apply
                 # them (fast — pushes an updated snapshot right after applying).
                 self._poll_commands(store)
@@ -1276,6 +1301,24 @@ class HistoryMonitor(threading.Thread):
                 store.set_state("__digest__", now)
         except Exception as exc:
             sys.stderr.write(f"[monitor] digest email failed: {exc}\n")
+
+    def _maybe_prune(self, store):
+        """Once a day, delete history older than the configured retention."""
+        with self.state.lock:
+            days = int(self.state.monitor.get("history_days") or 0)
+        if days <= 0:
+            return                       # 0 = keep everything
+        now = int(time.time())
+        if now - (store.get_state("__pruned__") or 0) < 86400:
+            return                       # already pruned in the last 24h
+        try:
+            n = store.prune(days)
+            store.set_state("__pruned__", now)
+            if n:
+                sys.stderr.write(f"[monitor] pruned {n} history rows older "
+                                 f"than {days} days\n")
+        except Exception as exc:
+            sys.stderr.write(f"[monitor] prune failed: {exc}\n")
 
 
 # --------------------------------------------------------------------------- #
@@ -1874,6 +1917,7 @@ class AppState:
             "alert_blocked": True,  # email when a child tries a blocked app
             "digest_enabled": False,   # daily summary email
             "digest_hours": 24,        # digest interval
+            "history_days": 90,        # keep this many days of history (0=forever)
             "email": {"enabled": False, "host": "", "port": 587,
                       "username": "", "password": "", "from": "", "to": "",
                       "quiet_start": "", "quiet_end": ""},
@@ -1893,6 +1937,10 @@ class AppState:
                 mon["digest_hours"] = max(1, int(value.get("digest_hours", 24)))
             except (TypeError, ValueError):
                 mon["digest_hours"] = 24
+            try:
+                mon["history_days"] = max(0, int(value.get("history_days", 90)))
+            except (TypeError, ValueError):
+                mon["history_days"] = 90
             email = value.get("email") or {}
             if isinstance(email, dict):
                 mon["email"].update({k: email.get(k, mon["email"][k])
@@ -3318,6 +3366,16 @@ class AppBlockerUI:
                    ).pack(side="left", padx=4)
         tk.Label(drow, text="hours", bg=COLOR_BG).pack(side="left")
 
+        hrow = tk.Frame(body, bg=COLOR_BG)
+        hrow.pack(fill="x", padx=16, pady=(6, 0))
+        tk.Label(hrow, text="Keep browsing history for", bg=COLOR_BG).pack(
+            side="left")
+        history_days = tk.StringVar(value=str(mon.get("history_days", 90)))
+        tk.Spinbox(hrow, from_=0, to=3650, width=5, textvariable=history_days
+                   ).pack(side="left", padx=4)
+        tk.Label(hrow, text="days (0 = keep forever). Older entries are "
+                 "auto-deleted.", bg=COLOR_BG, fg="#7f8c8d").pack(side="left")
+
         em_on = tk.BooleanVar(value=email.get("enabled", False))
         tk.Checkbutton(body, text="Send email alerts (SMTP)", variable=em_on,
                        bg=COLOR_BG, font=("Helvetica", 11, "bold")).pack(
@@ -3358,6 +3416,10 @@ class AppBlockerUI:
                 mon["digest_hours"] = max(1, int(digest_hours.get()))
             except ValueError:
                 mon["digest_hours"] = 24
+            try:
+                mon["history_days"] = max(0, int(history_days.get()))
+            except ValueError:
+                mon["history_days"] = 90
             em = {"enabled": em_on.get()}
             for key, v in vars_.items():
                 em[key] = v.get().strip()
