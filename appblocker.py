@@ -1358,7 +1358,43 @@ def build_report_data(store, days=REPORT_DAYS, limit=REPORT_LIMIT,
     }
     if state is not None:
         data["control"] = _control_snapshot(state)
+        # Flag recorded visits whose domain is on the effective blocklist — these
+        # are attempts to reach a blocked site (adult list or your own list). We
+        # can only surface the ones the browser wrote to history, so it's a
+        # best-effort view, not an airtight log.
+        bl = effective_block_domains(state)
+        blocked_sites = []
+        if bl:
+            for v in visits:
+                if _domain_blocked(v.get("d") or "", bl):
+                    blocked_sites.append({"u": v["u"], "d": v["d"],
+                                          "url": v["url"], "ts": v["ts"]})
+        data["blocked_sites"] = blocked_sites
+    else:
+        data["blocked_sites"] = []
     return data
+
+
+def effective_block_domains(state):
+    """All domains currently blocked machine-wide: your list + the adult list."""
+    with state.lock:
+        doms = set(state.websites)
+        adult = state.block_adult
+    if adult:
+        doms |= load_adult_domains()
+    return doms
+
+
+def _domain_blocked(domain, blocklist):
+    """True if `domain` or any of its parent domains is in `blocklist`."""
+    d = (domain or "").lower().strip(".")
+    if not d:
+        return False
+    parts = d.split(".")
+    for i in range(len(parts) - 1):
+        if ".".join(parts[i:]) in blocklist:
+            return True
+    return d in blocklist
 
 
 def machine_id():

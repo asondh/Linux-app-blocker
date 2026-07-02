@@ -149,7 +149,7 @@
     <button data-tab="visits" class="active">Visits</button>
     <button data-tab="searches">Searches</button>
     <button data-tab="time">Time per site</button>
-    <button data-tab="blocked">Blocked attempts</button>
+    <button data-tab="blocked">Blocked</button>
   </div>
 
   <div class="card hidden" id="panel-controls">
@@ -188,13 +188,14 @@
   </div>
 
   <div class="card hidden" id="panel-blocked">
-    <h2>Blocked-app attempts <span id="c-blocked" class="muted"></span></h2>
+    <h2>Blocked — apps &amp; sites <span id="c-blocked" class="muted"></span></h2>
     <table><thead><tr>
       <th data-sort="ts">When</th><th data-sort="user">User</th>
       <th class="col-m" data-sort="m">Machine</th>
-      <th data-sort="app">Tried to open</th></tr></thead>
+      <th data-sort="type">Type</th>
+      <th data-sort="what">Blocked</th></tr></thead>
       <tbody id="tb-blocked"></tbody></table>
-    <div id="e-blocked" class="empty hidden">No blocked attempts.</div>
+    <div id="e-blocked" class="empty hidden">Nothing blocked.</div>
   </div>
 </div>
 
@@ -254,14 +255,15 @@ async function ghGetRaw(path){
   return JSON.parse(await res.text());
 }
 function mergeMachines(){
-  const visits=[], attempts=[], users=new Set();
+  const visits=[], attempts=[], blocked_sites=[], users=new Set();
   MACHINES.forEach(m => {
     const nm = m.name;
     (m.data.visits||[]).forEach(v => visits.push(Object.assign({_m:nm}, v)));
     (m.data.attempts||[]).forEach(a => { attempts.push(Object.assign({_m:nm}, a)); users.add(a.u); });
+    (m.data.blocked_sites||[]).forEach(s => { blocked_sites.push(Object.assign({_m:nm}, s)); users.add(s.u); });
     (m.data.users||[]).forEach(u => users.add(u));
   });
-  DATA = { visits, attempts, users:[...users].sort(),
+  DATA = { visits, attempts, blocked_sites, users:[...users].sort(),
            machines: MACHINES.map(m=>({id:m.id, name:m.name})),
            truncated: MACHINES.some(m=>m.data.truncated) };
 }
@@ -423,23 +425,32 @@ function render(){
   $("c-time").textContent="("+durs.length+")";
   $("e-time").classList.toggle("hidden", durs.length>0);
 
-  // Blocked-app attempts (user + machine + date; site filter doesn't apply)
+  // Blocked — app-launch attempts + attempts to reach blocked sites.
+  // (user + machine + date filters; the site-text filter also narrows sites.)
   const u=$("fx-user").value, mac=$("fx-machine").value;
+  const siteF=($("fx-site").value||"").toLowerCase().trim();
   const from=$("fx-from").value?Date.parse($("fx-from").value)/1000:null;
   const to=$("fx-to").value?Date.parse($("fx-to").value)/1000+86400:null;
-  let att=(DATA.attempts||[]).filter(a=>{
-    if(u!=="All users"&&a.u!==u) return false;
-    if(mac!=="All machines"&&a._m!==mac) return false;
-    if(from!==null&&a.ts<from) return false;
-    if(to!==null&&a.ts>=to) return false;
+  const combined = (DATA.attempts||[]).map(a=>(
+      {ts:a.ts,user:a.u,m:a._m,type:"App",what:a.app,site:false}))
+    .concat((DATA.blocked_sites||[]).map(s=>(
+      {ts:s.ts,user:s.u,m:s._m,type:"Site",what:s.url||s.d,dom:s.d,site:true})));
+  let blk=combined.filter(r=>{
+    if(u!=="All users"&&r.user!==u) return false;
+    if(mac!=="All machines"&&r.m!==mac) return false;
+    if(from!==null&&r.ts<from) return false;
+    if(to!==null&&r.ts>=to) return false;
+    if(siteF&&r.site&&!((r.dom||r.what||"").toLowerCase().includes(siteF))) return false;
     return true; });
-  att=sortRows(att.map(a=>({ts:a.ts,user:a.u,m:a._m,app:a.app})),"blocked");
+  blk=sortRows(blk,"blocked");
   const tbB=$("tb-blocked"); tbB.innerHTML="";
-  att.forEach(a=>{ const tr=document.createElement("tr");
-    tr.innerHTML=`<td>${fmtWhen(a.ts)}</td><td>${esc(a.user)}</td>`+mcell(a.m)+
-                 `<td>${esc(a.app)}</td>`; tbB.appendChild(tr); });
-  $("c-blocked").textContent="("+att.length+")";
-  $("e-blocked").classList.toggle("hidden", att.length>0);
+  blk.forEach(r=>{ const tr=document.createElement("tr");
+    const pill=r.site?'<span class="pill red">Site</span>':'<span class="pill">App</span>';
+    tr.innerHTML=`<td>${fmtWhen(r.ts)}</td><td>${esc(r.user)}</td>`+mcell(r.m)+
+                 `<td>${pill}</td><td class="${r.site?'url':''}">${esc(r.what)}</td>`;
+    tbB.appendChild(tr); });
+  $("c-blocked").textContent="("+blk.length+")";
+  $("e-blocked").classList.toggle("hidden", blk.length>0);
 }
 
 function esc(s){ return (s==null?"":String(s)).replace(/[&<>"]/g,
