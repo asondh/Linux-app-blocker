@@ -1814,15 +1814,43 @@ class ProcessMonitor(threading.Thread):
         # Dynamic trigger rules: while a trigger app is running for some user,
         # block its target apps for exactly the user(s) running the trigger,
         # and (machine-wide) block any websites the rule lists.
+        #
+        # PWA / web-app triggers (match_type "commandline") are detected by the
+        # user's open WINDOWS, not by a process carrying the URL: a Chromium PWA
+        # opened while the browser is already running leaves no lasting process
+        # with its URL, and one opened first leaves that URL in the browser
+        # process even after the PWA window is closed. The window is the only
+        # signal that tracks the PWA actually being open.
+        human_uids = {uid for _n, uid in list_human_users()}
+        proc_uids = {uid for _p, _c, uid, _e, _cmd in procs}
+        win_cache = {}
+
+        def windows_for(uid):
+            if uid not in win_cache:
+                win_cache[uid] = self._list_user_windows(uid)
+            return win_cache[uid]
+
         dynamic_sites = set()
         for rule in trigger_rules:
             if not rule.get("enabled", True):
                 continue
             trig_app = resolve(rule.get("trigger"))
-            active_uids = {
-                uid for _pid, comm, uid, exe, cmd in procs
-                if app_matches(trig_app, comm, exe, cmd)
-            }
+            if trig_app.get("match_type") == "commandline":
+                terms = [t.lower() for t in app_match_terms(trig_app) if t]
+                active_uids = set()
+                for uid in (proc_uids & human_uids):
+                    wins = windows_for(uid)
+                    if wins is None:            # X not queryable — fall back
+                        if any(app_matches(trig_app, comm, exe, cmd)
+                               for _p, comm, u2, exe, cmd in procs if u2 == uid):
+                            active_uids.add(uid)
+                    elif any(t in w for t in terms for w in wins):
+                        active_uids.add(uid)
+            else:
+                active_uids = {
+                    uid for _pid, comm, uid, exe, cmd in procs
+                    if app_matches(trig_app, comm, exe, cmd)
+                }
             if not active_uids:
                 continue
             allowed = rule.get("users") or []
@@ -1882,6 +1910,70 @@ class ProcessMonitor(threading.Thread):
             if changed:
                 self.state.save_locked()
         return changed
+
+    def _user_x_env(self, uid):
+        """DISPLAY / XAUTHORITY for a uid's graphical session, read from one of
+        its session processes' environment, or None if it has no X session."""
+        try:
+            home = pwd.getpwuid(uid).pw_dir
+        except Exception:
+            home = None
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            base = f"/proc/{pid}"
+            try:
+                if os.stat(base).st_uid != uid:
+                    continue
+                with open(f"{base}/environ", "rb") as fh:
+                    raw = fh.read()
+            except Exception:
+                continue
+            disp = xauth = None
+            for e in raw.split(b"\0"):
+                if e.startswith(b"DISPLAY="):
+                    disp = e[8:].decode("utf-8", "replace")
+                elif e.startswith(b"XAUTHORITY="):
+                    xauth = e[11:].decode("utf-8", "replace")
+            if disp:
+                if not xauth and home:
+                    xauth = os.path.join(home, ".Xauthority")
+                return {"DISPLAY": disp, "XAUTHORITY": xauth}
+        return None
+
+    def _list_user_windows(self, uid):
+        """Lowercased 'wm_class title' strings for a user's open windows, or
+        None if the X session can't be queried (caller falls back to /proc).
+
+        This is how PWA / web-app triggers are detected reliably: a Chromium
+        PWA opened while the browser is already running leaves no lasting
+        process carrying its URL, but its window is always present while open.
+        """
+        if not which("wmctrl"):
+            return None
+        env = self._user_x_env(uid)
+        if not env:
+            return None
+        run_env = dict(os.environ)
+        run_env["DISPLAY"] = env["DISPLAY"]
+        if env.get("XAUTHORITY"):
+            run_env["XAUTHORITY"] = env["XAUTHORITY"]
+        try:
+            out = subprocess.run(["wmctrl", "-lx"], capture_output=True,
+                                 text=True, timeout=5, env=run_env)
+        except Exception:
+            return None
+        if out.returncode != 0:
+            return None
+        wins = []
+        for line in out.stdout.splitlines():
+            parts = line.split(None, 4)   # winid desktop wm_class host title
+            if len(parts) < 3:
+                continue
+            wm_class = parts[2]
+            title = parts[4] if len(parts) >= 5 else ""
+            wins.append((wm_class + " " + title).lower())
+        return wins
 
     @staticmethod
     def _iter_processes():
