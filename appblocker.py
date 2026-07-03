@@ -477,10 +477,54 @@ _BROWSER_CMDS = {
     "brave": ["brave-browser", "brave", "brave-browser-stable"],
     "firefox": ["firefox", "firefox-esr"],
 }
+# Flatpak app ids for the same browsers. Flatpak browsers aren't on PATH and
+# run sandboxed, so they need separate detection and a filesystem override to
+# see the host managed-policy directory.
+_FLATPAK_IDS = {
+    "chrome": "com.google.Chrome",
+    "chromium": "org.chromium.Chromium",
+    "brave": "com.brave.Browser",
+    "firefox": "org.mozilla.firefox",
+}
 
 
 def _browser_installed(key):
     return any(which(n) for n in _BROWSER_CMDS.get(key, []))
+
+
+def _flatpak_installed(app_id):
+    if not which("flatpak"):
+        return False
+    try:
+        return subprocess.run(["flatpak", "info", app_id],
+                              capture_output=True, timeout=8).returncode == 0
+    except Exception:
+        return False
+
+
+_FLATPAK_OVERRIDE_STATE = {}   # app_id -> last-applied enable flag (per process)
+
+
+def _flatpak_policy_access(app_id, host_policy_dir, enable):
+    """Grant/revoke a Flatpak browser read access to a host policy directory.
+
+    Sandboxed browsers can't see /etc/<browser>/policies, so managed policies
+    are ignored until we expose that directory into the sandbox. Applied once
+    per state per run (the lockdown sweep calls this every few seconds, but the
+    flatpak override is persistent, so we don't need to re-run it each time).
+    """
+    if not which("flatpak"):
+        return
+    if _FLATPAK_OVERRIDE_STATE.get(app_id) == bool(enable):
+        return
+    arg = (f"--filesystem={host_policy_dir}:ro" if enable
+           else f"--nofilesystem={host_policy_dir}")
+    try:
+        subprocess.run(["flatpak", "override", "--system", arg, app_id],
+                       capture_output=True, timeout=15)
+        _FLATPAK_OVERRIDE_STATE[app_id] = bool(enable)
+    except Exception as exc:
+        sys.stderr.write(f"[lockdown] flatpak override {app_id}: {exc}\n")
 
 
 def _write_json_file(path, data):
@@ -513,7 +557,9 @@ def apply_browser_lockdown(enabled):
     }
     for key, rel in CHROMIUM_POLICY_DIRS.items():
         path = os.path.join(POLICY_BASE, rel, "appblocker.json")
-        want = enabled and _browser_installed(key)
+        fp_id = _FLATPAK_IDS.get(key)
+        is_flatpak = bool(fp_id) and _flatpak_installed(fp_id)
+        want = enabled and (_browser_installed(key) or is_flatpak)
         try:
             if want:
                 if not (os.path.exists(path) and _file_is_ours(path) and
@@ -525,6 +571,11 @@ def apply_browser_lockdown(enabled):
                 changed.append(path)
         except Exception as exc:
             sys.stderr.write(f"[lockdown] {path}: {exc}\n")
+        # A Flatpak browser also needs read access to the host policy dir
+        # (e.g. /etc/brave/policies) or it never sees the file we just wrote.
+        if is_flatpak:
+            host_dir = "/" + os.path.dirname(rel)   # e.g. /etc/brave/policies
+            _flatpak_policy_access(fp_id, host_dir, enabled)
 
     # Firefox reads policies.json from the system dir (/etc/firefox/policies)
     # AND from a 'distribution' folder next to the program binary. Some builds
@@ -535,7 +586,11 @@ def apply_browser_lockdown(enabled):
     ff_paths = [os.path.join(POLICY_BASE, FIREFOX_POLICY_REL, "policies.json")]
     for progdir in _firefox_program_dirs():
         ff_paths.append(os.path.join(progdir, "distribution", "policies.json"))
-    want = enabled and _browser_installed("firefox")
+    ff_flatpak = _flatpak_installed(_FLATPAK_IDS["firefox"])
+    want = enabled and (_browser_installed("firefox") or ff_flatpak)
+    if ff_flatpak:
+        _flatpak_policy_access(_FLATPAK_IDS["firefox"],
+                               "/" + FIREFOX_POLICY_REL, enabled)
     for ff_path in ff_paths:
         try:
             exists = os.path.exists(ff_path)
