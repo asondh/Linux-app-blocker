@@ -2413,6 +2413,7 @@ class AppBlockerUI:
             mk("🌐 Block Websites", self.websites_dialog, "#16a085", "#0e6655")
             mk("📊 Activity", self.activity_dialog, "#2c3e50", "#1b2631")
             mk("🔒 Lockdown", self.lockdown_dialog, "#7f8c8d", "#616a6b")
+        mk("💾 Backup", self.backup_dialog, "#34495e", "#2c3e50")
 
         bar.bind("<Configure>", lambda e: self._reflow_toolbar(e.width))
         self.root.after(0, lambda: self._reflow_toolbar(bar.winfo_width()))
@@ -3536,6 +3537,87 @@ class AppBlockerUI:
         self.pm.set_password(pw1)
         messagebox.showinfo("Done", "Password updated.")
 
+    # -- backup / restore --------------------------------------------------- #
+    def backup_dialog(self):
+        win = tk.Toplevel(self.root)
+        win.title("Backup / Restore Settings")
+        win.configure(bg=COLOR_BG)
+        win.geometry("460x340")
+        win.minsize(400, 300)
+        self._present(win)
+
+        tk.Label(win, text="💾 Backup / Restore", bg=COLOR_BG, fg=COLOR_HEADER,
+                 font=("Helvetica", 14, "bold")).pack(pady=(14, 6))
+        tk.Label(win, text="Copy your whole setup to another machine: Export "
+                 "here, move the file to the new machine (USB / cloud), then "
+                 "Import it there. It carries your apps, rules, blocked "
+                 "websites, monitoring, dashboard settings and the parent "
+                 "password.", bg=COLOR_BG, fg="#7f8c8d", wraplength=410,
+                 justify="left").pack(padx=20)
+
+        bar = tk.Frame(win, bg=COLOR_BG)
+        bar.pack(side="bottom", fill="x", padx=20, pady=14)
+        tk.Button(bar, text="Close", command=win.destroy, relief="flat",
+                  padx=12, pady=6, cursor="hand2").pack(side="right")
+
+        box = tk.Frame(win, bg=COLOR_BG)
+        box.pack(fill="both", expand=True, padx=20, pady=10)
+        tk.Button(box, text="⭳  Export settings to a file…",
+                  command=lambda: self._export_settings_gui(win),
+                  bg=COLOR_ACCENT, fg="white", relief="flat", pady=8,
+                  cursor="hand2").pack(fill="x", pady=6)
+        tk.Button(box, text="⭱  Import settings from a file…",
+                  command=lambda: self._import_settings_gui(win),
+                  bg=COLOR_BLOCKED, fg="white", relief="flat", pady=8,
+                  cursor="hand2").pack(fill="x", pady=6)
+        tk.Label(box, text="The exported file contains your password, email "
+                 "password and dashboard token — keep it private and delete "
+                 "it after copying.", bg=COLOR_BG, fg="#b9770e", wraplength=410,
+                 justify="left").pack(pady=(6, 0))
+
+    def _export_settings_gui(self, parent):
+        if not self._authenticate("Exporting settings requires the password."):
+            return
+        path = filedialog.asksaveasfilename(
+            parent=parent, title="Export settings to…",
+            defaultextension=".json", initialfile="appblocker-settings.json")
+        if not path:
+            return
+        try:
+            export_settings(path)
+            messagebox.showinfo(
+                "Exported", f"Settings saved to:\n{path}\n\nMove this file to "
+                "the other machine and use Import there. It contains secrets — "
+                "keep it private and delete it afterwards.", parent=parent)
+        except Exception as exc:
+            messagebox.showerror("Export failed", str(exc), parent=parent)
+
+    def _import_settings_gui(self, parent):
+        if not self._authenticate("Importing settings requires the password."):
+            return
+        path = filedialog.askopenfilename(
+            parent=parent, title="Import settings from…")
+        if not path:
+            return
+        if not messagebox.askyesno(
+                "Replace all settings?",
+                "This replaces ALL settings on THIS machine (apps, rules, "
+                "websites, monitoring, dashboard and the parent password) with "
+                "the ones in the file. Continue?", parent=parent):
+            return
+        try:
+            import_settings(path)
+            self.state.load()                       # re-read the new blocklist
+            self.pm.config = load_json(CONFIG_FILE, {})  # pick up new password
+            self.refresh()
+            messagebox.showinfo(
+                "Imported", "Settings imported and applied. If the parent "
+                "password came from the other machine, use that one now.\n\n"
+                "Note: if this machine's user accounts are named differently, "
+                "double-check any per-user targeting.", parent=parent)
+        except Exception as exc:
+            messagebox.showerror("Import failed", str(exc), parent=parent)
+
     # -- helpers ------------------------------------------------------------ #
     def _ask_block_config(self, app, title="Block App"):
         """
@@ -3856,6 +3938,50 @@ class AppBlockerUI:
 
 
 # --------------------------------------------------------------------------- #
+# Settings backup / restore — move a fully-customized setup to another machine
+# --------------------------------------------------------------------------- #
+SETTINGS_EXPORT_VERSION = 1
+
+
+def export_settings(path):
+    """Write a portable settings bundle (blocklist + password config) to `path`.
+
+    Contains secrets — the parent password hash, the email password and the
+    dashboard token — so it is written owner-only and should be deleted after
+    it has been copied to the other machine.
+    """
+    bundle = {
+        "appblocker_settings": SETTINGS_EXPORT_VERSION,
+        "blocked": load_json(BLOCKED_FILE, {}),
+        "config": load_json(CONFIG_FILE, {}),
+    }
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(bundle, fh, indent=2)
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
+    os.replace(tmp, path)
+    return path
+
+
+def import_settings(path, include_password=True):
+    """Load a bundle written by export_settings into this machine's config."""
+    bundle = load_json(path, None)
+    if not isinstance(bundle, dict) or "blocked" not in bundle:
+        raise ValueError("That doesn't look like an AppBlocker settings file.")
+    blocked = bundle.get("blocked") or {}
+    if not isinstance(blocked, dict) or "apps" not in blocked:
+        raise ValueError("The settings file is missing the blocklist.")
+    ensure_app_dir()
+    save_json(BLOCKED_FILE, blocked)
+    if include_password and isinstance(bundle.get("config"), dict) and bundle["config"]:
+        save_json(CONFIG_FILE, bundle["config"])
+    return True
+
+
+# --------------------------------------------------------------------------- #
 # Headless root daemon (system mode)
 # --------------------------------------------------------------------------- #
 def run_daemon():
@@ -3986,6 +4112,13 @@ def main():
     parser.add_argument(
         "--sync-now", action="store_true",
         help="build and push the remote dashboard data to GitHub once")
+    parser.add_argument(
+        "--export-settings", metavar="FILE",
+        help="save all settings (apps, rules, websites, email, dashboard, "
+             "password) to FILE, to copy to another machine")
+    parser.add_argument(
+        "--import-settings", metavar="FILE",
+        help="load settings previously saved with --export-settings")
     args = parser.parse_args()
 
     if args.lockdown_clear:
@@ -4047,6 +4180,31 @@ def main():
             print("No websites are blocked.")
         return
 
+    is_root = (hasattr(os, "geteuid") and os.geteuid() == 0)
+
+    if args.export_settings:
+        configure_paths(system_mode=(args.system or is_root))
+        try:
+            export_settings(args.export_settings)
+            print(f"Exported settings to {args.export_settings}")
+            print("This file contains secrets (password, email password, "
+                  "dashboard token) — keep it private and delete it after "
+                  "copying it to the other machine.")
+        except Exception as exc:
+            print(f"Export failed: {exc}")
+        return
+
+    if args.import_settings:
+        configure_paths(system_mode=(args.system or is_root))
+        try:
+            import_settings(args.import_settings)
+            print(f"Imported settings from {args.import_settings}.")
+            print("Restart the service to apply now:  sudo systemctl restart "
+                  "appblocker")
+        except Exception as exc:
+            print(f"Import failed: {exc}")
+        return
+
     # The daemon is always system-wide. The GUI is system-wide when asked, or
     # automatically when launched as root; otherwise it stays per-user.
     if args.daemon:
@@ -4054,7 +4212,6 @@ def main():
         run_daemon()
         return
 
-    is_root = (hasattr(os, "geteuid") and os.geteuid() == 0)
     configure_paths(system_mode=(args.system or is_root))
     run_gui()
 
