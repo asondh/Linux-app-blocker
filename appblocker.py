@@ -1432,6 +1432,7 @@ def _control_snapshot(state):
                 "targets": list(a.get("target_users") or []),
             })
         websites = list(state.websites)
+        watch = list(state.monitor.get("watch") or [])
         lockdown = bool(state.lockdown.get("enabled"))
         adult = bool(state.block_adult)
         remote_enabled = bool(state.sync.get("control"))
@@ -1439,9 +1440,9 @@ def _control_snapshot(state):
         human_users = [name for name, _uid in list_human_users()]
     except Exception:
         human_users = []
-    return {"apps": apps, "websites": websites, "lockdown": lockdown,
-            "block_adult": adult, "human_users": human_users,
-            "remote_enabled": remote_enabled}
+    return {"apps": apps, "websites": websites, "watch": watch,
+            "lockdown": lockdown, "block_adult": adult,
+            "human_users": human_users, "remote_enabled": remote_enabled}
 
 
 def build_report_data(store, days=REPORT_DAYS, limit=REPORT_LIMIT,
@@ -1713,6 +1714,24 @@ def apply_remote_command(state, cmd):
             cur = [d for d in state.websites if d != dom]
         state.set_websites(cur)
         return True, f"unblocked website {dom}"
+
+    if action in ("add_watch", "remove_watch"):
+        dom = normalize_domain(cmd.get("domain", ""))
+        if action == "add_watch" and not dom:
+            return False, "invalid domain"
+        with state.lock:
+            mon = dict(state.monitor)
+            watch = list(mon.get("watch") or [])
+        if action == "add_watch":
+            if dom not in watch:
+                watch.append(dom)
+            msg = f"watching {dom}"
+        else:
+            watch = [d for d in watch if d != dom]
+            msg = f"stopped watching {dom}"
+        mon["watch"] = watch
+        state.set_monitor(mon)
+        return True, msg
 
     if action == "set_lockdown":
         en = bool(cmd.get("enabled"))

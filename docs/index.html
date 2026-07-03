@@ -541,6 +541,10 @@ function onCtlButton(b){
     if(!d){ ctlMsg("Enter a domain first.","bad"); return; }
     return sendCommand({action:"add_website",domain:d}, "block "+d); }
   if(act==="remove_website") return sendCommand({action:"remove_website",domain:b.dataset.dom}, "unblock "+b.dataset.dom);
+  if(act==="add_watch"){ const d=($("ctl-watch").value||"").trim();
+    if(!d){ ctlMsg("Enter a domain first.","bad"); return; }
+    return sendCommand({action:"add_watch",domain:d}, "watch "+d); }
+  if(act==="remove_watch") return sendCommand({action:"remove_watch",domain:b.dataset.dom}, "stop watching "+b.dataset.dom);
   if(act==="set_block_adult") return sendCommand({action:"set_block_adult",enabled:b.dataset.en==="1"}, "adult blocklist "+(b.dataset.en==="1"?"on":"off"));
   if(act==="set_lockdown")    return sendCommand({action:"set_lockdown",enabled:b.dataset.en==="1"}, "lockdown "+(b.dataset.en==="1"?"on":"off"));
 }
@@ -659,6 +663,25 @@ function renderControls(){
      'placeholder="e.g. tiktok.com">'+
      ctlRowBtn("add_website","red small","Block site")+'</div>'+
      '<div class="ctl-note">Blocks machine-wide'+(broadcast?", on every machine":"")+
+     '.</div></div>';
+
+  // Watched websites (email alerts — not blocked, just flagged).
+  h+='<div class="ctl-sec"><h3>Watched websites (email alerts)</h3>';
+  if(broadcast){
+    h+='<div class="ctl-note">Adding here watches the site on every machine. Pick '+
+       'a specific machine to see and remove its current list.</div>';
+  } else if(ctl){
+    (ctl.watch||[]).forEach(d=>{
+      h+='<div class="ctl-row"><span class="name">'+esc(d)+'</span>'+
+         '<span class="spacer"></span>'+
+         ctlRowBtn("remove_watch","green small","Unwatch",' data-dom="'+esc(d)+'"')+'</div>';
+    });
+  }
+  h+='<div class="ctl-row"><input id="ctl-watch" class="ctl-in" '+
+     'placeholder="e.g. youtube.com">'+
+     ctlRowBtn("add_watch","red small","Watch site")+'</div>'+
+     '<div class="ctl-note">You get an email when a child visits these — they are '+
+     '<b>not</b> blocked, just reported'+(broadcast?", on every machine":"")+
      '.</div></div>';
 
   // Protection.
