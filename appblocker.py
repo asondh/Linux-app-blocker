@@ -3943,12 +3943,33 @@ class AppBlockerUI:
 SETTINGS_EXPORT_VERSION = 1
 
 
+def _invoking_user_ids():
+    """(uid, gid) of the human who launched us via pkexec/sudo, or None.
+
+    The admin GUI runs as root (polkit), so files it creates would be owned by
+    root and unreadable by the user's own apps (e.g. their file manager or a
+    Drive uploader). We use this to hand exported files back to that user.
+    """
+    for var in ("PKEXEC_UID", "SUDO_UID"):
+        val = os.environ.get(var)
+        if val and val.isdigit():
+            uid = int(val)
+            try:
+                gid = pwd.getpwuid(uid).pw_gid
+            except KeyError:
+                gid = uid
+            return uid, gid
+    return None
+
+
 def export_settings(path):
     """Write a portable settings bundle (blocklist + password config) to `path`.
 
     Contains secrets — the parent password hash, the email password and the
-    dashboard token — so it is written owner-only and should be deleted after
-    it has been copied to the other machine.
+    dashboard token — so it is kept owner-only (0600). When exported by the
+    root admin GUI, ownership is handed to the human who launched it so their
+    own apps can read and move the file; otherwise it stays root-only and
+    unreadable outside root (which is what breaks uploading it to Drive).
     """
     bundle = {
         "appblocker_settings": SETTINGS_EXPORT_VERSION,
@@ -3963,6 +3984,14 @@ def export_settings(path):
     except OSError:
         pass
     os.replace(tmp, path)
+    # Give the file to the real user so they can read/move it (still 0600, so
+    # it's private to them — not world-readable).
+    ids = _invoking_user_ids()
+    if ids and hasattr(os, "geteuid") and os.geteuid() == 0:
+        try:
+            os.chown(path, ids[0], ids[1])
+        except OSError:
+            pass
     return path
 
 
