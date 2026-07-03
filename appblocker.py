@@ -571,11 +571,6 @@ def apply_browser_lockdown(enabled):
                 changed.append(path)
         except Exception as exc:
             sys.stderr.write(f"[lockdown] {path}: {exc}\n")
-        # A Flatpak browser also needs read access to the host policy dir
-        # (e.g. /etc/brave/policies) or it never sees the file we just wrote.
-        if is_flatpak:
-            host_dir = "/" + os.path.dirname(rel)   # e.g. /etc/brave/policies
-            _flatpak_policy_access(fp_id, host_dir, enabled)
 
     # Firefox reads policies.json from the system dir (/etc/firefox/policies)
     # AND from a 'distribution' folder next to the program binary. Some builds
@@ -588,9 +583,6 @@ def apply_browser_lockdown(enabled):
         ff_paths.append(os.path.join(progdir, "distribution", "policies.json"))
     ff_flatpak = _flatpak_installed(_FLATPAK_IDS["firefox"])
     want = enabled and (_browser_installed("firefox") or ff_flatpak)
-    if ff_flatpak:
-        _flatpak_policy_access(_FLATPAK_IDS["firefox"],
-                               "/" + FIREFOX_POLICY_REL, enabled)
     for ff_path in ff_paths:
         try:
             exists = os.path.exists(ff_path)
@@ -611,6 +603,53 @@ def apply_browser_lockdown(enabled):
         except Exception as exc:
             sys.stderr.write(f"[lockdown] {ff_path}: {exc}\n")
     return changed
+
+
+def apply_site_block_policy(domains):
+    """Block `domains` INSIDE Chromium browsers (Brave/Chrome/Chromium) via the
+    enterprise URLBlocklist managed policy.
+
+    Unlike /etc/hosts this is enforced by the browser itself: it takes effect on
+    already-open tabs within seconds (the browser reloads its policy files on
+    change), it can't be bypassed by Secure DNS (DoH) or a VPN, and a child
+    can't turn it off. /etc/hosts still runs alongside it to cover other apps.
+
+    `domains` = the currently-effective blocked hosts. Only marked files are
+    ever written/removed. Returns changed paths.
+    """
+    entries = sorted(set(d for d in domains if d))
+    policy = {"URLBlocklist": entries, "_managed_by": POLICY_MARKER}
+    changed = []
+    for key, rel in CHROMIUM_POLICY_DIRS.items():
+        path = os.path.join(POLICY_BASE, rel, "appblocker-sites.json")
+        fp_id = _FLATPAK_IDS.get(key)
+        is_flatpak = bool(fp_id) and _flatpak_installed(fp_id)
+        want = bool(entries) and (_browser_installed(key) or is_flatpak)
+        try:
+            if want:
+                if not (os.path.exists(path) and _file_is_ours(path) and
+                        json.load(open(path)) == policy):
+                    _write_json_file(path, policy)
+                    changed.append(path)
+            elif os.path.exists(path) and _file_is_ours(path):
+                os.remove(path)
+                changed.append(path)
+        except Exception as exc:
+            sys.stderr.write(f"[siteblock] {path}: {exc}\n")
+    return changed
+
+
+def sync_flatpak_policy_overrides(active):
+    """Expose (or hide) the host policy dirs to Flatpak browsers so they can see
+    the managed-policy files. Single owner of the override state, so the
+    lockdown and site-block policies don't fight over it."""
+    for key, rel in CHROMIUM_POLICY_DIRS.items():
+        fp_id = _FLATPAK_IDS.get(key)
+        if fp_id and _flatpak_installed(fp_id):
+            _flatpak_policy_access(fp_id, "/" + os.path.dirname(rel), active)
+    ff_id = _FLATPAK_IDS.get("firefox")
+    if ff_id and _flatpak_installed(ff_id):
+        _flatpak_policy_access(ff_id, "/" + FIREFOX_POLICY_REL, active)
 
 
 def _firefox_program_dirs():
@@ -1887,8 +1926,14 @@ class ProcessMonitor(threading.Thread):
             if adult_on:
                 domains |= load_adult_domains()
             sync_blocked_websites(sorted(domains))
-            # Keep the browser incognito/history-deletion lockdown in sync too.
+            # Block the same sites INSIDE the browser (URLBlocklist policy) so it
+            # takes hold on already-open tabs without a reload and survives DoH —
+            # /etc/hosts above still covers non-browser apps.
             apply_browser_lockdown(lockdown_on)
+            apply_site_block_policy(domains)
+            # Expose the policy dirs to Flatpak browsers when we have anything
+            # for them to read.
+            sync_flatpak_policy_overrides(bool(lockdown_on) or bool(domains))
 
         if (changed_timer or reloaded) and self.on_change:
             self.on_change()
@@ -4389,8 +4434,10 @@ def main():
 
     if args.web_clear:
         changed = sync_blocked_websites([])
-        print("Cleared AppBlocker website blocks from /etc/hosts."
-              if changed else "No AppBlocker website blocks were present.")
+        apply_site_block_policy([])          # also drop the in-browser URLBlocklist
+        sync_flatpak_policy_overrides(False)
+        print("Cleared AppBlocker website blocks from /etc/hosts and browsers."
+              if changed else "Cleared AppBlocker in-browser website blocks.")
         return
 
     if args.web_status:
