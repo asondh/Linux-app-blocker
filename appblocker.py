@@ -526,31 +526,59 @@ def apply_browser_lockdown(enabled):
         except Exception as exc:
             sys.stderr.write(f"[lockdown] {path}: {exc}\n")
 
-    # Firefox: single policies.json. Only manage it if it's absent or ours, so
-    # we never clobber a policy file an admin created for other reasons.
-    ff_path = os.path.join(POLICY_BASE, FIREFOX_POLICY_REL, "policies.json")
+    # Firefox reads policies.json from the system dir (/etc/firefox/policies)
+    # AND from a 'distribution' folder next to the program binary. Some builds
+    # (e.g. the newer XDG-dirs Firefox) honour only the latter, so we write
+    # both. Only files we created (marked) are ever removed or overwritten.
     ff_policy = {"policies": {"DisablePrivateBrowsing": True},
                  "_managed_by": POLICY_MARKER}
-    try:
-        want = enabled and _browser_installed("firefox")
-        exists = os.path.exists(ff_path)
-        if want:
-            if exists and _file_is_ours(ff_path) and \
-                    json.load(open(ff_path)) == ff_policy:
-                pass  # already correct — leave it (keeps this idempotent)
-            elif not exists or _file_is_ours(ff_path):
-                _write_json_file(ff_path, ff_policy)
+    ff_paths = [os.path.join(POLICY_BASE, FIREFOX_POLICY_REL, "policies.json")]
+    for progdir in _firefox_program_dirs():
+        ff_paths.append(os.path.join(progdir, "distribution", "policies.json"))
+    want = enabled and _browser_installed("firefox")
+    for ff_path in ff_paths:
+        try:
+            exists = os.path.exists(ff_path)
+            if want:
+                if exists and _file_is_ours(ff_path) and \
+                        json.load(open(ff_path)) == ff_policy:
+                    pass  # already correct — leave it (keeps this idempotent)
+                elif not exists or _file_is_ours(ff_path):
+                    _write_json_file(ff_path, ff_policy)
+                    changed.append(ff_path)
+                else:
+                    sys.stderr.write(
+                        f"[lockdown] {ff_path} exists and is not ours; "
+                        "leaving it alone.\n")
+            elif exists and _file_is_ours(ff_path):
+                os.remove(ff_path)
                 changed.append(ff_path)
-            else:
-                sys.stderr.write(
-                    "[lockdown] firefox policies.json exists and is not ours; "
-                    "leaving it alone.\n")
-        elif exists and _file_is_ours(ff_path):
-            os.remove(ff_path)
-            changed.append(ff_path)
-    except Exception as exc:
-        sys.stderr.write(f"[lockdown] {ff_path}: {exc}\n")
+        except Exception as exc:
+            sys.stderr.write(f"[lockdown] {ff_path}: {exc}\n")
     return changed
+
+
+def _firefox_program_dirs():
+    """Directories that hold the Firefox binary (where it reads distribution/)."""
+    dirs = set()
+    for name in ("firefox", "firefox-esr"):
+        p = which(name)
+        if not p:
+            continue
+        try:
+            real = os.path.realpath(p)
+        except OSError:
+            real = p
+        d = os.path.dirname(real)
+        # A wrapper in a generic bin dir isn't the program dir; skip it and
+        # rely on the well-known candidates below.
+        if d and d not in ("/usr/bin", "/bin", "/usr/local/bin", "/sbin"):
+            dirs.add(d)
+    for cand in ("/usr/lib/firefox", "/usr/lib/firefox-esr",
+                 "/usr/lib64/firefox", "/opt/firefox"):
+        if os.path.isdir(cand):
+            dirs.add(cand)
+    return dirs
 
 
 # --------------------------------------------------------------------------- #
@@ -615,6 +643,7 @@ def iter_history_sources(home):
     """
     ff_bases = [
         f"{home}/.mozilla/firefox",
+        f"{home}/.config/mozilla/firefox",   # newer XDG-dirs Firefox builds
         f"{home}/snap/firefox/common/.mozilla/firefox",
         f"{home}/.var/app/org.mozilla.firefox/.mozilla/firefox",
     ]
