@@ -1922,9 +1922,15 @@ class ProcessMonitor(threading.Thread):
                 domains = set(self.state.websites)
                 lockdown_on = self.state.lockdown.get("enabled")
                 adult_on = self.state.block_adult
+                web_scheds = [dict(s) for s in self.state.web_schedules]
             domains |= dynamic_sites
             if adult_on:
                 domains |= load_adult_domains()
+            # Scheduled "downtime" blocks: add each schedule's sites while the
+            # current time is inside one of its windows.
+            for sch in web_scheds:
+                if schedule_active(sch.get("schedule") or []):
+                    domains |= set(sch.get("sites") or [])
             sync_blocked_websites(sorted(domains))
             # Block the same sites INSIDE the browser (URLBlocklist policy) so it
             # takes hold on already-open tabs without a reload and survives DoH —
@@ -2130,6 +2136,7 @@ class AppState:
         self.lockdown = {"enabled": False}      # browser incognito lockdown
         self.sync = self._default_sync()        # remote dashboard (GitHub) sync
         self.block_adult = False                # built-in adult-content blocklist
+        self.web_schedules = []                 # scheduled website blocks (downtime)
         self._mtime = None
         self.load()
 
@@ -2248,6 +2255,35 @@ class AppState:
                 out.append(nd)
         return out
 
+    @staticmethod
+    def _normalize_web_schedules(value):
+        """Scheduled website blocks: [{name, sites:[domains], schedule:[windows]}]."""
+        clean = []
+        for s in value or []:
+            if not isinstance(s, dict):
+                continue
+            sites = []
+            for d in s.get("sites") or []:
+                nd = normalize_domain(d)
+                if nd and nd not in sites:
+                    sites.append(nd)
+            windows = []
+            for w in s.get("schedule") or []:
+                if not isinstance(w, dict):
+                    continue
+                days = []
+                for d in w.get("days") or []:
+                    try:
+                        days.append(int(d))
+                    except (TypeError, ValueError):
+                        pass
+                windows.append({"days": days, "start": str(w.get("start", "")),
+                                "end": str(w.get("end", ""))})
+            if sites and windows:
+                clean.append({"name": str(s.get("name", "")),
+                              "sites": sites, "schedule": windows})
+        return clean
+
     def load(self):
         data = load_json(BLOCKED_FILE, None)
         if data and isinstance(data, dict) and "apps" in data:
@@ -2259,6 +2295,8 @@ class AppState:
                 (data.get("lockdown") or {}).get("enabled"))}
             self.sync = self._normalize_sync(data.get("sync"))
             self.block_adult = bool(data.get("block_adult"))
+            self.web_schedules = self._normalize_web_schedules(
+                data.get("web_schedules"))
             self._mtime = self._file_mtime()
         else:
             self.apps = self._default_apps()
@@ -2268,6 +2306,7 @@ class AppState:
             self.lockdown = {"enabled": False}
             self.sync = self._default_sync()
             self.block_adult = False
+            self.web_schedules = []
             self.save()
 
     def reload_if_changed(self):
@@ -2290,6 +2329,8 @@ class AppState:
                     (data.get("lockdown") or {}).get("enabled"))}
                 self.sync = self._normalize_sync(data.get("sync"))
                 self.block_adult = bool(data.get("block_adult"))
+                self.web_schedules = self._normalize_web_schedules(
+                    data.get("web_schedules"))
                 self._mtime = mtime
             return True
         return False
@@ -2304,7 +2345,8 @@ class AppState:
                                  "monitor": self.monitor,
                                  "lockdown": self.lockdown,
                                  "sync": self.sync,
-                                 "block_adult": self.block_adult})
+                                 "block_adult": self.block_adult,
+                                 "web_schedules": self.web_schedules})
         self._mtime = self._file_mtime()
 
     @staticmethod
@@ -2456,6 +2498,27 @@ class AppState:
             self.block_adult = bool(enabled)
             self.save_locked()
             return self.block_adult
+
+    # -- scheduled website blocks (downtime) -------------------------------- #
+    def add_web_schedule(self, sched):
+        with self.lock:
+            self.web_schedules.append(sched)
+            self.web_schedules = self._normalize_web_schedules(self.web_schedules)
+            self.save_locked()
+
+    def update_web_schedule(self, index, sched):
+        with self.lock:
+            if 0 <= index < len(self.web_schedules):
+                self.web_schedules[index] = sched
+                self.web_schedules = self._normalize_web_schedules(
+                    self.web_schedules)
+                self.save_locked()
+
+    def remove_web_schedule(self, index):
+        with self.lock:
+            if 0 <= index < len(self.web_schedules):
+                del self.web_schedules[index]
+                self.save_locked()
 
 
 # --------------------------------------------------------------------------- #
@@ -2651,6 +2714,7 @@ class AppBlockerUI:
         mk("⛓ Auto-Block Rules", self.rules_dialog, "#8e44ad", "#6c3483")
         if SYSTEM_MODE:
             mk("🌐 Block Websites", self.websites_dialog, "#16a085", "#0e6655")
+            mk("⏰ Site Schedules", self.web_schedule_dialog, "#11998e", "#0b6b64")
             mk("📊 Activity", self.activity_dialog, "#2c3e50", "#1b2631")
             mk("🔒 Lockdown", self.lockdown_dialog, "#7f8c8d", "#616a6b")
         mk("💾 Backup", self.backup_dialog, "#34495e", "#2c3e50")
@@ -3753,6 +3817,172 @@ class AppBlockerUI:
             win.destroy()
 
         # `bar` was pinned to the bottom before the text box above.
+        tk.Button(bar, text="Save", command=save, bg=COLOR_ACTIVE, fg="white",
+                  relief="flat", padx=16, pady=6, cursor="hand2").pack(
+                      side="right")
+        tk.Button(bar, text="Cancel", command=win.destroy, relief="flat",
+                  padx=12, pady=6, cursor="hand2").pack(side="right", padx=8)
+
+    # -- scheduled website blocks (downtime) -------------------------------- #
+    def web_schedule_dialog(self):
+        win = tk.Toplevel(self.root)
+        win.title("Scheduled Website Blocks")
+        win.configure(bg=COLOR_BG)
+        win.geometry("560x480")
+        win.minsize(460, 380)
+        self._present(win)
+
+        tk.Label(win, text="⏰ Scheduled Website Blocks", bg=COLOR_BG,
+                 fg=COLOR_HEADER, font=("Helvetica", 14, "bold")).pack(
+                     pady=(14, 2))
+        tk.Label(win, text="Block chosen websites only during set times (e.g. "
+                 "homework hours or bedtime). This runs on top of your always-on "
+                 "blocks and any auto-block rules — a site is blocked if ANY of "
+                 "them applies.", bg=COLOR_BG, fg="#7f8c8d", wraplength=520,
+                 justify="left").pack(padx=16, pady=(0, 8))
+
+        bar = tk.Frame(win, bg=COLOR_BG)
+        bar.pack(side="bottom", fill="x", padx=14, pady=12)
+
+        container = tk.Frame(win, bg=COLOR_BG)
+        container.pack(fill="both", expand=True, padx=14)
+        canvas = tk.Canvas(container, bg=COLOR_BG, highlightthickness=0)
+        vsb = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+        listwrap = tk.Frame(canvas, bg=COLOR_BG)
+        listwrap.bind("<Configure>",
+                      lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        wid = canvas.create_window((0, 0), window=listwrap, anchor="nw")
+        canvas.bind("<Configure>", lambda e: canvas.itemconfig(wid, width=e.width))
+        canvas.configure(yscrollcommand=vsb.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        def render():
+            for c in listwrap.winfo_children():
+                c.destroy()
+            with self.state.lock:
+                scheds = [dict(s) for s in self.state.web_schedules]
+            if not scheds:
+                tk.Label(listwrap, text="No scheduled blocks yet. Click "
+                         "“＋ Add Schedule”.", bg=COLOR_BG, fg="#95a5a6").pack(
+                             pady=20)
+                return
+            for i, sch in enumerate(scheds):
+                card = tk.Frame(listwrap, bg="white",
+                                highlightbackground="#dfe4ea", highlightthickness=1)
+                card.pack(fill="x", pady=3)
+                tk.Button(card, text="✕", relief="flat", bg="white", fg="#95a5a6",
+                          cursor="hand2",
+                          command=lambda idx=i: self._delete_web_schedule(idx, render)
+                          ).pack(side="right", padx=4)
+                tk.Button(card, text="Edit", relief="flat", bg="white",
+                          fg=COLOR_ACCENT, cursor="hand2",
+                          command=lambda idx=i: self._edit_web_schedule(win, idx, render)
+                          ).pack(side="right")
+                name = sch.get("name") or ", ".join(sch.get("sites") or [])
+                summary = (f"{name}\n{', '.join(sch.get('sites') or [])}\n"
+                           f"{schedule_summary(sch.get('schedule') or [])}")
+                tk.Label(card, text=summary, bg="white", fg=COLOR_HEADER,
+                         justify="left", anchor="w", font=("Helvetica", 10)).pack(
+                             side="left", fill="x", expand=True, padx=6, pady=6)
+
+        tk.Button(bar, text="＋ Add Schedule",
+                  command=lambda: self._edit_web_schedule(win, None, render),
+                  bg="#11998e", fg="white", relief="flat", padx=14, pady=6,
+                  cursor="hand2").pack(side="left")
+        tk.Button(bar, text="Close", command=win.destroy, relief="flat",
+                  padx=12, pady=6, cursor="hand2").pack(side="right")
+        render()
+
+    def _delete_web_schedule(self, idx, on_done):
+        if not self._authenticate("Deleting a schedule requires the password."):
+            return
+        self.state.remove_web_schedule(idx)
+        on_done()
+
+    def _edit_web_schedule(self, parent, index, on_done):
+        with self.state.lock:
+            existing = (dict(self.state.web_schedules[index])
+                        if index is not None else {})
+
+        win = tk.Toplevel(parent)
+        win.title("Edit Schedule" if index is not None else "New Schedule")
+        win.configure(bg=COLOR_BG)
+        win.geometry("460x600")
+        win.minsize(400, 420)
+        self._present(win)
+
+        bar = tk.Frame(win, bg=COLOR_BG)
+        bar.pack(side="bottom", fill="x", padx=18, pady=14)
+        body = self._scroll_body(win)
+
+        tk.Label(body, text="Block these websites (one per line):", bg=COLOR_BG,
+                 fg=COLOR_HEADER, font=("Helvetica", 11, "bold")).pack(
+                     anchor="w", padx=18, pady=(14, 2))
+        sites = tk.Text(body, height=5, width=42, font=("monospace", 11))
+        sites.pack(fill="x", padx=18)
+        sites.insert("1.0", "\n".join(existing.get("sites") or []))
+
+        tk.Label(body, text="During these times:", bg=COLOR_BG, fg=COLOR_HEADER,
+                 font=("Helvetica", 11, "bold")).pack(
+                     anchor="w", padx=18, pady=(12, 2))
+        windows = list(existing.get("schedule") or [])
+        listbox = tk.Listbox(body, height=4)
+        listbox.pack(fill="x", padx=18)
+
+        def redraw():
+            listbox.delete(0, tk.END)
+            for w in windows:
+                listbox.insert(tk.END, schedule_summary([w]))
+
+        def add_window():
+            w = self._ask_schedule_window(win)
+            if w:
+                windows.append(w)
+                redraw()
+
+        def remove_window():
+            sel = listbox.curselection()
+            if sel:
+                del windows[sel[0]]
+                redraw()
+
+        sbtns = tk.Frame(body, bg=COLOR_BG)
+        sbtns.pack(fill="x", padx=18, pady=4)
+        tk.Button(sbtns, text="＋ Add window", command=add_window, relief="flat",
+                  bg=COLOR_ACCENT, fg="white", cursor="hand2").pack(side="left")
+        tk.Button(sbtns, text="－ Remove", command=remove_window, relief="flat",
+                  cursor="hand2").pack(side="left", padx=6)
+        redraw()
+
+        name_var = tk.StringVar(value=existing.get("name", ""))
+        nfr = tk.Frame(body, bg=COLOR_BG)
+        nfr.pack(fill="x", padx=18, pady=(12, 0))
+        tk.Label(nfr, text="Label (optional):", bg=COLOR_BG).pack(side="left")
+        tk.Entry(nfr, textvariable=name_var).pack(side="left", fill="x",
+                                                  expand=True, padx=6)
+
+        def save():
+            domains = [normalize_domain(ln) for ln in
+                       sites.get("1.0", tk.END).splitlines()
+                       if normalize_domain(ln)]
+            if not domains:
+                messagebox.showwarning("No sites", "Enter at least one website.",
+                                       parent=win)
+                return
+            if not windows:
+                messagebox.showwarning("No times", "Add at least one time window.",
+                                       parent=win)
+                return
+            sch = {"name": name_var.get().strip(), "sites": domains,
+                   "schedule": windows}
+            if index is None:
+                self.state.add_web_schedule(sch)
+            else:
+                self.state.update_web_schedule(index, sch)
+            win.destroy()
+            on_done()
+
         tk.Button(bar, text="Save", command=save, bg=COLOR_ACTIVE, fg="white",
                   relief="flat", padx=16, pady=6, cursor="hand2").pack(
                       side="right")
