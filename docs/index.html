@@ -80,6 +80,13 @@
                  font-size:12px; }
   .qx { display:inline-block; background:#eef2f7; color:#34495e; border-radius:10px;
         padding:0 7px; font-size:11px; font-weight:600; }
+  /* Blocked list: one stacked item per line so long site URLs never get
+     crushed into a narrow column on a phone. */
+  .brow { padding:9px 14px; border-bottom:1px solid var(--line); }
+  .brow:last-child { border-bottom:0; }
+  .brow .bmain { display:flex; align-items:baseline; gap:8px; flex-wrap:wrap; }
+  .brow .bwhat { font-weight:600; overflow-wrap:anywhere; }
+  .brow .bmeta { color:var(--muted); font-size:12px; margin-top:3px; }
   /* At-a-glance summary */
   #summary { padding:10px 12px; }
   #summary .su-title { font-size:12px; color:var(--muted); margin:0 2px 8px; }
@@ -229,12 +236,7 @@
 
   <div class="card hidden" id="panel-blocked">
     <h2>Blocked — apps &amp; sites <span id="c-blocked" class="muted"></span></h2>
-    <table><thead><tr>
-      <th data-sort="ts">When</th><th data-sort="user">User</th>
-      <th class="col-m" data-sort="m">Machine</th>
-      <th data-sort="type">Type</th>
-      <th data-sort="what">Blocked</th></tr></thead>
-      <tbody id="tb-blocked"></tbody></table>
+    <div id="tb-blocked"></div>
     <div id="e-blocked" class="empty hidden">Nothing blocked.</div>
   </div>
 </div>
@@ -600,14 +602,20 @@ function render(){
   });
   let bl=Object.values(bagg).map(b=>Object.assign(b,{m:[...b.ms].join(", ")}))
           .sort((a,b)=>b.ts-a.ts);
-  bl=sortRows(bl,"blocked");
   const tbB=$("tb-blocked"); tbB.innerHTML="";
-  bl.forEach(r=>{ const tr=document.createElement("tr");
+  const multiB=document.body.classList.contains("multi");
+  bl.forEach(r=>{
+    const div=document.createElement("div"); div.className="brow";
     const pill=r.site?'<span class="pill red">Site</span>':'<span class="pill">App</span>';
-    const x=r.count>1?` <span class="qx">×${r.count}</span>`:"";
-    tr.innerHTML=`<td>${fmtWhen(r.ts)}</td><td>${esc(r.user)}</td>`+mcell(r.m)+
-                 `<td>${pill}</td><td class="${r.site?'url':''}">${esc(r.what)}${x}</td>`;
-    tbB.appendChild(tr); });
+    const x=r.count>1?`<span class="qx">×${r.count}</span>`:"";
+    // item name on its own line (wraps by words / breaks long URLs), then a
+    // muted meta line: who · when · which machine(s).
+    const meta=`${esc(r.user)} · ${fmtWhen(r.ts)}`+
+               (multiB&&r.m?` · ${esc(r.m)}`:"");
+    div.innerHTML=`<div class="bmain">${pill}<span class="bwhat">${esc(r.what)}</span>${x}</div>`+
+                  `<div class="bmeta">${meta}</div>`;
+    tbB.appendChild(div);
+  });
   $("c-blocked").textContent="("+bl.length+")";
   $("e-blocked").classList.toggle("hidden", bl.length>0);
 }
