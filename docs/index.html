@@ -77,6 +77,16 @@
   .qrow .qmeta { color:var(--muted); font-size:12px; white-space:nowrap; }
   .qx { display:inline-block; background:#eef2f7; color:#34495e; border-radius:10px;
         padding:0 7px; font-size:11px; font-weight:600; }
+  /* At-a-glance summary */
+  #summary { padding:10px 12px; }
+  #summary .su-title { font-size:12px; color:var(--muted); margin:0 2px 8px; }
+  #summary .su-row { display:flex; flex-wrap:wrap; gap:10px; }
+  #summary .su { flex:1 1 170px; min-width:150px; background:#f8f9fa;
+                 border:1px solid var(--line); border-radius:8px; padding:9px 11px; }
+  #summary .su .who { font-weight:600; margin-bottom:5px; }
+  #summary .su .stat { font-size:12px; color:var(--muted); line-height:1.7; }
+  #summary .su .stat b { color:#2c3e50; font-size:14px; }
+  #summary .su-empty { color:var(--muted); font-size:13px; padding:4px 2px; }
   /* Controls tab */
   .ctl-sec { padding:12px 14px; border-bottom:1px solid var(--line); }
   .ctl-sec:last-child { border-bottom:0; }
@@ -163,6 +173,8 @@
     <button id="fx-clear" class="ghost" style="align-self:flex-end;">Clear</button>
   </div>
 
+  <div class="card" id="summary"></div>
+
   <div class="tabs">
     <button data-tab="controls">Controls</button>
     <button data-tab="visits" class="active">Visits</button>
@@ -180,11 +192,7 @@
 
   <div class="card" id="panel-visits">
     <h2>Visits <span id="c-visits" class="muted"></span></h2>
-    <table><thead><tr>
-      <th data-sort="ts">When</th><th data-sort="user">User</th>
-      <th class="col-m" data-sort="m">Machine</th>
-      <th data-sort="url">Page</th></tr></thead>
-      <tbody id="tb-visits"></tbody></table>
+    <div id="tb-visits"></div>
     <div id="e-visits" class="empty hidden">No visits match.</div>
   </div>
 
@@ -237,6 +245,8 @@ let MACHINES = [];             // [{id, name, data}] one per machine file
 let SEL_CTL = null;            // Controls tab: selected machine id, or "*" = all
 let sortState = {};            // per-table sort
 let openSearch = new Set();    // Searches tab: which site groups are expanded
+let openVisits = new Set();    // Visits tab: which site groups are expanded
+let filtersInit = false;       // seed the default date range only once
 let lastId = 0;                // last command id we minted (keep them increasing)
 let SENT = {};                 // id -> {label, targets:[ids]} sent this session
 let CTLMSG = "";               // transient controls status message (HTML)
@@ -367,6 +377,16 @@ function initFilters(){
   ["All machines"].concat((DATA.machines||[]).map(m=>m.name)).forEach(n => {
     const o=document.createElement("option"); o.textContent=n; msel.appendChild(o); });
   if([...msel.options].some(o=>o.value===mcur)) msel.value = mcur;
+
+  // Open focused on the last 7 days (once — don't fight the user or the 30s
+  // auto-refresh). Clearing the date, or widening it, sticks after that.
+  if(!filtersInit){
+    filtersInit = true;
+    if(!$("fx-from").value){
+      const d = new Date(Date.now() - 7*86400*1000);
+      $("fx-from").value = d.toISOString().slice(0,10);
+    }
+  }
 }
 
 function activeRows(){
@@ -424,64 +444,100 @@ function sortRows(rows, table, keys){
 
 function mcell(m){ return `<td class="col-m"><span class="mtag">${esc(m||"")}</span></td>`; }
 
-function render(){
-  const rows = activeRows();
-  // Visits
-  let vs = sortRows(rows.map(v=>({ts:v.ts,user:v.u,m:v._m,url:v.url||v.d})),
-                    "visits");
-  const tbV=$("tb-visits"); tbV.innerHTML="";
-  vs.slice(0,3000).forEach(v=>{ const tr=document.createElement("tr");
-    tr.innerHTML=`<td>${fmtWhen(v.ts)}</td><td>${esc(v.user)}</td>`+mcell(v.m)+
-                 `<td class="url">${esc(v.url)}</td>`; tbV.appendChild(tr); });
-  $("c-visits").textContent="("+rows.length+")";
-  $("e-visits").classList.toggle("hidden", rows.length>0);
-
-  // Searches — grouped by website and collapsed by default, so it's a tidy list
-  // of sites instead of a wall of duplicates. Tap a site to reveal its terms;
-  // identical searches (same words, case-insensitive) merge into one ×count row.
-  const srAll = rows.filter(v=>v.q);
-  const byDom = {};
-  srAll.forEach(v=>{
-    const d = v.d || "(unknown)";
-    const g = byDom[d] || (byDom[d] = {domain:d, total:0, lastTs:0, terms:{}});
+// Build collapsible site groups from rows. keyFn(row)->item key (the thing that
+// gets deduped within a site, e.g. the search term or the page URL); labelFn is
+// what to show for it. Returns [{domain,total,lastTs,items:[{label,count,lastTs,ms}]}].
+function buildSiteGroups(rows, keyFn, labelFn){
+  const byDom={};
+  rows.forEach(v=>{
+    const d=v.d||"(unknown)";
+    const g=byDom[d]||(byDom[d]={domain:d,total:0,lastTs:0,items:{}});
     g.total++; if(v.ts>g.lastTs) g.lastTs=v.ts;
-    const key = (v.q||"").trim().toLowerCase();
-    const t = g.terms[key] || (g.terms[key] = {q:v.q, count:0, lastTs:0, ms:new Set()});
-    t.count++; if(v.ts>=t.lastTs){ t.lastTs=v.ts; t.q=v.q; }
-    if(v._m) t.ms.add(v._m);
+    const k=keyFn(v);
+    const it=g.items[k]||(g.items[k]={label:labelFn(v),count:0,lastTs:0,ms:new Set()});
+    it.count++; if(v.ts>=it.lastTs){ it.lastTs=v.ts; it.label=labelFn(v); }
+    if(v._m) it.ms.add(v._m);
   });
-  const doms = Object.values(byDom).sort((a,b)=>b.lastTs-a.lastTs);
-  const tbS=$("tb-searches"); tbS.innerHTML="";
-  const multi = document.body.classList.contains("multi");
-  doms.forEach(g=>{
-    const terms = Object.values(g.terms).sort((a,b)=>b.lastTs-a.lastTs);
-    const open = openSearch.has(g.domain);
-    const uniq = terms.length;
+  return Object.values(byDom).map(g=>({
+      domain:g.domain, total:g.total, lastTs:g.lastTs,
+      items:Object.values(g.items).sort((a,b)=>b.lastTs-a.lastTs)
+    })).sort((a,b)=>b.lastTs-a.lastTs);
+}
+
+// Render site groups into a container as a tap-to-expand accordion. openSet
+// persists which sites are expanded across re-renders (30s auto-refresh).
+function renderSiteGroups(containerId, groups, openSet, unit){
+  const cont=$(containerId); cont.innerHTML="";
+  const multi=document.body.classList.contains("multi");
+  groups.forEach(g=>{
+    const open=openSet.has(g.domain), uniq=g.items.length;
     const div=document.createElement("div");
     div.className="grp"+(open?" open":"");
     let h=`<div class="grp-h"><span class="tw">${open?"▾":"▸"}</span>`+
-          `<span class="dom">${esc(g.domain)}</span>`+
-          `<span class="cnt muted">${uniq} search${uniq!=1?"es":""}`+
-          (g.total>uniq?` · ${g.total} total`:"")+`</span></div>`;
-    h+=`<div class="grp-body">`;
-    terms.forEach(t=>{
-      const who = (multi && t.ms.size) ? " · "+[...t.ms].join(", ") : "";
-      h+=`<div class="qrow"><span class="q">${esc(t.q)}</span>`+
+      `<span class="dom">${esc(g.domain)}</span>`+
+      `<span class="cnt muted">${uniq} ${unit}${uniq!=1?"s":""}`+
+      (g.total>uniq?` · ${g.total} total`:"")+`</span></div><div class="grp-body">`;
+    g.items.forEach(t=>{
+      const who=(multi&&t.ms.size)?" · "+[...t.ms].join(", "):"";
+      h+=`<div class="qrow"><span class="q">${esc(t.label)}</span>`+
          `<span class="qmeta">`+(t.count>1?`<span class="qx">×${t.count}</span> `:"")+
          `${fmtWhen(t.lastTs)}${who}</span></div>`;
     });
-    h+=`</div>`;
-    div.innerHTML=h;
+    h+=`</div>`; div.innerHTML=h;
     div.querySelector(".grp-h").onclick=()=>{
-      if(openSearch.has(g.domain)) openSearch.delete(g.domain);
-      else openSearch.add(g.domain);
-      const nowOpen=div.classList.toggle("open");
-      div.querySelector(".tw").textContent = nowOpen?"▾":"▸";
+      if(openSet.has(g.domain)) openSet.delete(g.domain); else openSet.add(g.domain);
+      div.querySelector(".tw").textContent = div.classList.toggle("open")?"▾":"▸";
     };
-    tbS.appendChild(div);
+    cont.appendChild(div);
   });
-  $("c-searches").textContent="("+doms.length+" site"+(doms.length!=1?"s":"")+")";
-  $("e-searches").classList.toggle("hidden", doms.length>0);
+}
+
+// At-a-glance strip: per-child totals for TODAY (since local midnight), across
+// all machines, independent of the tab filters.
+function renderSummary(){
+  const el=$("summary"); if(!el) return;
+  const mid=new Date(); mid.setHours(0,0,0,0); const t0=mid.getTime()/1000;
+  const V=(DATA.visits||[]).filter(v=>v.ts>=t0);
+  const N=(DATA.new_domains||[]).filter(n=>n.ts>=t0);
+  const A=(DATA.attempts||[]).filter(a=>a.ts>=t0);
+  const BS=(DATA.blocked_sites||[]).filter(s=>s.ts>=t0);
+  const users=[...new Set([].concat(V.map(v=>v.u),N.map(n=>n.u),
+                A.map(a=>a.u),BS.map(s=>s.u)))].filter(Boolean).sort();
+  let h=`<div class="su-title">Today so far</div>`;
+  if(!users.length){ el.innerHTML=h+`<div class="su-empty">No activity yet today.</div>`; return; }
+  h+=`<div class="su-row">`;
+  users.forEach(u=>{
+    const uv=V.filter(v=>v.u===u);
+    const searches=uv.filter(v=>v.q).length, pages=uv.length;
+    const news=N.filter(n=>n.u===u).length;
+    const blocked=A.filter(a=>a.u===u).length + BS.filter(s=>s.u===u).length;
+    h+=`<div class="su"><div class="who">${esc(u)}</div><div class="stat">`+
+       `<b>${pages}</b> page${pages!=1?"s":""} · `+
+       `<b>${searches}</b> search${searches!=1?"es":""}<br>`+
+       `<b>${news}</b> new site${news!=1?"s":""}`+
+       (blocked?` · <b>${blocked}</b> blocked`:"")+`</div></div>`;
+  });
+  el.innerHTML=h+`</div>`;
+}
+
+function render(){
+  const rows = activeRows();
+  renderSummary();
+
+  // Visits — grouped by website, collapsed. Tap a site to see its pages;
+  // repeated visits to the same page merge into one ×count row.
+  const vg = buildSiteGroups(rows, v=>v.url||v.d||"", v=>v.url||v.d||"(page)");
+  renderSiteGroups("tb-visits", vg, openVisits, "page");
+  $("c-visits").textContent="("+vg.length+" site"+(vg.length!=1?"s":"")+")";
+  $("e-visits").classList.toggle("hidden", vg.length>0);
+
+  // Searches — grouped by website, collapsed. Identical searches (same words,
+  // case- and space-insensitive) merge into one ×count row.
+  const sg = buildSiteGroups(rows.filter(v=>v.q),
+                             v=>(v.q||"").trim().toLowerCase(), v=>v.q);
+  renderSiteGroups("tb-searches", sg, openSearch, "search");
+  $("c-searches").textContent="("+sg.length+" site"+(sg.length!=1?"s":"")+")";
+  $("e-searches").classList.toggle("hidden", sg.length>0);
 
   // New sites (never-visited / long-unseen domains). Same user/machine/date/
   // site-text filters as the other tabs.
@@ -530,15 +586,27 @@ function render(){
     if(to!==null&&r.ts>=to) return false;
     if(siteF&&r.site&&!((r.dom||r.what||"").toLowerCase().includes(siteF))) return false;
     return true; });
-  blk=sortRows(blk,"blocked");
+  // Collapse repeated attempts (same user + type + target) into one row with a
+  // ×count and the most recent time, so 20 tries of the same app is one line.
+  const bagg={};
+  blk.forEach(r=>{
+    const k=r.user+"|"+r.type+"|"+r.what;
+    const b=bagg[k]||(bagg[k]={ts:0,user:r.user,type:r.type,what:r.what,
+                               site:r.site,count:0,ms:new Set()});
+    b.count++; if(r.ts>b.ts) b.ts=r.ts; if(r.m) b.ms.add(r.m);
+  });
+  let bl=Object.values(bagg).map(b=>Object.assign(b,{m:[...b.ms].join(", ")}))
+          .sort((a,b)=>b.ts-a.ts);
+  bl=sortRows(bl,"blocked");
   const tbB=$("tb-blocked"); tbB.innerHTML="";
-  blk.forEach(r=>{ const tr=document.createElement("tr");
+  bl.forEach(r=>{ const tr=document.createElement("tr");
     const pill=r.site?'<span class="pill red">Site</span>':'<span class="pill">App</span>';
+    const x=r.count>1?` <span class="qx">×${r.count}</span>`:"";
     tr.innerHTML=`<td>${fmtWhen(r.ts)}</td><td>${esc(r.user)}</td>`+mcell(r.m)+
-                 `<td>${pill}</td><td class="${r.site?'url':''}">${esc(r.what)}</td>`;
+                 `<td>${pill}</td><td class="${r.site?'url':''}">${esc(r.what)}${x}</td>`;
     tbB.appendChild(tr); });
-  $("c-blocked").textContent="("+blk.length+")";
-  $("e-blocked").classList.toggle("hidden", blk.length>0);
+  $("c-blocked").textContent="("+bl.length+")";
+  $("e-blocked").classList.toggle("hidden", bl.length>0);
 }
 
 function esc(s){ return (s==null?"":String(s)).replace(/[&<>"]/g,
