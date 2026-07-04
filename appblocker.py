@@ -1804,6 +1804,13 @@ def build_report_data(store, days=REPORT_DAYS, limit=REPORT_LIMIT,
         machine = ""
     now = time.time()
     users = sorted(set(store.users()) | {a["u"] for a in attempts})
+    # New-domain novelty events in the window (sites the child had never
+    # visited, or hadn't visited in a while). Newest first.
+    win_start = int(now - days * 86400)
+    new_domains = [{"u": u, "d": d, "ts": int(ts)}
+                   for u, d, ts in store.new_domain_events_since(win_start)]
+    new_domains.sort(key=lambda e: e["ts"], reverse=True)
+    new_domains = new_domains[:2000]
     data = {
         "generated_at": int(now),
         "generated_at_str": time.strftime("%Y-%m-%d %H:%M", time.localtime(now)),
@@ -1814,6 +1821,7 @@ def build_report_data(store, days=REPORT_DAYS, limit=REPORT_LIMIT,
         "users": users,
         "visits": visits,
         "attempts": attempts,
+        "new_domains": new_domains,
         "control_results": list(cmd_results or []),
         "cmd_ts": int(cmd_ts or 0),
     }
