@@ -1278,7 +1278,16 @@ def build_digest(store, since_ts):
               if v[3] >= since_ts]        # (user, domain, url, ts)
     attempts = [a for a in store.attempts(start_day=start_day, limit=100000)
                 if a[2] >= since_ts]      # (user, app, ts)
-    users = sorted({v[0] for v in visits} | {a[0] for a in attempts})
+    # New-domain novelty events in the same window, folded in per user so the
+    # daily digest is the single place new websites are reported (no separate
+    # new-website email). Dedupe domains and keep first-seen order.
+    new_by_user = {}
+    for uname, dom, _ts in store.new_domain_events_since(since_ts):
+        seen = new_by_user.setdefault(uname, [])
+        if dom not in seen:
+            seen.append(dom)
+    users = sorted({v[0] for v in visits} | {a[0] for a in attempts}
+                   | set(new_by_user))
     lines = [f"AppBlocker summary — {time.strftime('%Y-%m-%d %H:%M', time.localtime(now))}",
              f"(activity since {time.strftime('%Y-%m-%d %H:%M', time.localtime(since_ts))})",
              ""]
@@ -1305,6 +1314,12 @@ def build_digest(store, since_ts):
                 apps[app] = apps.get(app, 0) + 1
             lines.append("  Tried to open (blocked): "
                          + ", ".join(f"{a} x{n}" for a, n in apps.items()))
+        nd = new_by_user.get(user) or []
+        if nd:
+            shown = nd[:20]
+            more = len(nd) - len(shown)
+            lines.append(f"  New websites ({len(nd)}): " + ", ".join(shown)
+                         + (f", +{more} more" if more > 0 else ""))
         lines.append("")
     return "AppBlocker daily summary", "\n".join(lines)
 
@@ -1759,6 +1774,10 @@ class HistoryMonitor(threading.Thread):
         with self.state.lock:
             mon = dict(self.state.monitor)
         if not mon.get("alert_new_domains"):
+            return
+        if mon.get("digest_enabled"):
+            # New sites are folded into the main daily digest — don't also send
+            # a separate new-website email (that would be clutter).
             return
         interval = 86400                 # daily
         last = store.get_state("__newdom_digest__")
