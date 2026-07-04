@@ -1001,6 +1001,19 @@ class HistoryStore:
         finally:
             conn.close()
 
+    def all_known_domains(self):
+        """(username, domain, last_ts) for every known domain on this machine.
+
+        Used to seed the household-shared ledger so other machines learn what
+        this one has already seen.
+        """
+        conn = self._connect()
+        try:
+            return conn.execute(
+                "SELECT username, domain, last_ts FROM known_domains").fetchall()
+        finally:
+            conn.close()
+
     def mark_domain_seen(self, username, domain, ts):
         conn = self._connect()
         try:
@@ -1353,7 +1366,7 @@ def scan_and_alert(state, store, on_alert, alert_state=None):
     return fired
 
 
-def scan_new_domains(state, store):
+def scan_new_domains(state, store, household=None):
     """Find new-domain visits since the watermark and log them as events.
 
     "New" = a domain the user has never visited, OR hasn't visited in the last
@@ -1361,6 +1374,12 @@ def scan_new_domains(state, store):
     Reads the shared visit log without modifying it, so every existing metric
     and log stays exactly as it was. Returns a list of new-domain event dicts
     for real-time delivery; the events are also persisted for the daily digest.
+
+    If `household` is given (a HouseholdKnown), novelty is decided against the
+    whole household's shared history, not just this machine's — so the same new
+    site visited on a second machine isn't reported twice. Domains seen here are
+    noted back into the household so the other machines learn them. The feature
+    fails open: a None household simply falls back to per-machine behavior.
     """
     with state.lock:
         mon = dict(state.monitor)
@@ -1394,9 +1413,15 @@ def scan_new_domains(state, store):
         last = cache.get(key)
         if last is None:
             last = store.domain_last_seen(username, dom)
+        if household is not None:
+            hs = household.last_seen(username, dom)
+            if hs is not None and (last is None or hs > last):
+                last = hs            # a sibling machine has seen it — not new
         is_new = last is None or (gap > 0 and ts - last > gap)
         store.mark_domain_seen(username, dom, ts)
         cache[key] = ts
+        if household is not None:
+            household.note(username, dom, ts)
         if is_new:
             store.add_new_domain_event(username, dom, ts)
             events.append({"user": username, "domain": dom, "url": url,
@@ -1485,6 +1510,7 @@ class HistoryMonitor(threading.Thread):
         self._cmd_results = []      # recent remote-command outcomes (for the UI)
         self._newdom_day = ""       # calendar day of the real-time email counter
         self._newdom_sent = 0       # real-time new-domain emails sent today
+        self._last_known_push = 0   # last household-ledger refresh (throttle)
 
     def stop(self):
         self._stop.set()
@@ -1662,17 +1688,52 @@ class HistoryMonitor(threading.Thread):
         """Scan for new domains and, if real-time is on, send one batched email.
 
         Events are logged regardless of real-time delivery so the daily digest
-        (and dashboard, later) still sees them even during quiet hours.
+        (and dashboard) still sees them even during quiet hours. When household
+        sharing is on, novelty is judged against every machine's history so the
+        same new site isn't reported twice across the household.
         """
+        with self.state.lock:
+            mon = dict(self.state.monitor)
+            cfg = dict(self.state.sync)
+        # Load the household ledger if sharing is enabled and sync is set up.
+        # Any failure -> household stays None -> per-machine behavior (fail open).
+        household = None
+        if (mon.get("alert_new_domains") and mon.get("new_domain_shared", True)
+                and cfg.get("enabled") and cfg.get("repo") and cfg.get("token")):
+            try:
+                household = HouseholdKnown.load(
+                    cfg, aliases=mon.get("new_domain_aliases"))
+            except Exception as exc:
+                sys.stderr.write(f"[monitor] household ledger load failed: {exc}\n")
+                household = None
         try:
-            events = scan_new_domains(self.state, store)
+            events = scan_new_domains(self.state, store, household=household)
         except Exception as exc:
             sys.stderr.write(f"[monitor] new-domain scan failed: {exc}\n")
             return
+        # One-time: contribute this machine's whole baseline so the other
+        # machines stop re-alerting on sites we've long known (covers first-run
+        # seeds and machines upgrading from a per-machine-only version).
+        if household is not None and not store.get_state("__household_seeded__"):
+            try:
+                for u, d, t in store.all_known_domains():
+                    household.note(u, d, t)
+            except Exception as exc:
+                sys.stderr.write(f"[monitor] household baseline note failed: {exc}\n")
+        # Publish contributions. New domains push right away (so siblings dedupe
+        # fast); routine last-seen refreshes are throttled to the sync cadence.
+        if household is not None and household.dirty():
+            now = time.time()
+            first_seed = not store.get_state("__household_seeded__")
+            if events or first_seed or (now - self._last_known_push >= SYNC_INTERVAL):
+                try:
+                    household.push(cfg)
+                    self._last_known_push = now
+                    store.set_state("__household_seeded__", 1)
+                except Exception as exc:
+                    sys.stderr.write(f"[monitor] household ledger push failed: {exc}\n")
         if not events:
             return
-        with self.state.lock:
-            mon = dict(self.state.monitor)
         if not mon.get("new_domain_realtime"):
             return                       # digest-only mode; events still logged
         # Anti-flood: cap real-time emails per calendar day.
@@ -1943,6 +2004,195 @@ def push_reports_to_github(cfg, data):
         body["sha"] = sha
     _gh_request(api, token, method="PUT", body=body)
     return len(payload)
+
+
+# --------------------------------------------------------------------------- #
+# Household-shared "known domains" ledger — a single small file in the same
+# sync repo that every machine merges into. It lets new-domain alerts dedupe
+# across a household's machines: a site that's already been seen on ANY machine
+# (for that username) is no longer "new" anywhere. Scoped by username, bounded
+# by age, and fail-open (unreachable ledger just falls back to per-machine).
+# --------------------------------------------------------------------------- #
+HOUSEHOLD_KNOWN_MAX_AGE = 180 * 86400   # drop shared domains unseen this long
+
+
+def household_known_path(cfg):
+    """Where the shared known-domains ledger lives, under the sync base dir."""
+    return f"{_sync_base_dir(cfg)}newdomains/known.json"
+
+
+def _sanitize_known_users(users):
+    """Coerce a loaded ledger into {user_lower: {domain: int_ts}} (case-folded
+    username so Timmy/timmy merge; last write wins on ts via max)."""
+    clean = {}
+    if isinstance(users, dict):
+        for u, m in users.items():
+            if not isinstance(m, dict):
+                continue
+            key = str(u).lower()
+            dd = clean.setdefault(key, {})
+            for dom, ts in m.items():
+                try:
+                    ts = int(ts)
+                except (TypeError, ValueError):
+                    continue
+                d = str(dom)
+                if ts > dd.get(d, 0):
+                    dd[d] = ts
+    return clean
+
+
+def fetch_household_known(cfg):
+    """Return (users_map, sha). users_map = {user: {domain: last_ts}}.
+
+    Missing file -> ({}, None). Network/HTTP errors propagate to the caller,
+    which treats them as "sharing unavailable" and falls back to per-machine.
+    """
+    repo = cfg.get("repo", "").strip()
+    token = cfg.get("token", "").strip()
+    branch = cfg.get("branch", "main").strip() or "main"
+    if not repo or not token:
+        return {}, None
+    api = (f"https://api.github.com/repos/{repo}/contents/"
+           f"{household_known_path(cfg)}")
+    try:
+        obj = _gh_request(f"{api}?ref={branch}", token)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return {}, None
+        raise
+    raw = obj.get("content", "")
+    if obj.get("encoding") == "base64":
+        raw = base64.b64decode(raw).decode("utf-8", "replace")
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return {}, obj.get("sha")
+    return _sanitize_known_users(data.get("users")), obj.get("sha")
+
+
+def _merge_known(base, incoming, max_age=HOUSEHOLD_KNOWN_MAX_AGE, now=None):
+    """Merge `incoming` {user:{dom:ts}} into `base`, keeping the max ts and
+    pruning entries older than max_age. Returns (merged, changed) where changed
+    is True only if `incoming` added or advanced something (so we don't write
+    the file just to prune)."""
+    now = int(now if now is not None else time.time())
+    cutoff = (now - max_age) if max_age else 0
+    merged = {}
+    for u, m in (base or {}).items():
+        dd = {d: int(t) for d, t in m.items() if int(t) >= cutoff}
+        if dd:
+            merged[u] = dd
+    changed = False
+    for u, m in (incoming or {}).items():
+        key = str(u).lower()
+        for d, t in m.items():
+            t = int(t)
+            if t < cutoff:
+                continue
+            cur = merged.get(key, {}).get(d)
+            if cur is None or t > cur:
+                merged.setdefault(key, {})[d] = t
+                changed = True
+    return merged, changed
+
+
+def write_household_known(cfg, users, sha):
+    """PUT the merged ledger. Raises urllib.error.HTTPError (409/422 on a race)."""
+    repo = cfg.get("repo", "").strip()
+    token = cfg.get("token", "").strip()
+    branch = cfg.get("branch", "main").strip() or "main"
+    api = (f"https://api.github.com/repos/{repo}/contents/"
+           f"{household_known_path(cfg)}")
+    payload = json.dumps({"v": 1, "users": users},
+                         separators=(",", ":")).encode("utf-8")
+    body = {"message": "Update household known domains",
+            "content": base64.b64encode(payload).decode("ascii"),
+            "branch": branch}
+    if sha:
+        body["sha"] = sha
+    _gh_request(api, token, method="PUT", body=body)
+    return len(payload)
+
+
+def push_household_known(cfg, updates, max_attempts=3):
+    """Read-modify-write `updates` into the shared ledger with 409/422 retry.
+    Returns True if a write happened, False if nothing new to contribute."""
+    for attempt in range(max_attempts):
+        base, sha = fetch_household_known(cfg)
+        merged, changed = _merge_known(base, updates)
+        if not changed:
+            return False
+        try:
+            write_household_known(cfg, merged, sha)
+            return True
+        except urllib.error.HTTPError as exc:
+            if exc.code in (409, 422) and attempt < max_attempts - 1:
+                continue             # someone else wrote — re-read and retry
+            raise
+    return False
+
+
+class HouseholdKnown:
+    """In-memory view of the household ledger plus this machine's buffered
+    contributions. Loaded per novelty scan; pushed back after."""
+
+    def __init__(self, users, sha, aliases=None):
+        self.users = users               # {household_id: {domain: ts}} from repo
+        self.sha = sha
+        self._buf = {}                   # pending {household_id: {domain: ts}}
+        # local-username -> household-identity, so the same child under a
+        # different login name on each machine still merges. Case-folded.
+        self.aliases = {}
+        for k, v in (aliases or {}).items():
+            lk, lv = str(k).strip().lower(), str(v).strip().lower()
+            if lk and lv and lk != lv:
+                self.aliases[lk] = lv
+
+    @classmethod
+    def load(cls, cfg, aliases=None):
+        users, sha = fetch_household_known(cfg)
+        return cls(users, sha, aliases=aliases)
+
+    def _hid(self, user):
+        """Map a local username to its household identity (alias or itself)."""
+        u = str(user).lower()
+        return self.aliases.get(u, u)
+
+    def last_seen(self, user, domain):
+        key = self._hid(user)
+        vals = []
+        v = (self.users.get(key) or {}).get(domain)
+        if v is not None:
+            vals.append(v)
+        b = (self._buf.get(key) or {}).get(domain)
+        if b is not None:
+            vals.append(b)
+        return max(vals) if vals else None
+
+    def note(self, user, domain, ts):
+        key = self._hid(user)
+        ts = int(ts)
+        cur = self.last_seen(user, domain)
+        if cur is None or ts > cur:
+            self._buf.setdefault(key, {})[domain] = ts
+
+    def dirty(self):
+        return bool(self._buf)
+
+    def push(self, cfg, max_attempts=3):
+        """Send buffered contributions. On success, fold them into the local
+        view and clear the buffer. Returns True if a write happened."""
+        if not self._buf:
+            return False
+        sent = push_household_known(cfg, self._buf, max_attempts=max_attempts)
+        for u, m in self._buf.items():
+            dst = self.users.setdefault(u, {})
+            for d, t in m.items():
+                if t > dst.get(d, 0):
+                    dst[d] = t
+        self._buf = {}
+        return sent
 
 
 def sync_reports(state, store):
@@ -2469,6 +2719,8 @@ class AppState:
             "alert_new_domains": False,  # alert on never-seen / long-unseen sites
             "new_domain_days": 30,     # "new" if not seen in this many days (0=never-seen only)
             "new_domain_realtime": True,  # also send real-time (else digest-only)
+            "new_domain_shared": True,    # dedupe new-site alerts across household machines
+            "new_domain_aliases": {},     # local-user -> household-id, for cross-machine merge
             "history_days": 90,        # keep this many days of history (0=forever)
             "email": {"enabled": False, "host": "", "port": 587,
                       "username": "", "password": "", "from": "", "to": "",
@@ -2496,6 +2748,16 @@ class AppState:
                 mon["new_domain_days"] = 30
             mon["new_domain_realtime"] = bool(
                 value.get("new_domain_realtime", True))
+            mon["new_domain_shared"] = bool(
+                value.get("new_domain_shared", True))
+            aliases = value.get("new_domain_aliases") or {}
+            clean_aliases = {}
+            if isinstance(aliases, dict):
+                for k, v in aliases.items():
+                    lk, lv = str(k).strip().lower(), str(v).strip().lower()
+                    if lk and lv and lk != lv:
+                        clean_aliases[lk] = lv
+            mon["new_domain_aliases"] = clean_aliases
             try:
                 mon["history_days"] = max(0, int(value.get("history_days", 90)))
             except (TypeError, ValueError):
@@ -3989,6 +4251,19 @@ class AppBlockerUI:
         tk.Checkbutton(body, variable=newdom_rt, bg=COLOR_BG, anchor="w",
                        text="Send new-site alerts in real time (they're always "
                        "in the daily summary too)").pack(fill="x", padx=32)
+        newdom_shared = tk.BooleanVar(value=mon.get("new_domain_shared", True))
+        tk.Checkbutton(body, variable=newdom_shared, bg=COLOR_BG, anchor="w",
+                       text="Share history across our machines (don't alert twice "
+                       "for the same new site) — needs the dashboard repo set up"
+                       ).pack(fill="x", padx=32)
+        tk.Label(body, text="Merge users across machines (only if the same child "
+                 "logs in under different names). One per line: local = household",
+                 bg=COLOR_BG, fg="#7f8c8d", wraplength=460, justify="left").pack(
+                     anchor="w", padx=48, pady=(2, 0))
+        newdom_alias = tk.Text(body, height=2, width=38, font=("monospace", 10))
+        newdom_alias.pack(fill="x", padx=48)
+        newdom_alias.insert("1.0", "\n".join(
+            f"{k} = {v}" for k, v in (mon.get("new_domain_aliases") or {}).items()))
 
         alert_blocked = tk.BooleanVar(value=mon.get("alert_blocked", True))
         tk.Checkbutton(body, variable=alert_blocked, bg=COLOR_BG, anchor="w",
@@ -4055,6 +4330,15 @@ class AppBlockerUI:
             except ValueError:
                 mon["new_domain_days"] = 30
             mon["new_domain_realtime"] = newdom_rt.get()
+            mon["new_domain_shared"] = newdom_shared.get()
+            aliases = {}
+            for ln in newdom_alias.get("1.0", tk.END).splitlines():
+                if "=" in ln:
+                    lk, lv = ln.split("=", 1)
+                    lk, lv = lk.strip().lower(), lv.strip().lower()
+                    if lk and lv and lk != lv:
+                        aliases[lk] = lv
+            mon["new_domain_aliases"] = aliases
             mon["digest_enabled"] = digest_on.get()
             try:
                 mon["digest_hours"] = max(1, int(digest_hours.get()))
