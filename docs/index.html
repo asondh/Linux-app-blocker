@@ -148,6 +148,7 @@
     <button data-tab="controls">Controls</button>
     <button data-tab="visits" class="active">Visits</button>
     <button data-tab="searches">Searches</button>
+    <button data-tab="newsites">New sites</button>
     <button data-tab="time">Time per site</button>
     <button data-tab="blocked">Blocked</button>
   </div>
@@ -176,6 +177,19 @@
       <th data-sort="domain">Where</th><th data-sort="q">Searched for</th>
       </tr></thead><tbody id="tb-searches"></tbody></table>
     <div id="e-searches" class="empty hidden">No searches match.</div>
+  </div>
+
+  <div class="card hidden" id="panel-newsites">
+    <h2>New sites <span id="c-newsites" class="muted"></span></h2>
+    <div class="muted" style="margin:-4px 0 8px;">Domains a child visited for
+      the first time, or hadn't visited in a while (per your Monitoring
+      settings). Turn this on in the app under Monitoring — Alerts &amp; Email.</div>
+    <table><thead><tr>
+      <th data-sort="ts">When</th><th data-sort="user">User</th>
+      <th class="col-m" data-sort="m">Machine</th>
+      <th data-sort="domain">New site</th></tr></thead>
+      <tbody id="tb-newsites"></tbody></table>
+    <div id="e-newsites" class="empty hidden">No new sites in this period.</div>
   </div>
 
   <div class="card hidden" id="panel-time">
@@ -255,15 +269,16 @@ async function ghGetRaw(path){
   return JSON.parse(await res.text());
 }
 function mergeMachines(){
-  const visits=[], attempts=[], blocked_sites=[], users=new Set();
+  const visits=[], attempts=[], blocked_sites=[], new_domains=[], users=new Set();
   MACHINES.forEach(m => {
     const nm = m.name;
     (m.data.visits||[]).forEach(v => visits.push(Object.assign({_m:nm}, v)));
     (m.data.attempts||[]).forEach(a => { attempts.push(Object.assign({_m:nm}, a)); users.add(a.u); });
     (m.data.blocked_sites||[]).forEach(s => { blocked_sites.push(Object.assign({_m:nm}, s)); users.add(s.u); });
+    (m.data.new_domains||[]).forEach(n => { new_domains.push(Object.assign({_m:nm}, n)); users.add(n.u); });
     (m.data.users||[]).forEach(u => users.add(u));
   });
-  DATA = { visits, attempts, blocked_sites, users:[...users].sort(),
+  DATA = { visits, attempts, blocked_sites, new_domains, users:[...users].sort(),
            machines: MACHINES.map(m=>({id:m.id, name:m.name})),
            truncated: MACHINES.some(m=>m.data.truncated) };
 }
@@ -415,6 +430,27 @@ function render(){
     tbS.appendChild(tr); });
   $("c-searches").textContent="("+sr.length+")";
   $("e-searches").classList.toggle("hidden", sr.length>0);
+
+  // New sites (never-visited / long-unseen domains). Same user/machine/date/
+  // site-text filters as the other tabs.
+  const uN=$("fx-user").value, macN=$("fx-machine").value;
+  const siteN=($("fx-site").value||"").toLowerCase().trim();
+  const fromN=$("fx-from").value?Date.parse($("fx-from").value)/1000:null;
+  const toN=$("fx-to").value?Date.parse($("fx-to").value)/1000+86400:null;
+  let nd=(DATA.new_domains||[]).filter(n=>{
+    if(uN!=="All users"&&n.u!==uN) return false;
+    if(macN!=="All machines"&&n._m!==macN) return false;
+    if(siteN&&!(n.d||"").toLowerCase().includes(siteN)) return false;
+    if(fromN!==null&&n.ts<fromN) return false;
+    if(toN!==null&&n.ts>=toN) return false;
+    return true; });
+  nd=sortRows(nd.map(n=>({ts:n.ts,user:n.u,m:n._m,domain:n.d})),"newsites");
+  const tbN=$("tb-newsites"); tbN.innerHTML="";
+  nd.slice(0,3000).forEach(n=>{ const tr=document.createElement("tr");
+    tr.innerHTML=`<td>${fmtWhen(n.ts)}</td><td>${esc(n.user)}</td>`+mcell(n.m)+
+                 `<td class="url">${esc(n.domain)}</td>`; tbN.appendChild(tr); });
+  $("c-newsites").textContent="("+nd.length+")";
+  $("e-newsites").classList.toggle("hidden", nd.length>0);
 
   // Time per site (aggregated across the filtered rows / selected machine)
   const durs = sortRows(computeDurations(rows), "time");
@@ -722,7 +758,7 @@ function renderControls(){
 document.querySelectorAll(".tabs button").forEach(b=>{
   b.onclick=()=>{ document.querySelectorAll(".tabs button")
       .forEach(x=>x.classList.remove("active")); b.classList.add("active");
-    ["controls","visits","searches","time","blocked"].forEach(t=>
+    ["controls","visits","searches","newsites","time","blocked"].forEach(t=>
       $("panel-"+t).classList.toggle("hidden", t!==b.dataset.tab)); };
 });
 document.querySelectorAll("th[data-sort]").forEach(th=>{
