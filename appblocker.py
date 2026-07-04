@@ -1271,41 +1271,65 @@ def notify_email(email_cfg, subject, body, respect_quiet=True):
 
 
 def build_digest(store, since_ts):
-    """Compose a per-user activity summary since `since_ts`. Returns (subj, body)."""
+    """Compose a per-user activity summary since `since_ts`. Returns (subj, body).
+
+    Decluttered for quick reading: each active child leads with the flagged
+    items (new websites, blocked attempts), then a compact counts line and the
+    top time-on-site. Empty sections are omitted and idle children collapse to a
+    single trailing line.
+    """
     now = int(time.time())
     start_day = time.strftime("%Y-%m-%d", time.localtime(since_ts))
     visits = [v for v in store.query(start_day=start_day, limit=100000)
               if v[3] >= since_ts]        # (user, domain, url, ts)
     attempts = [a for a in store.attempts(start_day=start_day, limit=100000)
                 if a[2] >= since_ts]      # (user, app, ts)
-    users = sorted({v[0] for v in visits} | {a[0] for a in attempts})
-    lines = [f"AppBlocker summary — {time.strftime('%Y-%m-%d %H:%M', time.localtime(now))}",
-             f"(activity since {time.strftime('%Y-%m-%d %H:%M', time.localtime(since_ts))})",
+    # New-domain novelty events in the same window, folded in per user so the
+    # daily digest is the single place new websites are reported (no separate
+    # new-website email). Dedupe domains and keep first-seen order.
+    new_by_user = {}
+    for uname, dom, _ts in store.new_domain_events_since(since_ts):
+        seen = new_by_user.setdefault(uname, [])
+        if dom not in seen:
+            seen.append(dom)
+    active = sorted({v[0] for v in visits} | {a[0] for a in attempts}
+                    | set(new_by_user))
+    lines = [f"AppBlocker daily summary · "
+             f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(now))}",
+             f"Activity since {time.strftime('%Y-%m-%d %H:%M', time.localtime(since_ts))}",
              ""]
-    if not users:
+    if not active:
         lines.append("No activity recorded in this period.")
-    for user in users:
+        return "AppBlocker daily summary", "\n".join(lines)
+    for user in active:
         uv = [v for v in visits if v[0] == user]
         ua = [a for a in attempts if a[0] == user]
-        # top sites by approx time
-        durs = store.site_durations(username=user, start_day=start_day)
-        durs = [d for d in durs if d[2] > 0][:5]
         searches = sum(1 for _u, _d, url, _ts in uv if extract_search_query(url))
-        lines.append(f"== {user} ==")
-        lines.append(f"  {len(uv)} page visits, {searches} searches"
-                     + (f", {len(ua)} blocked-app attempts" if ua else ""))
-        if durs:
-            lines.append("  Most time on:")
-            for dom, cnt, sec in durs:
-                m = sec // 60
-                lines.append(f"    {dom} — ~{m}m ({cnt} visits)")
+        lines.append(user)
+        nd = new_by_user.get(user) or []
+        if nd:                                   # flagged items first
+            shown = nd[:20]
+            more = len(nd) - len(shown)
+            lines.append(f"  ⚠ New websites ({len(nd)}): " + ", ".join(shown)
+                         + (f", +{more} more" if more > 0 else ""))
         if ua:
             apps = {}
             for _u, app, _ts in ua:
                 apps[app] = apps.get(app, 0) + 1
-            lines.append("  Tried to open (blocked): "
-                         + ", ".join(f"{a} x{n}" for a, n in apps.items()))
+            lines.append("  ⚠ Blocked: "
+                         + ", ".join(f"{a} ×{n}" for a, n in apps.items()))
+        lines.append(f"  {len(uv)} page{'' if len(uv) == 1 else 's'} · "
+                     f"{searches} search{'' if searches == 1 else 'es'}")
+        durs = [d for d in store.site_durations(username=user, start_day=start_day)
+                if d[2] > 0][:3]
+        if durs:
+            lines.append("  Most time: "
+                         + " · ".join(f"{dom} ~{sec // 60}m"
+                                      for dom, _cnt, sec in durs))
         lines.append("")
+    idle = sorted(u for u in store.users() if u not in set(active))
+    if idle:
+        lines.append("No activity: " + ", ".join(idle))
     return "AppBlocker daily summary", "\n".join(lines)
 
 
@@ -1759,6 +1783,10 @@ class HistoryMonitor(threading.Thread):
         with self.state.lock:
             mon = dict(self.state.monitor)
         if not mon.get("alert_new_domains"):
+            return
+        if mon.get("digest_enabled"):
+            # New sites are folded into the main daily digest — don't also send
+            # a separate new-website email (that would be clutter).
             return
         interval = 86400                 # daily
         last = store.get_state("__newdom_digest__")
