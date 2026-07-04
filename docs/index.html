@@ -70,11 +70,14 @@
                 padding-left:8px; }
   .grp-body { display:none; padding:2px 14px 10px 32px; }
   .grp.open .grp-body { display:block; }
-  .qrow { display:flex; align-items:baseline; gap:10px; padding:6px 0;
-          border-top:1px dashed var(--line); }
+  /* Each item stacks: the term/page on its own full-width line (wraps by
+     words), then a muted meta line under it — so a long phrase never gets
+     crushed into a 1-char-wide column on a phone. */
+  .qrow { padding:7px 0; border-top:1px dashed var(--line); }
   .qrow:first-child { border-top:0; }
-  .qrow .q { flex:1; word-break:break-word; }
-  .qrow .qmeta { color:var(--muted); font-size:12px; white-space:nowrap; }
+  .qrow .q { display:block; overflow-wrap:anywhere; }
+  .qrow .qmeta { display:block; margin-top:3px; color:var(--muted);
+                 font-size:12px; }
   .qx { display:inline-block; background:#eef2f7; color:#34495e; border-radius:10px;
         padding:0 7px; font-size:11px; font-weight:600; }
   /* At-a-glance summary */
@@ -466,7 +469,7 @@ function buildSiteGroups(rows, keyFn, labelFn){
 
 // Render site groups into a container as a tap-to-expand accordion. openSet
 // persists which sites are expanded across re-renders (30s auto-refresh).
-function renderSiteGroups(containerId, groups, openSet, unit){
+function renderSiteGroups(containerId, groups, openSet, unitOne, unitMany){
   const cont=$(containerId); cont.innerHTML="";
   const multi=document.body.classList.contains("multi");
   groups.forEach(g=>{
@@ -475,7 +478,7 @@ function renderSiteGroups(containerId, groups, openSet, unit){
     div.className="grp"+(open?" open":"");
     let h=`<div class="grp-h"><span class="tw">${open?"▾":"▸"}</span>`+
       `<span class="dom">${esc(g.domain)}</span>`+
-      `<span class="cnt muted">${uniq} ${unit}${uniq!=1?"s":""}`+
+      `<span class="cnt muted">${uniq} ${uniq!=1?unitMany:unitOne}`+
       (g.total>uniq?` · ${g.total} total`:"")+`</span></div><div class="grp-body">`;
     g.items.forEach(t=>{
       const who=(multi&&t.ms.size)?" · "+[...t.ms].join(", "):"";
@@ -527,7 +530,7 @@ function render(){
   // Visits — grouped by website, collapsed. Tap a site to see its pages;
   // repeated visits to the same page merge into one ×count row.
   const vg = buildSiteGroups(rows, v=>v.url||v.d||"", v=>v.url||v.d||"(page)");
-  renderSiteGroups("tb-visits", vg, openVisits, "page");
+  renderSiteGroups("tb-visits", vg, openVisits, "page", "pages");
   $("c-visits").textContent="("+vg.length+" site"+(vg.length!=1?"s":"")+")";
   $("e-visits").classList.toggle("hidden", vg.length>0);
 
@@ -535,7 +538,7 @@ function render(){
   // case- and space-insensitive) merge into one ×count row.
   const sg = buildSiteGroups(rows.filter(v=>v.q),
                              v=>(v.q||"").trim().toLowerCase(), v=>v.q);
-  renderSiteGroups("tb-searches", sg, openSearch, "search");
+  renderSiteGroups("tb-searches", sg, openSearch, "search", "searches");
   $("c-searches").textContent="("+sg.length+" site"+(sg.length!=1?"s":"")+")";
   $("e-searches").classList.toggle("hidden", sg.length>0);
 
