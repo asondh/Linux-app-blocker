@@ -267,10 +267,10 @@ function mergeMachines(){
            machines: MACHINES.map(m=>({id:m.id, name:m.name})),
            truncated: MACHINES.some(m=>m.data.truncated) };
 }
-async function loadData(){
+async function loadData(silent){
   const c = getCfg();
   if(!c || !c.repo || !c.token){ showSetup(); return; }
-  $("meta").textContent = "Loading…";
+  if(!silent) $("meta").textContent = "Loading…";
   try {
     let entries;
     try { entries = await ghList(baseDir()+"machines"); }
@@ -745,6 +745,18 @@ $("f-save").onclick=()=>{ setCfg({ repo:$("f-repo").value.trim(),
   token:$("f-token").value.trim() }); loadData(); };
 
 loadData();
+
+// Auto-refresh: quietly re-check the repo every 30s so pending commands flip to
+// "applied" and newly-blocked sites appear on their own — no manual Refresh.
+// Skips while the tab is hidden or while you're typing in a field (so it never
+// wipes a half-entered site).
+setInterval(() => {
+  if(document.hidden) return;
+  if($("app").classList.contains("hidden")) return;   // still on the setup screen
+  const a = document.activeElement;
+  if(a && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName)) return;
+  loadData(true);
+}, 30000);
 </script>
 </body>
 </html>
