@@ -729,6 +729,41 @@ def extract_search_query(url):
     return ""
 
 
+# --------------------------------------------------------------------------- #
+# New-domain novelty detection: alert when a child visits a domain they've
+# never visited before, or haven't visited in the last X days. This is purely
+# additive — it reads the same `visits` log that powers every existing metric
+# and never changes how visits are recorded or queried.
+# --------------------------------------------------------------------------- #
+NEWDOM_ALERT_CAP = 40           # max real-time new-domain emails per day (anti-flood)
+
+# Ultra-common domains never count as "new" — they'd be noise (a child loading
+# Google, a CDN or an analytics beacon isn't a discovery). Matched against the
+# bare domain and any subdomain of it.
+NEWDOM_IGNORE = {
+    "google.com", "gstatic.com", "googleapis.com", "googleusercontent.com",
+    "google-analytics.com", "googletagmanager.com", "googlesyndication.com",
+    "doubleclick.net", "youtube.com", "ytimg.com", "ggpht.com", "gvt1.com",
+    "gvt2.com", "gmail.com", "bing.com", "bing.net", "microsoft.com",
+    "live.com", "office.com", "windows.com", "msn.com", "apple.com",
+    "icloud.com", "cloudflare.com", "cloudflareinsights.com", "cloudfront.net",
+    "akamaihd.net", "akamai.net", "fbcdn.net", "facebook.com", "fbsbx.com",
+    "instagram.com", "cdninstagram.com", "mozilla.com", "mozilla.org",
+    "mozilla.net", "firefox.com", "duckduckgo.com", "wikipedia.org",
+    "wikimedia.org", "jsdelivr.net", "unpkg.com", "bootstrapcdn.com",
+}
+
+
+def _is_common_domain(dom):
+    """True if `dom` is (a subdomain of) an ultra-common domain we never flag."""
+    if not dom:
+        return True
+    for base in NEWDOM_IGNORE:
+        if dom == base or dom.endswith("." + base):
+            return True
+    return False
+
+
 def iter_history_sources(home):
     """
     Yield (browser_label, kind, db_path) for a user's home directory.
@@ -837,7 +872,15 @@ class HistoryStore:
                 " source TEXT PRIMARY KEY, last INTEGER);"
                 "CREATE TABLE IF NOT EXISTS attempts ("
                 " username TEXT, app TEXT, ts INTEGER);"
-                "CREATE INDEX IF NOT EXISTS i_attempts_ts ON attempts(ts);")
+                "CREATE INDEX IF NOT EXISTS i_attempts_ts ON attempts(ts);"
+                # New-domain novelty detection (purely additive — the visits
+                # table above is never touched by this feature).
+                "CREATE TABLE IF NOT EXISTS known_domains ("
+                " username TEXT, domain TEXT, last_ts INTEGER,"
+                " PRIMARY KEY(username, domain));"
+                "CREATE TABLE IF NOT EXISTS new_domain_events ("
+                " username TEXT, domain TEXT, ts INTEGER);"
+                "CREATE INDEX IF NOT EXISTS i_newdom_ts ON new_domain_events(ts);")
             conn.commit()
         finally:
             conn.close()
@@ -916,6 +959,80 @@ class HistoryStore:
         finally:
             conn.close()
 
+    # -- new-domain novelty detection -------------------------------------- #
+    # Watermark of the newest visit already checked for new-domain novelty.
+    # Kept separate from the alert/import cursors so this feature is fully
+    # additive and can be enabled without disturbing anything else.
+    NEWDOM_KEY = "__newdom_ts__"
+
+    def get_newdom_watermark(self):
+        return self.get_cursor(self.NEWDOM_KEY)
+
+    def set_newdom_watermark(self, ts):
+        self.set_state(self.NEWDOM_KEY, int(ts))
+
+    def seed_known_domains(self):
+        """Mark every domain already in the visit log as 'known' (baseline).
+
+        Called once when new-domain alerting is first enabled so the child's
+        entire browsing past isn't reported as new. Records each domain's most
+        recent past visit as its last-seen time.
+        """
+        conn = self._connect()
+        try:
+            conn.execute(
+                "INSERT INTO known_domains(username, domain, last_ts) "
+                "SELECT username, domain, MAX(ts) FROM visits "
+                "WHERE domain <> '' GROUP BY username, domain "
+                "ON CONFLICT(username, domain) DO UPDATE SET "
+                "last_ts=MAX(last_ts, excluded.last_ts)")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def domain_last_seen(self, username, domain):
+        """Last-seen epoch for (username, domain), or None if never recorded."""
+        conn = self._connect()
+        try:
+            r = conn.execute(
+                "SELECT last_ts FROM known_domains WHERE username=? AND domain=?",
+                (username, domain)).fetchone()
+            return r[0] if r else None
+        finally:
+            conn.close()
+
+    def mark_domain_seen(self, username, domain, ts):
+        conn = self._connect()
+        try:
+            conn.execute(
+                "INSERT INTO known_domains(username, domain, last_ts) "
+                "VALUES(?,?,?) ON CONFLICT(username, domain) DO UPDATE SET "
+                "last_ts=MAX(last_ts, excluded.last_ts)",
+                (username, domain, int(ts)))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def add_new_domain_event(self, username, domain, ts):
+        conn = self._connect()
+        try:
+            conn.execute(
+                "INSERT INTO new_domain_events(username, domain, ts) "
+                "VALUES(?,?,?)", (username, domain, int(ts)))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def new_domain_events_since(self, ts):
+        """(username, domain, ts) new-domain events strictly newer than `ts`."""
+        conn = self._connect()
+        try:
+            return conn.execute(
+                "SELECT username, domain, ts FROM new_domain_events "
+                "WHERE ts > ? ORDER BY ts", (int(ts),)).fetchall()
+        finally:
+            conn.close()
+
     # -- generic state (heartbeat, digest timestamp) via the cursors table --
     def get_state(self, key):
         return self.get_cursor(key)
@@ -950,6 +1067,11 @@ class HistoryStore:
         try:
             n = conn.execute("DELETE FROM visits WHERE ts < ?", (cutoff,)).rowcount or 0
             n += conn.execute("DELETE FROM attempts WHERE ts < ?", (cutoff,)).rowcount or 0
+            # Old new-domain events expire too, but known_domains is kept: it is
+            # long-term memory of what's been seen, which is exactly what the
+            # "not visited in X days" check needs.
+            n += conn.execute("DELETE FROM new_domain_events WHERE ts < ?",
+                              (cutoff,)).rowcount or 0
             conn.commit()
             return n
         finally:
@@ -1231,6 +1353,111 @@ def scan_and_alert(state, store, on_alert, alert_state=None):
     return fired
 
 
+def scan_new_domains(state, store):
+    """Find new-domain visits since the watermark and log them as events.
+
+    "New" = a domain the user has never visited, OR hasn't visited in the last
+    X days (X = monitor['new_domain_days']; 0 means never-seen-before only).
+    Reads the shared visit log without modifying it, so every existing metric
+    and log stays exactly as it was. Returns a list of new-domain event dicts
+    for real-time delivery; the events are also persisted for the daily digest.
+    """
+    with state.lock:
+        mon = dict(state.monitor)
+    if not mon.get("alert_new_domains"):
+        # Keep the watermark current so enabling later doesn't replay history.
+        store.set_newdom_watermark(int(time.time()))
+        return []
+    try:
+        days = max(0, int(mon.get("new_domain_days", 30)))
+    except (TypeError, ValueError):
+        days = 30
+
+    wm = store.get_newdom_watermark()
+    if wm <= 0:
+        # First run ever: treat every domain already in history as "known"
+        # (baseline) so the child's whole past isn't reported, then watch from
+        # now on. No alerts fire for pre-existing history.
+        store.seed_known_domains()
+        store.set_newdom_watermark(int(time.time()))
+        return []
+
+    gap = days * 86400
+    events = []
+    max_ts = wm
+    cache = {}                       # (user, dom) -> last-seen ts within this batch
+    for username, dom, url, ts in store.visits_since(wm):
+        max_ts = max(max_ts, ts)
+        if _is_common_domain(dom):
+            continue
+        key = (username, dom)
+        last = cache.get(key)
+        if last is None:
+            last = store.domain_last_seen(username, dom)
+        is_new = last is None or (gap > 0 and ts - last > gap)
+        store.mark_domain_seen(username, dom, ts)
+        cache[key] = ts
+        if is_new:
+            store.add_new_domain_event(username, dom, ts)
+            events.append({"user": username, "domain": dom, "url": url,
+                           "ts": int(ts), "last": last})
+    if max_ts > wm:
+        store.set_newdom_watermark(max_ts)
+    return events
+
+
+def _newdom_tag(ts, last):
+    """Human label for how 'new' a domain is."""
+    if not last:
+        return "never visited before"
+    days = max(1, (ts - last) // 86400)
+    return f"not visited in ~{days} day{'s' if days != 1 else ''}"
+
+
+def build_new_domain_alert(events):
+    """Compose the real-time 'new website(s)' email. Returns (subj, body)."""
+    by_user = {}
+    for e in events:
+        by_user.setdefault(e["user"], []).append(e)
+    lines = ["AppBlocker — new website alert", ""]
+    for user in sorted(by_user):
+        lines.append(f"== {user} ==")
+        for e in by_user[user]:
+            when = time.strftime("%H:%M", time.localtime(e["ts"]))
+            lines.append(f"  {e['domain']}  ({_newdom_tag(e['ts'], e['last'])}, "
+                         f"at {when})")
+        lines.append("")
+    n = len(events)
+    subj = f"[AppBlocker] {n} new website{'s' if n != 1 else ''} visited"
+    return subj, "\n".join(lines)
+
+
+def build_new_domain_digest(events, since_ts):
+    """Daily summary of new domains seen since `since_ts`. Returns (subj, body)."""
+    now = int(time.time())
+    by_user = {}
+    for username, dom, ts in events:
+        by_user.setdefault(username, {}).setdefault(dom, []).append(ts)
+    lines = [f"AppBlocker — new websites summary "
+             f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(now))}",
+             f"(new domains first seen since "
+             f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(since_ts))})",
+             ""]
+    if not by_user:
+        lines.append("No new websites in this period.")
+    for user in sorted(by_user):
+        doms = by_user[user]
+        lines.append(f"== {user} — {len(doms)} new site(s) ==")
+        for dom in sorted(doms, key=lambda d: min(doms[d]), reverse=True):
+            first = min(doms[dom])
+            when = time.strftime("%m-%d %H:%M", time.localtime(first))
+            n = len(doms[dom])
+            extra = f" (x{n})" if n > 1 else ""
+            lines.append(f"    {dom} — first at {when}{extra}")
+        lines.append("")
+    return "AppBlocker daily new-website summary", "\n".join(lines)
+
+
 def _within_quiet_hours(cfg, now=None):
     """True if the current local time is inside the email quiet-hours window."""
     start = _parse_hhmm(cfg.get("quiet_start", ""))
@@ -1256,6 +1483,8 @@ class HistoryMonitor(threading.Thread):
         self._last_sync = 0
         self._checked_tamper = False
         self._cmd_results = []      # recent remote-command outcomes (for the UI)
+        self._newdom_day = ""       # calendar day of the real-time email counter
+        self._newdom_sent = 0       # real-time new-domain emails sent today
 
     def stop(self):
         self._stop.set()
@@ -1277,8 +1506,12 @@ class HistoryMonitor(threading.Thread):
                 import_all_history(self.state, store)
                 scan_and_alert(self.state, store, self._alert,
                                self._alert_state)
+                # Detect never-seen / long-unseen domains (additive: reads the
+                # same visit log, records events + optional real-time email).
+                self._maybe_new_domain_alert(store)
                 store.set_state("__heartbeat__", int(time.time()))
                 self._maybe_digest(store)
+                self._maybe_new_domain_digest(store)
                 self._maybe_prune(store)
                 # Poll for remote-control commands from the dashboard and apply
                 # them (fast — pushes an updated snapshot right after applying).
@@ -1424,6 +1657,67 @@ class HistoryMonitor(threading.Thread):
                 store.set_state("__digest__", now)
         except Exception as exc:
             sys.stderr.write(f"[monitor] digest email failed: {exc}\n")
+
+    def _maybe_new_domain_alert(self, store):
+        """Scan for new domains and, if real-time is on, send one batched email.
+
+        Events are logged regardless of real-time delivery so the daily digest
+        (and dashboard, later) still sees them even during quiet hours.
+        """
+        try:
+            events = scan_new_domains(self.state, store)
+        except Exception as exc:
+            sys.stderr.write(f"[monitor] new-domain scan failed: {exc}\n")
+            return
+        if not events:
+            return
+        with self.state.lock:
+            mon = dict(self.state.monitor)
+        if not mon.get("new_domain_realtime"):
+            return                       # digest-only mode; events still logged
+        # Anti-flood: cap real-time emails per calendar day.
+        today = time.strftime("%Y-%m-%d")
+        if self._newdom_day != today:
+            self._newdom_day = today
+            self._newdom_sent = 0
+        if self._newdom_sent >= NEWDOM_ALERT_CAP:
+            return
+        subject, body = build_new_domain_alert(events)
+        try:
+            if notify_email(mon.get("email") or {}, subject, body):
+                self._newdom_sent += 1
+        except Exception as exc:
+            sys.stderr.write(f"[monitor] new-domain email failed: {exc}\n")
+
+    def _maybe_new_domain_digest(self, store):
+        """Once a day, email a summary of every new domain seen since last time.
+
+        Runs whenever new-domain alerting is on (independent of the general
+        activity digest), so the parent always gets a daily new-website roundup.
+        """
+        with self.state.lock:
+            mon = dict(self.state.monitor)
+        if not mon.get("alert_new_domains"):
+            return
+        interval = 86400                 # daily
+        last = store.get_state("__newdom_digest__")
+        now = int(time.time())
+        if last <= 0:
+            store.set_state("__newdom_digest__", now)   # start clock, no send
+            return
+        if now - last < interval:
+            return
+        events = store.new_domain_events_since(last)
+        if not events:
+            store.set_state("__newdom_digest__", now)   # nothing new; reset clock
+            return
+        subject, body = build_new_domain_digest(events, last)
+        try:
+            if notify_email(mon.get("email") or {}, subject, body,
+                            respect_quiet=False):
+                store.set_state("__newdom_digest__", now)
+        except Exception as exc:
+            sys.stderr.write(f"[monitor] new-domain digest failed: {exc}\n")
 
     def _maybe_prune(self, store):
         """Once a day, delete history older than the configured retention."""
@@ -2164,6 +2458,9 @@ class AppState:
             "alert_blocked": True,  # email when a child tries a blocked app
             "digest_enabled": False,   # daily summary email
             "digest_hours": 24,        # digest interval
+            "alert_new_domains": False,  # alert on never-seen / long-unseen sites
+            "new_domain_days": 30,     # "new" if not seen in this many days (0=never-seen only)
+            "new_domain_realtime": True,  # also send real-time (else digest-only)
             "history_days": 90,        # keep this many days of history (0=forever)
             "email": {"enabled": False, "host": "", "port": 587,
                       "username": "", "password": "", "from": "", "to": "",
@@ -2184,6 +2481,13 @@ class AppState:
                 mon["digest_hours"] = max(1, int(value.get("digest_hours", 24)))
             except (TypeError, ValueError):
                 mon["digest_hours"] = 24
+            mon["alert_new_domains"] = bool(value.get("alert_new_domains", False))
+            try:
+                mon["new_domain_days"] = max(0, int(value.get("new_domain_days", 30)))
+            except (TypeError, ValueError):
+                mon["new_domain_days"] = 30
+            mon["new_domain_realtime"] = bool(
+                value.get("new_domain_realtime", True))
             try:
                 mon["history_days"] = max(0, int(value.get("history_days", 90)))
             except (TypeError, ValueError):
@@ -3657,6 +3961,27 @@ class AppBlockerUI:
         keywords.pack(fill="x", padx=16)
         keywords.insert("1.0", "\n".join(mon.get("keywords", [])))
 
+        # New-domain novelty detection — catches sites you never listed, by
+        # flagging domains the child has never visited (or not in a while).
+        newdom_on = tk.BooleanVar(value=mon.get("alert_new_domains", False))
+        tk.Checkbutton(body, variable=newdom_on, bg=COLOR_BG, anchor="w",
+                       text="Alert me about brand-new websites (never visited "
+                       "before, or not recently)").pack(fill="x", padx=16,
+                                                        pady=(10, 0))
+        nrow = tk.Frame(body, bg=COLOR_BG)
+        nrow.pack(fill="x", padx=32)
+        tk.Label(nrow, text="Treat as new if not visited in the last",
+                 bg=COLOR_BG).pack(side="left")
+        new_domain_days = tk.StringVar(value=str(mon.get("new_domain_days", 30)))
+        tk.Spinbox(nrow, from_=0, to=3650, width=4, textvariable=new_domain_days
+                   ).pack(side="left", padx=4)
+        tk.Label(nrow, text="days (0 = only ever never-seen sites)", bg=COLOR_BG,
+                 fg="#7f8c8d").pack(side="left")
+        newdom_rt = tk.BooleanVar(value=mon.get("new_domain_realtime", True))
+        tk.Checkbutton(body, variable=newdom_rt, bg=COLOR_BG, anchor="w",
+                       text="Send new-site alerts in real time (they're always "
+                       "in the daily summary too)").pack(fill="x", padx=32)
+
         alert_blocked = tk.BooleanVar(value=mon.get("alert_blocked", True))
         tk.Checkbutton(body, variable=alert_blocked, bg=COLOR_BG, anchor="w",
                        text="Email me when a child tries to open a blocked app"
@@ -3716,6 +4041,12 @@ class AppBlockerUI:
             mon["keywords"] = [ln for ln in keywords.get(
                 "1.0", tk.END).splitlines() if ln.strip()]
             mon["alert_blocked"] = alert_blocked.get()
+            mon["alert_new_domains"] = newdom_on.get()
+            try:
+                mon["new_domain_days"] = max(0, int(new_domain_days.get()))
+            except ValueError:
+                mon["new_domain_days"] = 30
+            mon["new_domain_realtime"] = newdom_rt.get()
             mon["digest_enabled"] = digest_on.get()
             try:
                 mon["digest_hours"] = max(1, int(digest_hours.get()))
