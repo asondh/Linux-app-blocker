@@ -1858,13 +1858,21 @@ def _control_snapshot(state):
         lockdown = bool(state.lockdown.get("enabled"))
         adult = bool(state.block_adult)
         remote_enabled = bool(state.sync.get("control"))
+        distractions = list(state.distractions)
+        free_until = int(state.distract_free_until or 0)
+        # only report per-site allows that haven't expired
+        now = int(time.time())
+        distract_allow = {d: int(t) for d, t in state.distract_allow.items()
+                          if int(t) > now}
     try:
         human_users = [name for name, _uid in list_human_users()]
     except Exception:
         human_users = []
     return {"apps": apps, "websites": websites, "watch": watch,
             "lockdown": lockdown, "block_adult": adult,
-            "human_users": human_users, "remote_enabled": remote_enabled}
+            "human_users": human_users, "remote_enabled": remote_enabled,
+            "distractions": distractions, "distract_free_until": free_until,
+            "distract_allow": distract_allow}
 
 
 def build_report_data(store, days=REPORT_DAYS, limit=REPORT_LIMIT,
@@ -2362,6 +2370,41 @@ def apply_remote_command(state, cmd):
         state.set_block_adult(en)
         return True, f"adult blocklist {'on' if en else 'off'}"
 
+    if action in ("add_distraction", "remove_distraction"):
+        dom = normalize_domain(cmd.get("domain", ""))
+        if action == "add_distraction" and not dom:
+            return False, "invalid domain"
+        with state.lock:
+            cur = list(state.distractions)
+        if action == "add_distraction":
+            if dom not in cur:
+                cur.append(dom)
+            msg = f"added distraction {dom}"
+        else:
+            cur = [d for d in cur if d != dom]
+            msg = f"removed distraction {dom}"
+        state.set_distractions(cur)
+        return True, msg
+
+    if action == "grant_free_time":
+        until = state.grant_free_time(cmd.get("minutes"))
+        if until:
+            return True, ("free time until "
+                          + time.strftime("%H:%M", time.localtime(until)))
+        return True, "free time ended — distractions re-locked"
+
+    if action == "end_free_time":
+        state.end_free_time()
+        return True, "distractions re-locked"
+
+    if action == "allow_distraction":
+        dom = state.allow_distraction(cmd.get("domain", ""), cmd.get("minutes"))
+        if not dom:
+            return False, "invalid domain"
+        mins = cmd.get("minutes")
+        return True, (f"allowed {dom} for {mins} min" if mins
+                      else f"re-blocked {dom}")
+
     return False, f"unknown action '{action}'"
 
 
@@ -2503,6 +2546,9 @@ class ProcessMonitor(threading.Thread):
                 lockdown_on = self.state.lockdown.get("enabled")
                 adult_on = self.state.block_adult
                 web_scheds = [dict(s) for s in self.state.web_schedules]
+                distractions = list(self.state.distractions)
+                free_until = self.state.distract_free_until
+                allow = dict(self.state.distract_allow)
             domains |= dynamic_sites
             if adult_on:
                 domains |= load_adult_domains()
@@ -2511,6 +2557,10 @@ class ProcessMonitor(threading.Thread):
             for sch in web_scheds:
                 if schedule_active(sch.get("schedule") or []):
                     domains |= set(sch.get("sites") or [])
+            # Distractions: blocked by default unless free time is granted or the
+            # specific site has an unexpired allow. Auto re-locks when they lapse
+            # because this recomputes every sweep.
+            domains |= active_distractions(distractions, free_until, allow)
             sync_blocked_websites(sorted(domains))
             # Block the same sites INSIDE the browser (URLBlocklist policy) so it
             # takes hold on already-open tabs without a reload and survives DoH —
@@ -2717,6 +2767,12 @@ class AppState:
         self.sync = self._default_sync()        # remote dashboard (GitHub) sync
         self.block_adult = False                # built-in adult-content blocklist
         self.web_schedules = []                 # scheduled website blocks (downtime)
+        # "Distractions": sites blocked by default (machine-wide) that the parent
+        # can temporarily unlock. free_until = epoch while ALL are lifted ("free
+        # time"); allow = {domain: epoch} for per-site temporary allows.
+        self.distractions = []
+        self.distract_free_until = 0
+        self.distract_allow = {}
         self._mtime = None
         self.load()
 
@@ -2858,6 +2914,32 @@ class AppState:
         return out
 
     @staticmethod
+    def _normalize_distract_allow(value):
+        """Per-site temporary allows: {domain: epoch}. Drops past/invalid ones."""
+        out = {}
+        if isinstance(value, dict):
+            now = int(time.time())
+            for k, v in value.items():
+                d = normalize_domain(k)
+                try:
+                    t = int(v)
+                except (TypeError, ValueError):
+                    continue
+                if d and t > now:
+                    out[d] = t
+        return out
+
+    def _apply_distract(self, data):
+        """Load the distraction fields from a parsed blocked.json dict."""
+        self.distractions = self._normalize_websites(data.get("distractions"))
+        try:
+            self.distract_free_until = int(data.get("distract_free_until") or 0)
+        except (TypeError, ValueError):
+            self.distract_free_until = 0
+        self.distract_allow = self._normalize_distract_allow(
+            data.get("distract_allow"))
+
+    @staticmethod
     def _normalize_web_schedules(value):
         """Scheduled website blocks: [{name, sites:[domains], schedule:[windows]}]."""
         clean = []
@@ -2899,6 +2981,7 @@ class AppState:
             self.block_adult = bool(data.get("block_adult"))
             self.web_schedules = self._normalize_web_schedules(
                 data.get("web_schedules"))
+            self._apply_distract(data)
             self._mtime = self._file_mtime()
         else:
             self.apps = self._default_apps()
@@ -2909,6 +2992,9 @@ class AppState:
             self.sync = self._default_sync()
             self.block_adult = False
             self.web_schedules = []
+            self.distractions = []
+            self.distract_free_until = 0
+            self.distract_allow = {}
             self.save()
 
     def reload_if_changed(self):
@@ -2933,6 +3019,7 @@ class AppState:
                 self.block_adult = bool(data.get("block_adult"))
                 self.web_schedules = self._normalize_web_schedules(
                     data.get("web_schedules"))
+                self._apply_distract(data)
                 self._mtime = mtime
             return True
         return False
@@ -2948,7 +3035,10 @@ class AppState:
                                  "lockdown": self.lockdown,
                                  "sync": self.sync,
                                  "block_adult": self.block_adult,
-                                 "web_schedules": self.web_schedules})
+                                 "web_schedules": self.web_schedules,
+                                 "distractions": self.distractions,
+                                 "distract_free_until": self.distract_free_until,
+                                 "distract_allow": self.distract_allow})
         self._mtime = self._file_mtime()
 
     @staticmethod
@@ -3121,6 +3211,61 @@ class AppState:
             if 0 <= index < len(self.web_schedules):
                 del self.web_schedules[index]
                 self.save_locked()
+
+    # -- distractions (blocked by default, grantable) ----------------------- #
+    def set_distractions(self, domains):
+        with self.lock:
+            self.distractions = self._normalize_websites(domains)
+            self.save_locked()
+            return list(self.distractions)
+
+    def grant_free_time(self, minutes):
+        """Lift ALL distraction blocks for `minutes` (0/neg ends free time).
+        Returns the epoch it runs until (0 = not active)."""
+        try:
+            m = int(minutes)
+        except (TypeError, ValueError):
+            m = 0
+        with self.lock:
+            self.distract_free_until = int(time.time()) + m * 60 if m > 0 else 0
+            self.save_locked()
+            return self.distract_free_until
+
+    def end_free_time(self):
+        """Re-lock everything now: clear the free-time grant and per-site allows."""
+        with self.lock:
+            self.distract_free_until = 0
+            self.distract_allow = {}
+            self.save_locked()
+
+    def allow_distraction(self, domain, minutes):
+        """Temporarily allow one distraction domain for `minutes` (0 removes it).
+        Returns the normalized domain, or '' if invalid."""
+        d = normalize_domain(domain)
+        if not d:
+            return ""
+        try:
+            m = int(minutes)
+        except (TypeError, ValueError):
+            m = 0
+        with self.lock:
+            if m > 0:
+                self.distract_allow[d] = int(time.time()) + m * 60
+            else:
+                self.distract_allow.pop(d, None)
+            self.save_locked()
+        return d
+
+
+def active_distractions(distractions, free_until, allow, now=None):
+    """Distraction domains that should be blocked right now: all of them, unless
+    a free-time grant is active (then none), minus any with an unexpired per-site
+    allow. Pure function of its inputs for easy testing."""
+    now = int(now if now is not None else time.time())
+    if free_until and now < int(free_until):
+        return set()
+    allow = allow or {}
+    return {d for d in (distractions or []) if int(allow.get(d, 0)) <= now}
 
 
 # --------------------------------------------------------------------------- #
@@ -3316,6 +3461,7 @@ class AppBlockerUI:
         mk("⛓ Auto-Block Rules", self.rules_dialog, "#8e44ad", "#6c3483")
         if SYSTEM_MODE:
             mk("🌐 Block Websites", self.websites_dialog, "#16a085", "#0e6655")
+            mk("🎯 Distractions", self.distractions_dialog, "#d35400", "#a04000")
             mk("⏰ Site Schedules", self.web_schedule_dialog, "#11998e", "#0b6b64")
             mk("📊 Activity", self.activity_dialog, "#2c3e50", "#1b2631")
             mk("🔒 Lockdown", self.lockdown_dialog, "#7f8c8d", "#616a6b")
@@ -4472,6 +4618,134 @@ class AppBlockerUI:
                   relief="flat", padx=16, pady=6, cursor="hand2").pack(
                       side="right")
         tk.Button(bar, text="Cancel", command=win.destroy, relief="flat",
+                  padx=12, pady=6, cursor="hand2").pack(side="right", padx=8)
+
+    # -- distractions (blocked by default, grantable) ----------------------- #
+    def distractions_dialog(self):
+        win = tk.Toplevel(self.root)
+        win.title("Distractions")
+        win.configure(bg=COLOR_BG)
+        win.geometry("500x600")
+        win.minsize(440, 460)
+        self._present(win)
+
+        bar = tk.Frame(win, bg=COLOR_BG)
+        bar.pack(side="bottom", fill="x", padx=18, pady=14)
+
+        tk.Label(win, text="🎯 Distractions", bg=COLOR_BG, fg=COLOR_HEADER,
+                 font=("Helvetica", 14, "bold")).pack(pady=(14, 2))
+        tk.Label(win, text="These sites are blocked by default for everyone on "
+                 "this computer, so schoolwork on any site stays distraction-"
+                 "free. You can grant free time or temporarily allow one site — "
+                 "they re-lock automatically when it runs out.", bg=COLOR_BG,
+                 fg="#7f8c8d", wraplength=460, justify="left").pack(
+                     padx=18, pady=(0, 8))
+
+        status = tk.Label(win, text="", bg=COLOR_BG, fg=COLOR_HEADER,
+                          wraplength=460, justify="left",
+                          font=("Helvetica", 11, "bold"))
+        status.pack(padx=18, pady=(0, 4))
+
+        def refresh_status():
+            with self.state.lock:
+                fu = self.state.distract_free_until
+                al = dict(self.state.distract_allow)
+                n = len(self.state.distractions)
+            now = int(time.time())
+            if fu and now < fu:
+                status.config(text="🟢 Free time — all distractions unlocked "
+                              f"until {time.strftime('%H:%M', time.localtime(fu))}.")
+            else:
+                active = {d: t for d, t in al.items() if t > now}
+                base = f"🔒 Blocked by default ({n} site(s))."
+                if active:
+                    parts = ", ".join(
+                        f"{d} → {time.strftime('%H:%M', time.localtime(t))}"
+                        for d, t in active.items())
+                    base += f"  Temporarily allowed: {parts}"
+                status.config(text=base)
+
+        # --- grant free time / re-lock ---
+        grow = tk.Frame(win, bg=COLOR_BG)
+        grow.pack(fill="x", padx=18, pady=(2, 0))
+        tk.Label(grow, text="Grant free time for", bg=COLOR_BG).pack(side="left")
+        free_min = tk.StringVar(value="30")
+        tk.Spinbox(grow, from_=1, to=1440, width=5, textvariable=free_min).pack(
+            side="left", padx=4)
+        tk.Label(grow, text="min", bg=COLOR_BG).pack(side="left")
+
+        def do_grant():
+            try:
+                m = max(1, int(free_min.get()))
+            except ValueError:
+                m = 30
+            self.state.grant_free_time(m)
+            refresh_status()
+
+        def do_end():
+            self.state.end_free_time()
+            refresh_status()
+
+        tk.Button(grow, text="Grant", command=do_grant, bg="#27ae60", fg="white",
+                  relief="flat", padx=12, pady=4, cursor="hand2").pack(
+                      side="left", padx=6)
+        tk.Button(grow, text="Re-lock now", command=do_end, bg=COLOR_BLOCKED,
+                  fg="white", relief="flat", padx=10, pady=4,
+                  cursor="hand2").pack(side="left")
+
+        # --- temporarily allow one site ---
+        arow = tk.Frame(win, bg=COLOR_BG)
+        arow.pack(fill="x", padx=18, pady=(8, 0))
+        tk.Label(arow, text="Allow one site", bg=COLOR_BG).pack(side="left")
+        allow_site = tk.StringVar()
+        tk.Entry(arow, textvariable=allow_site, width=18).pack(side="left", padx=4)
+        tk.Label(arow, text="for", bg=COLOR_BG).pack(side="left")
+        allow_min = tk.StringVar(value="20")
+        tk.Spinbox(arow, from_=1, to=1440, width=5, textvariable=allow_min).pack(
+            side="left", padx=4)
+        tk.Label(arow, text="min", bg=COLOR_BG).pack(side="left")
+
+        def do_allow():
+            try:
+                m = max(1, int(allow_min.get()))
+            except ValueError:
+                m = 20
+            d = self.state.allow_distraction(allow_site.get(), m)
+            if d:
+                allow_site.set("")
+                refresh_status()
+            else:
+                messagebox.showwarning("Invalid", "Enter a domain to allow.",
+                                       parent=win)
+
+        tk.Button(arow, text="Allow", command=do_allow, bg=COLOR_ACCENT,
+                  fg="white", relief="flat", padx=12, pady=4,
+                  cursor="hand2").pack(side="left", padx=6)
+
+        tk.Label(win, text="Distraction sites (one domain per line):", bg=COLOR_BG,
+                 fg=COLOR_HEADER).pack(anchor="w", padx=18, pady=(10, 2))
+        txt = tk.Text(win, height=10, width=44, font=("monospace", 11))
+        txt.pack(fill="both", expand=True, padx=18)
+        with self.state.lock:
+            txt.insert("1.0", "\n".join(self.state.distractions))
+
+        refresh_status()
+
+        def save():
+            raw = txt.get("1.0", tk.END)
+            domains = [ln for ln in raw.splitlines() if ln.strip()]
+            saved = self.state.set_distractions(domains)
+            refresh_status()
+            messagebox.showinfo(
+                "Saved", f"{len(saved)} distraction site(s) saved.\n\nThey're "
+                "blocked by default; changes take effect within a few seconds.",
+                parent=win)
+            win.destroy()
+
+        tk.Button(bar, text="Save list", command=save, bg=COLOR_ACTIVE,
+                  fg="white", relief="flat", padx=16, pady=6,
+                  cursor="hand2").pack(side="right")
+        tk.Button(bar, text="Close", command=win.destroy, relief="flat",
                   padx=12, pady=6, cursor="hand2").pack(side="right", padx=8)
 
     # -- scheduled website blocks (downtime) -------------------------------- #
