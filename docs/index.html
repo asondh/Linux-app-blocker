@@ -714,7 +714,16 @@ function onCtlButton(b){
   if(act==="remove_watch") return sendCommand({action:"remove_watch",domain:b.dataset.dom}, "stop watching "+b.dataset.dom);
   if(act==="set_block_adult") return sendCommand({action:"set_block_adult",enabled:b.dataset.en==="1"}, "adult blocklist "+(b.dataset.en==="1"?"on":"off"));
   if(act==="set_lockdown")    return sendCommand({action:"set_lockdown",enabled:b.dataset.en==="1"}, "lockdown "+(b.dataset.en==="1"?"on":"off"));
+  if(act==="grant_free_time") return sendCommand({action:"grant_free_time",minutes:parseInt(b.dataset.min,10)}, "free time "+b.dataset.min+"m");
+  if(act==="end_free_time")   return sendCommand({action:"end_free_time"}, "re-lock distractions");
+  if(act==="add_distraction"){ const d=($("ctl-distract").value||"").trim();
+    if(!d){ ctlMsg("Enter a domain first.","bad"); return; }
+    return sendCommand({action:"add_distraction",domain:d}, "add distraction "+d); }
+  if(act==="remove_distraction") return sendCommand({action:"remove_distraction",domain:b.dataset.dom}, "remove distraction "+b.dataset.dom);
+  if(act==="allow_distraction")  return sendCommand({action:"allow_distraction",domain:b.dataset.dom,minutes:parseInt(b.dataset.min,10)}, "allow "+b.dataset.dom+" "+b.dataset.min+"m");
 }
+function fmtClock(ts){ const d=new Date(ts*1000);
+  return String(d.getHours()).padStart(2,"0")+":"+String(d.getMinutes()).padStart(2,"0"); }
 function ctlMsg(t,cls){ CTLMSG=t?('<span class="'+(cls||"")+'">'+esc(t)+'</span>'):""; renderCtlStatus(); }
 function renderCtlStatus(){
   const el=$("ctl-status"); if(!el) return;
@@ -850,6 +859,43 @@ function renderControls(){
      '<div class="ctl-note">You get an email when a child visits these — they are '+
      '<b>not</b> blocked, just reported'+(broadcast?", on every machine":"")+
      '.</div></div>';
+
+  // Distractions — blocked by default; grant free time or allow one site.
+  h+='<div class="ctl-sec"><h3>Distractions'+(broadcast?" (all machines)":"")+'</h3>';
+  if(ctl){
+    const now=Math.floor(Date.now()/1000), fu=ctl.distract_free_until||0;
+    if(fu>now){
+      h+='<div class="ctl-row"><span class="name ok">🟢 Free time until '+
+         fmtClock(fu)+'</span><span class="spacer"></span>'+
+         ctlRowBtn("end_free_time","red small","Re-lock now")+'</div>';
+    } else {
+      h+='<div class="ctl-row"><span class="name">🔒 Blocked by default</span>'+
+         '<span class="spacer"></span>'+
+         ctlRowBtn("grant_free_time","green small","Free 15m",' data-min="15"')+
+         ctlRowBtn("grant_free_time","green small","30m",' data-min="30"')+
+         ctlRowBtn("grant_free_time","green small","60m",' data-min="60"')+'</div>';
+    }
+  }
+  if(broadcast){
+    h+='<div class="ctl-note">Adding a site blocks it (by default) on every '+
+       'machine. Pick a specific machine to see, allow, or remove its list.</div>';
+  } else if(ctl){
+    const now=Math.floor(Date.now()/1000);
+    (ctl.distractions||[]).forEach(d=>{
+      const au=(ctl.distract_allow||{})[d]||0;
+      const tag = au>now ? '<span class="pill">allowed → '+fmtClock(au)+'</span> ' : '';
+      h+='<div class="ctl-row"><span class="name">'+esc(d)+'</span> '+tag+
+         '<span class="spacer"></span>'+
+         ctlRowBtn("allow_distraction","small","Allow 20m",' data-dom="'+esc(d)+'" data-min="20"')+
+         ctlRowBtn("remove_distraction","green small","Remove",' data-dom="'+esc(d)+'"')+'</div>';
+    });
+  }
+  h+='<div class="ctl-row"><input id="ctl-distract" class="ctl-in" '+
+     'placeholder="e.g. youtube.com">'+
+     ctlRowBtn("add_distraction","red small","Add distraction")+'</div>'+
+     '<div class="ctl-note">Blocked by default so schoolwork on any site stays '+
+     'focused. Grant free time or allow one site, and it re-locks on its own'+
+     (broadcast?", on every machine":"")+'.</div></div>';
 
   // Protection.
   h+='<div class="ctl-sec"><h3>Protection'+(broadcast?" (all machines)":"")+'</h3>';
