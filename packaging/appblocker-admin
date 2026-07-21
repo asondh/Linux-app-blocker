@@ -23,8 +23,9 @@ if command -v pkexec >/dev/null 2>&1; then
     fi
 fi
 
-# 2) Graphical sudo fallback. Find an askpass helper, or synthesize one with
-#    zenity (present on Mint/Cinnamon), so sudo can prompt with a GUI box.
+# 2) Graphical sudo fallback. Prefer a real askpass helper or zenity; otherwise
+#    synthesize one with Python/tkinter — which is a hard dependency of this
+#    package, so it is ALWAYS available even when zenity/ssh-askpass are not.
 askpass=""
 for c in /usr/bin/ssh-askpass /usr/lib/ssh/ssh-askpass \
          /usr/lib/ssh/x11-ssh-askpass /usr/libexec/openssh/ssh-askpass; do
@@ -39,6 +40,28 @@ if [ -z "$askpass" ] && command -v zenity >/dev/null 2>&1; then
     cat > "$tmp_askpass" <<'EOF'
 #!/bin/sh
 exec zenity --password --title="AppBlocker — enter your login password"
+EOF
+    chmod +x "$tmp_askpass"
+    askpass="$tmp_askpass"
+fi
+if [ -z "$askpass" ] && command -v python3 >/dev/null 2>&1; then
+    tmp_askpass="$(mktemp)"
+    cat > "$tmp_askpass" <<'EOF'
+#!/usr/bin/env python3
+# Tiny GUI password box for sudo's SUDO_ASKPASS. Prints the entered password to
+# stdout (how sudo -A reads it), or an empty line if cancelled.
+import tkinter as tk
+from tkinter import simpledialog
+_root = tk.Tk()
+_root.withdraw()
+try:
+    _pw = simpledialog.askstring(
+        "AppBlocker",
+        "Enter your login password to open AppBlocker settings:",
+        show="*", parent=_root)
+except Exception:
+    _pw = None
+print(_pw or "")
 EOF
     chmod +x "$tmp_askpass"
     askpass="$tmp_askpass"
