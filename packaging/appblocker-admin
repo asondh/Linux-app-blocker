@@ -1,10 +1,57 @@
 #!/bin/sh
-# Launch the AppBlocker admin GUI as root with a graphical polkit prompt so
+# Launch the AppBlocker admin GUI as root with a graphical password prompt so
 # only someone with the admin password can change settings.
+#
+# Preferred path is pkexec (the standard polkit dialog). On some machines
+# polkit is broken/misconfigured and rejects every password (the prompt
+# "shakes" and closes) even though the account is a valid sudoer. When pkexec
+# can't authorize, we fall back to sudo with a graphical askpass so the desktop
+# icon still works without opening a terminal.
+
+DISP="$DISPLAY"
+XAUTH="${XAUTHORITY:-$HOME/.Xauthority}"
+
+# 1) pkexec (standard). Exit codes: 126 = not authorized / dialog dismissed,
+#    127 = couldn't execute; anything else is the app's own exit status (so a
+#    successful launch does NOT fall through to the sudo prompt below).
 if command -v pkexec >/dev/null 2>&1; then
-    exec pkexec env DISPLAY="$DISPLAY" \
-        XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}" \
+    pkexec env DISPLAY="$DISP" XAUTHORITY="$XAUTH" \
         /usr/bin/appblocker --system "$@"
-else
-    exec sudo /usr/bin/appblocker --system "$@"
+    rc=$?
+    if [ "$rc" -ne 126 ] && [ "$rc" -ne 127 ]; then
+        exit "$rc"
+    fi
 fi
+
+# 2) Graphical sudo fallback. Find an askpass helper, or synthesize one with
+#    zenity (present on Mint/Cinnamon), so sudo can prompt with a GUI box.
+askpass=""
+for c in /usr/bin/ssh-askpass /usr/lib/ssh/ssh-askpass \
+         /usr/lib/ssh/x11-ssh-askpass /usr/libexec/openssh/ssh-askpass; do
+    if [ -x "$c" ]; then
+        askpass="$c"
+        break
+    fi
+done
+tmp_askpass=""
+if [ -z "$askpass" ] && command -v zenity >/dev/null 2>&1; then
+    tmp_askpass="$(mktemp)"
+    cat > "$tmp_askpass" <<'EOF'
+#!/bin/sh
+exec zenity --password --title="AppBlocker — enter your login password"
+EOF
+    chmod +x "$tmp_askpass"
+    askpass="$tmp_askpass"
+fi
+
+if [ -n "$askpass" ]; then
+    SUDO_ASKPASS="$askpass" sudo -A env DISPLAY="$DISP" XAUTHORITY="$XAUTH" \
+        /usr/bin/appblocker --system "$@"
+    rc=$?
+    [ -n "$tmp_askpass" ] && rm -f "$tmp_askpass"
+    exit "$rc"
+fi
+
+# 3) Last resort: plain sudo (works when launched from a terminal).
+exec sudo env DISPLAY="$DISP" XAUTHORITY="$XAUTH" \
+    /usr/bin/appblocker --system "$@"
