@@ -12,7 +12,11 @@ case "$1" in
 
         if [ -d /run/systemd/system ]; then
             systemctl daemon-reload || true
-            systemctl enable --now appblocker.service || true
+            # Always (re-)enable for boot and (re)start the new binary. Explicit
+            # enable + restart also heals any machine left disabled by an older
+            # buggy prerm, and guarantees the freshly-installed binary is running.
+            systemctl enable appblocker.service || true
+            systemctl restart appblocker.service || true
         else
             echo "systemd not detected; start the daemon manually with:" >&2
             echo "  /usr/bin/appblocker --daemon" >&2

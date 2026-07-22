@@ -12,8 +12,12 @@ case "$1" in
         [ -x /usr/bin/appblocker ] && /usr/bin/appblocker --lockdown-clear || true
         ;;
     upgrade)
+        # On upgrade, only STOP the old binary so the new one can take over —
+        # do NOT disable. Disabling here and re-enabling in postinst is fragile:
+        # if that handoff is ever missed, the service is left off at boot (no
+        # monitoring, no alerts). Keeping it enabled and just restarting is safe.
         if [ -d /run/systemd/system ]; then
-            systemctl disable --now appblocker.service || true
+            systemctl stop appblocker.service || true
         fi
         ;;
 esac
