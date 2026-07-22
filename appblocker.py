@@ -822,7 +822,7 @@ def _read_browser_history(kind, db_path, since_native):
             if kind == "firefox":
                 cur.execute(
                     "SELECT v.visit_date, p.url, p.title "
-                    "FROM moz_historyvisits v JOIN moz_places p ON p.id = v.place "
+                    "FROM moz_historyvisits v JOIN moz_places p ON p.id = v.place_id "
                     "WHERE v.visit_date > ? ORDER BY v.visit_date", (since_native,))
                 for visit_date, url, title in cur.fetchall():
                     if visit_date is None:
@@ -4540,8 +4540,21 @@ class AppBlockerUI:
             try:
                 send_email(cfg, "[AppBlocker] Test email",
                            "This is a test from AppBlocker. Email alerts work.")
-                messagebox.showinfo("Sent", f"Test email sent to {cfg.get('to')}.",
-                                    parent=win)
+                # The test sends regardless of the master toggle, so warn loudly
+                # if alerts are off — otherwise a working test misleads you into
+                # thinking real alerts will arrive when they won't.
+                if not cfg.get("enabled"):
+                    messagebox.showwarning(
+                        "Test sent — but alerts are OFF",
+                        f"Test email sent to {cfg.get('to')}.\n\n"
+                        "⚠️ “Send email alerts (SMTP)” is unchecked, so you will "
+                        "NOT receive real alerts (watched sites, blocked-app "
+                        "attempts, digests) until you tick that box and Save.",
+                        parent=win)
+                else:
+                    messagebox.showinfo(
+                        "Sent", f"Test email sent to {cfg.get('to')}.\n\n"
+                        "Email alerts are on.", parent=win)
             except Exception as exc:
                 messagebox.showerror("Email failed", str(exc), parent=win)
 
