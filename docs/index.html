@@ -422,13 +422,12 @@ function initFilters(){
     const o=document.createElement("option"); o.textContent=n; msel.appendChild(o); });
   if([...msel.options].some(o=>o.value===mcur)) msel.value = mcur;
 
-  // Open focused on the last 7 days (once — don't fight the user or the 30s
+  // Open focused on just today (once — don't fight the user or the 30s
   // auto-refresh). Clearing the date, or widening it, sticks after that.
   if(!filtersInit){
     filtersInit = true;
     if(!$("fx-from").value){
-      const d = new Date(Date.now() - 7*86400*1000);
-      $("fx-from").value = d.toISOString().slice(0,10);
+      $("fx-from").value = todayStr();
     }
   }
 }
