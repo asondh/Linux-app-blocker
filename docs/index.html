@@ -498,48 +498,57 @@ function sortRows(rows, table, keys){
 
 function mcell(m){ return `<td class="col-m"><span class="mtag">${esc(m||"")}</span></td>`; }
 
-// Build collapsible site groups from rows. keyFn(row)->item key (the thing that
-// gets deduped within a site, e.g. the search term or the page URL); labelFn is
-// what to show for it. Returns [{domain,total,lastTs,items:[{label,count,lastTs,ms}]}].
-function buildSiteGroups(rows, keyFn, labelFn){
-  const byDom={};
+// Build collapsible groups from rows. keyFn(row)->item key (the thing that
+// gets deduped within a group, e.g. the search term or the page URL); labelFn
+// is what to show for it. groupKeyFn(row)->the outer grouping key, defaulting
+// to the site domain (Visits); pass v=>v.u to group by user instead (Searches).
+// itemSiteFn (optional) tags each item with its site, shown in the item's meta
+// line -- only meaningful when grouping by something other than site, since
+// otherwise the site is already the group header. Returns
+// [{group,total,lastTs,items:[{label,count,lastTs,ms,site}]}].
+function buildSiteGroups(rows, keyFn, labelFn, groupKeyFn, itemSiteFn){
+  groupKeyFn = groupKeyFn || (v=>v.d||"(unknown)");
+  const byGroup={};
   rows.forEach(v=>{
-    const d=v.d||"(unknown)";
-    const g=byDom[d]||(byDom[d]={domain:d,total:0,lastTs:0,items:{}});
+    const gk=groupKeyFn(v)||"(unknown)";
+    const g=byGroup[gk]||(byGroup[gk]={group:gk,total:0,lastTs:0,items:{}});
     g.total++; if(v.ts>g.lastTs) g.lastTs=v.ts;
-    const k=keyFn(v);
-    const it=g.items[k]||(g.items[k]={label:labelFn(v),count:0,lastTs:0,ms:new Set()});
+    const site=itemSiteFn?itemSiteFn(v):null;
+    const k=keyFn(v)+(site?"|"+site:"");
+    const it=g.items[k]||(g.items[k]={label:labelFn(v),count:0,lastTs:0,
+                                       ms:new Set(), site});
     it.count++; if(v.ts>=it.lastTs){ it.lastTs=v.ts; it.label=labelFn(v); }
     if(v._m) it.ms.add(v._m);
   });
-  return Object.values(byDom).map(g=>({
-      domain:g.domain, total:g.total, lastTs:g.lastTs,
+  return Object.values(byGroup).map(g=>({
+      group:g.group, total:g.total, lastTs:g.lastTs,
       items:Object.values(g.items).sort((a,b)=>b.lastTs-a.lastTs)
     })).sort((a,b)=>b.lastTs-a.lastTs);
 }
 
-// Render site groups into a container as a tap-to-expand accordion. openSet
-// persists which sites are expanded across re-renders (30s auto-refresh).
+// Render groups into a container as a tap-to-expand accordion. openSet
+// persists which groups are expanded across re-renders (30s auto-refresh).
 function renderSiteGroups(containerId, groups, openSet, unitOne, unitMany){
   const cont=$(containerId); cont.innerHTML="";
   const multi=document.body.classList.contains("multi");
   groups.forEach(g=>{
-    const open=openSet.has(g.domain), uniq=g.items.length;
+    const open=openSet.has(g.group), uniq=g.items.length;
     const div=document.createElement("div");
     div.className="grp"+(open?" open":"");
     let h=`<div class="grp-h"><span class="tw">${open?"▾":"▸"}</span>`+
-      `<span class="dom">${esc(g.domain)}</span>`+
+      `<span class="dom">${esc(g.group)}</span>`+
       `<span class="cnt muted">${uniq} ${uniq!=1?unitMany:unitOne}`+
       (g.total>uniq?` · ${g.total} total`:"")+`</span></div><div class="grp-body">`;
     g.items.forEach(t=>{
+      const site=t.site?`${esc(t.site)} · `:"";
       const who=(multi&&t.ms.size)?" · "+[...t.ms].join(", "):"";
       h+=`<div class="qrow"><span class="q">${esc(t.label)}</span>`+
-         `<span class="qmeta">`+(t.count>1?`<span class="qx">×${t.count}</span> `:"")+
+         `<span class="qmeta">${site}`+(t.count>1?`<span class="qx">×${t.count}</span> `:"")+
          `${fmtWhen(t.lastTs)}${who}</span></div>`;
     });
     h+=`</div>`; div.innerHTML=h;
     div.querySelector(".grp-h").onclick=()=>{
-      if(openSet.has(g.domain)) openSet.delete(g.domain); else openSet.add(g.domain);
+      if(openSet.has(g.group)) openSet.delete(g.group); else openSet.add(g.group);
       div.querySelector(".tw").textContent = div.classList.toggle("open")?"▾":"▸";
     };
     cont.appendChild(div);
@@ -600,12 +609,14 @@ function render(){
   $("c-visits").textContent="("+vg.length+" site"+(vg.length!=1?"s":"")+")";
   $("e-visits").classList.toggle("hidden", vg.length>0);
 
-  // Searches — grouped by website, collapsed. Identical searches (same words,
-  // case- and space-insensitive) merge into one ×count row.
+  // Searches — grouped by user, collapsed. Tap a user to see their searches
+  // (with the site each was made on); identical searches on the same site
+  // (same words, case- and space-insensitive) merge into one ×count row.
   const sg = buildSiteGroups(rows.filter(v=>v.q),
-                             v=>(v.q||"").trim().toLowerCase(), v=>v.q);
+                             v=>(v.q||"").trim().toLowerCase(), v=>v.q,
+                             v=>v.u||"(unknown)", v=>v.d||"");
   renderSiteGroups("tb-searches", sg, openSearch, "search", "searches");
-  $("c-searches").textContent="("+sg.length+" site"+(sg.length!=1?"s":"")+")";
+  $("c-searches").textContent="("+sg.length+" user"+(sg.length!=1?"s":"")+")";
   $("e-searches").classList.toggle("hidden", sg.length>0);
 
   // New sites (never-visited / long-unseen domains). Same user/machine/date/
