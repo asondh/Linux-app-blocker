@@ -1,6 +1,7 @@
 package com.appblocker.monitor
 
 import android.accessibilityservice.AccessibilityService
+import android.content.Intent
 import android.os.Handler
 import android.os.Looper
 import android.view.accessibility.AccessibilityEvent
@@ -38,7 +39,16 @@ class MonitorAccessibilityService : AccessibilityService() {
     override fun onServiceConnected() {
         store = Store(this)
         cfg = Config(this)
+        Watchdog.ensureScheduled(this)
+        handler.removeCallbacksAndMessages(null)   // don't stack loops on re-enable
         scheduleUpload()
+    }
+
+    override fun onUnbind(intent: Intent?): Boolean {
+        // Service disabled: stop the periodic upload loop so it doesn't keep
+        // running (and referencing this dead instance) after disconnect.
+        handler.removeCallbacksAndMessages(null)
+        return super.onUnbind(intent)
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {

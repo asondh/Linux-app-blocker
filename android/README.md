@@ -28,6 +28,29 @@ searches, and screen time included. No dashboard changes needed.
   service on modern Android — a savvy child can see it and could turn the
   service off in Settings. This raises the bar; it isn't invisible.
 
+## Tamper detection (detect-and-alert)
+
+You can't *prevent* a child disabling an Accessibility service on a normal
+Android device (Android forbids that by design), so instead this reports when
+it happens:
+
+- A **WorkManager watchdog** runs every ~15 min **independently of the
+  Accessibility service**. It uploads status even when the service is off, so a
+  device that got its monitoring turned off keeps reporting
+  `accessibility_enabled: false`.
+- The **dashboard flags it**: any device reporting `accessibility_enabled:
+  false` shows "⚠️ <device> — monitoring turned OFF", and a monitored device
+  that hasn't checked in for >45 min shows "no update in N min". Computers never
+  send the flag, so a PC that's simply powered off is not flagged.
+- If the app is force-stopped or uninstalled entirely, uploads stop and the
+  device goes stale (caught by the >45 min rule). WorkManager reschedules the
+  watchdog across reboots on its own.
+
+For a *push* alert (email) rather than a dashboard flag, the clean follow-up is
+to have the parent's Linux box watch the shared repo and email when any
+device's file goes stale/`accessibility_enabled:false` — keeping SMTP
+credentials on the parent's machine, never on the child's phone.
+
 ## Build & install (wireless debugging)
 
 1. Open the `android/` folder in **Android Studio** (it's a standard Gradle

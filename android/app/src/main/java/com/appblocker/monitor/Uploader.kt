@@ -59,6 +59,9 @@ object Uploader {
             .put("new_domains", JSONArray())
             .put("screen_time", screenTime)
             .put("screen_day", UsageCollector.today())
+            // Tamper signal: reported even by the watchdog when the service is
+            // off, so the dashboard can flag "monitoring turned off".
+            .put("accessibility_enabled", A11y.isEnabled(ctx))
     }
 
     private fun getSha(url: String, token: String): String? {

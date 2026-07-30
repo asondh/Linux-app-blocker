@@ -17,12 +17,18 @@ data class Visit(
  */
 class Store(ctx: Context) {
     private val file = File(ctx.applicationContext.filesDir, "visits.json")
-    private val lock = Any()
     private val max = 5000
     private val keepMs = 7L * 86400_000L
 
+    // One process-wide lock: several Store instances (service writer, uploader
+    // reader) share the same file, so the lock must be shared too — a per-
+    // instance lock would let them corrupt visits.json concurrently.
+    private companion object {
+        val LOCK = Any()
+    }
+
     fun addVisit(v: Visit) {
-        synchronized(lock) {
+        synchronized(LOCK) {
             val list = readList()
             // Skip an immediate duplicate (same domain+query as the last entry).
             val last = list.lastOrNull()
@@ -36,7 +42,7 @@ class Store(ctx: Context) {
         }
     }
 
-    fun snapshot(): List<Visit> = synchronized(lock) { readList() }
+    fun snapshot(): List<Visit> = synchronized(LOCK) { readList() }
 
     private fun readList(): MutableList<Visit> {
         if (!file.exists()) return mutableListOf()

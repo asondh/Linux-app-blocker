@@ -20,6 +20,7 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
         cfg = Config(this)
+        Watchdog.ensureScheduled(this)
 
         val child = findViewById<EditText>(R.id.child)
         val repo = findViewById<EditText>(R.id.repo)
