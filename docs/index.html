@@ -188,27 +188,12 @@
 
 <!-- Main dashboard -->
 <div id="app" class="wrap hidden">
-  <div class="filters">
-    <label class="col-m">Machine
-      <select id="fx-machine"><option>All machines</option></select>
-    </label>
-    <label>User
-      <select id="fx-user"><option>All users</option></select>
-    </label>
-    <label>From <input id="fx-from" type="date"></label>
-    <label>To <input id="fx-to" type="date"></label>
-    <label>Site contains <input id="fx-site" placeholder="e.g. youtube"></label>
-    <button id="fx-clear" class="ghost" style="align-self:flex-end;">Clear</button>
-  </div>
-
-  <div class="card" id="summary"></div>
-
   <div class="tabs">
     <button data-tab="controls">Controls</button>
-    <button data-tab="visits" class="active">Visits</button>
+    <button data-tab="visits">Visits</button>
     <button data-tab="searches">Searches</button>
     <button data-tab="newsites">New sites</button>
-    <button data-tab="time">Time per site</button>
+    <button data-tab="time" class="active">Time per site</button>
     <button data-tab="blocked">Blocked</button>
   </div>
 
@@ -218,7 +203,7 @@
     <div id="ctl-status"></div>
   </div>
 
-  <div class="card" id="panel-visits">
+  <div class="card hidden" id="panel-visits">
     <h2>Visits <span id="c-visits" class="muted"></span></h2>
     <div id="tb-visits"></div>
     <div id="e-visits" class="empty hidden">No visits match.</div>
@@ -243,7 +228,7 @@
     <div id="e-newsites" class="empty hidden">No new sites in this period.</div>
   </div>
 
-  <div class="card hidden" id="panel-time">
+  <div class="card" id="panel-time">
     <h2>Time per site (approx.) <span id="c-time" class="muted"></span></h2>
     <table><thead><tr>
       <th data-sort="user">User</th><th data-sort="visits">Visits</th>
@@ -256,6 +241,21 @@
     <h2>Blocked — apps &amp; sites <span id="c-blocked" class="muted"></span></h2>
     <div id="tb-blocked"></div>
     <div id="e-blocked" class="empty hidden">Nothing blocked.</div>
+  </div>
+
+  <div class="card" id="summary"></div>
+
+  <div class="filters">
+    <label class="col-m">Machine
+      <select id="fx-machine"><option>All machines</option></select>
+    </label>
+    <label>User
+      <select id="fx-user"><option>All users</option></select>
+    </label>
+    <label>From <input id="fx-from" type="date"></label>
+    <label>To <input id="fx-to" type="date"></label>
+    <label>Site contains <input id="fx-site" placeholder="e.g. youtube"></label>
+    <button id="fx-clear" class="ghost" style="align-self:flex-end;">Clear</button>
   </div>
 </div>
 
