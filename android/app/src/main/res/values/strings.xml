@@ -1,0 +1,8 @@
+<resources>
+    <string name="app_name">AppBlocker monitor</string>
+    <string name="accessibility_description">
+        Reads the browser address bar and search boxes to record which sites and
+        searches this device visits, so a parent can review them on the
+        AppBlocker dashboard.
+    </string>
+</resources>
