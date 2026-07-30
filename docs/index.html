@@ -80,6 +80,11 @@
                  font-size:12px; }
   .qx { display:inline-block; background:#eef2f7; color:#34495e; border-radius:10px;
         padding:0 7px; font-size:11px; font-weight:600; }
+  /* Time per site: rows expand (tap) to a per-user breakdown, reusing .qrow. */
+  .time-row { cursor:pointer; user-select:none; }
+  .time-row:hover { background:#f8f9fa; }
+  .time-row .tw { color:var(--muted); font-size:11px; display:inline-block; width:12px; }
+  .time-detail td { padding:2px 12px 8px 30px; background:#fbfcfc; }
   /* Blocked list: one stacked item per line so long site URLs never get
      crushed into a narrow column on a phone. */
   .brow { padding:9px 14px; border-bottom:1px solid var(--line); }
@@ -254,6 +259,7 @@ let SEL_CTL = null;            // Controls tab: selected machine id, or "*" = al
 let sortState = {};            // per-table sort
 let openSearch = new Set();    // Searches tab: which site groups are expanded
 let openVisits = new Set();    // Visits tab: which site groups are expanded
+let openTime = new Set();      // Time per site tab: which site rows are expanded
 let filtersInit = false;       // seed the default date range only once
 let lastId = 0;                // last command id we minted (keep them increasing)
 let SENT = {};                 // id -> {label, targets:[ids]} sent this session
@@ -435,20 +441,31 @@ function fmtDur(s){ const m=Math.floor(s/60);
 
 function computeDurations(rows){
   // gap-based, same as the app: sum gap to next visit by same user, capped.
+  // Bucketed by (domain, user) as well as domain alone, so each site's row
+  // can expand to show who accounted for the total.
   const byUser = {};
   rows.slice().sort((a,b)=>a.ts-b.ts).forEach(v=>{
     (byUser[v.u]=byUser[v.u]||[]).push(v); });
-  const secs={}, cnt={};
-  Object.values(byUser).forEach(list=>{
+  const sites={};   // domain -> {visits, secs, users:{user:{visits,secs,ms:Set}}}
+  Object.entries(byUser).forEach(([user,list])=>{
     list.forEach((v,i)=>{
-      cnt[v.d]=(cnt[v.d]||0)+1;
+      const site=sites[v.d]||(sites[v.d]={visits:0,secs:0,users:{}});
+      const u=site.users[user]||(site.users[user]={visits:0,secs:0,ms:new Set()});
       let dur=0;
       if(i+1<list.length) dur=Math.min(Math.max(0,list[i+1].ts-v.ts),IDLE_CAP);
-      secs[v.d]=(secs[v.d]||0)+dur;
+      site.visits++; site.secs+=dur;
+      u.visits++; u.secs+=dur;
+      if(v._m) u.ms.add(v._m);
     });
   });
-  return Object.keys(cnt).map(d=>({domain:d,visits:cnt[d],secs:secs[d]||0}))
-         .sort((a,b)=>b.secs-a.secs);
+  return Object.keys(sites).map(d=>{
+    const s=sites[d];
+    const users=Object.keys(s.users).map(user=>{
+      const u=s.users[user];
+      return {user, visits:u.visits, secs:u.secs, ms:[...u.ms]};
+    }).sort((a,b)=>b.secs-a.secs);
+    return {domain:d, visits:s.visits, secs:s.secs, users};
+  }).sort((a,b)=>b.secs-a.secs);
 }
 
 function sortRows(rows, table, keys){
@@ -591,12 +608,35 @@ function render(){
   $("c-newsites").textContent="("+nd.length+")";
   $("e-newsites").classList.toggle("hidden", nd.length>0);
 
-  // Time per site (aggregated across the filtered rows / selected machine)
+  // Time per site (aggregated across the filtered rows / selected machine).
+  // Tap a site row to expand a per-user breakdown of visits/approx. time.
   const durs = sortRows(computeDurations(rows), "time");
   const tbT=$("tb-time"); tbT.innerHTML="";
-  durs.forEach(d=>{ const tr=document.createElement("tr");
-    tr.innerHTML=`<td>${esc(d.domain)}</td><td>${d.visits}</td>`+
-                 `<td>${fmtDur(d.secs)}</td>`; tbT.appendChild(tr); });
+  const multiT=document.body.classList.contains("multi");
+  durs.forEach(d=>{
+    const open=openTime.has(d.domain);
+    const tr=document.createElement("tr");
+    tr.className="time-row"+(open?" open":"");
+    tr.innerHTML=`<td><span class="tw">${open?"▾":"▸"}</span> ${esc(d.domain)}</td>`+
+                 `<td>${d.visits}</td><td>${fmtDur(d.secs)}</td>`;
+    const dtr=document.createElement("tr");
+    dtr.className="time-detail"+(open?"":" hidden");
+    let dh="<td colspan=\"3\">";
+    d.users.forEach(u=>{
+      const who=(multiT&&u.ms.length)?" · "+u.ms.map(esc).join(", "):"";
+      dh+=`<div class="qrow"><span class="q">${esc(u.user)}</span>`+
+          `<span class="qmeta">${u.visits} visit${u.visits!=1?"s":""} · `+
+          `${fmtDur(u.secs)}${who}</span></div>`;
+    });
+    dtr.innerHTML=dh+"</td>";
+    tr.onclick=()=>{
+      if(openTime.has(d.domain)) openTime.delete(d.domain); else openTime.add(d.domain);
+      const nowOpen=tr.classList.toggle("open");
+      tr.querySelector(".tw").textContent=nowOpen?"▾":"▸";
+      dtr.classList.toggle("hidden");
+    };
+    tbT.appendChild(tr); tbT.appendChild(dtr);
+  });
   $("c-time").textContent="("+durs.length+")";
   $("e-time").classList.toggle("hidden", durs.length>0);
 
