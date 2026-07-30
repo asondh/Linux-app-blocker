@@ -219,6 +219,25 @@ The dashboard has filterable tables (by user / date range / site) for **visits**
 **searches**, and **time-per-site**. Everything stays private to your GitHub
 account and your browser; keep the tokens secret (both are revocable anytime).
 
+### Folding in TV screen time (TV Locker Guard)
+
+If you also run the [TV Locker](https://github.com/asondh/Tv-locker) Android
+app on a TV/set-top box, its daily screen time can show up on this same
+dashboard as its own **"TV"** card, alongside each kid's computer time — no
+changes to the dashboard page itself, since it already merges screen time
+from every machine that publishes to the `machines/` folder.
+
+1. Set up the Remote Dashboard above first (this reuses that same repo/token).
+2. In AppBlocker → **📊 Activity → 📺 TV Screen Time**, tick *Enable* and enter
+   the TV Locker server URL and sync token (the same values the Android app
+   uses to sync in its own Settings), then **Sync now** to confirm.
+
+This pulls the TV's latest snapshot and republishes it as `machines/tv.json` in
+the dashboard repo on the same opportunistic timer as the rest of the sync.
+It only reports today's total once the TV app has synced today — a TV that's
+been off since yesterday won't show a stale number. Terminal helper:
+`sudo appblocker --sync-tv-now`.
+
 ## Blocked-attempt alerts, digests, tamper alerts, adult blocklist
 
 - **Blocked-attempt log & alerts** — every time a child tries to open a blocked

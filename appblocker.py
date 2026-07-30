@@ -1601,6 +1601,7 @@ class HistoryMonitor(threading.Thread):
         self._newdom_sent = 0       # real-time new-domain emails sent today
         self._last_known_push = 0   # last household-ledger refresh (throttle)
         self._last_screen = None    # last screen-time sample time (epoch)
+        self._last_tv_sync = 0      # last TV Locker Guard bridge push
 
     def stop(self):
         self._stop.set()
@@ -1658,6 +1659,14 @@ class HistoryMonitor(threading.Thread):
                             sys.stderr.write(f"[sync] pushed {n} bytes\n")
                     except Exception as exc:
                         sys.stderr.write(f"[sync] failed: {exc}\n")
+                if now - self._last_tv_sync >= SYNC_INTERVAL:
+                    self._last_tv_sync = now
+                    try:
+                        n = self._push_tv_snapshot()
+                        if n:
+                            sys.stderr.write(f"[tv-sync] pushed {n} bytes\n")
+                    except Exception as exc:
+                        sys.stderr.write(f"[tv-sync] failed: {exc}\n")
             except Exception as exc:
                 sys.stderr.write(f"[monitor] sweep error: {exc}\n")
             self._stop.wait(MONITOR_HISTORY_INTERVAL)
@@ -1672,6 +1681,28 @@ class HistoryMonitor(threading.Thread):
                                  cmd_results=self._cmd_results,
                                  cmd_ts=store.get_state("__cmd_ts__") or 0)
         return push_reports_to_github(cfg, data)
+
+    def _push_tv_snapshot(self):
+        """Pull the TV Locker Guard Android app's latest screen-time snapshot
+        and republish it as machines/tv.json in the same dashboard repo, so it
+        shows up as its own card alongside this machine's. No-op unless both
+        the TV bridge and the dashboard sync itself are configured (it reuses
+        the dashboard's GitHub repo/token, just needs its own way to reach the
+        TV Locker web app)."""
+        with self.state.lock:
+            tv_cfg = dict(self.state.tv_sync)
+            sync_cfg = dict(self.state.sync)
+        if not (tv_cfg.get("enabled") and tv_cfg.get("server_url")
+                and tv_cfg.get("token")):
+            return 0
+        if not (sync_cfg.get("enabled") and sync_cfg.get("repo")
+                and sync_cfg.get("token")):
+            return 0
+        snapshot = fetch_tv_snapshot(tv_cfg)
+        data = build_tv_report_data(tv_cfg, snapshot)
+        if data is None:
+            return 0    # nothing synced yet today, nothing new to publish
+        return push_tv_snapshot_to_github(sync_cfg, data)
 
     def _poll_commands(self, store):
         """Fetch, apply, and record any new remote-control commands."""
@@ -2100,14 +2131,13 @@ def _gh_request(url, token, method="GET", body=None):
         return json.loads(resp.read().decode("utf-8"))
 
 
-def push_reports_to_github(cfg, data):
+def push_json_to_github(cfg, path, data, commit_message):
     """
-    PUT data.json into the configured private repo. cfg keys: repo (owner/name),
-    branch, path, token. Raises on failure.
+    PUT `data` as JSON to `path` in the configured private repo. cfg keys: repo
+    (owner/name), branch, token. Raises on failure.
     """
     repo = cfg.get("repo", "").strip()
     token = cfg.get("token", "").strip()
-    path = machine_data_path(cfg)   # machines/<this-host>.json — never clobbers others
     branch = cfg.get("branch", "main").strip() or "main"
     if not repo or not token:
         raise ValueError("Dashboard repo and token are required.")
@@ -2121,7 +2151,7 @@ def push_reports_to_github(cfg, data):
             raise
     payload = json.dumps(data, separators=(",", ":")).encode("utf-8")
     body = {
-        "message": f"Update activity {data.get('generated_at_str', '')}",
+        "message": commit_message,
         "content": base64.b64encode(payload).decode("ascii"),
         "branch": branch,
     }
@@ -2129,6 +2159,87 @@ def push_reports_to_github(cfg, data):
         body["sha"] = sha
     _gh_request(api, token, method="PUT", body=body)
     return len(payload)
+
+
+def push_reports_to_github(cfg, data):
+    """
+    PUT data.json into the configured private repo. cfg keys: repo (owner/name),
+    branch, path, token. Raises on failure.
+    """
+    path = machine_data_path(cfg)   # machines/<this-host>.json — never clobbers others
+    return push_json_to_github(
+        cfg, path, data, f"Update activity {data.get('generated_at_str', '')}")
+
+
+# Fixed pseudo-machine id for the TV Locker Guard Android app's screen-time
+# snapshot, so it lands in its own dashboard card ("TV") regardless of which
+# Linux machine's daemon does the bridging (the TV has no OS user of its own,
+# so it can't just merge into a machine_id()-keyed file).
+TV_MACHINE_ID = "tv"
+
+
+def tv_data_path(cfg):
+    """Where the TV Locker Guard snapshot is published — machines/tv.json."""
+    return f"{_sync_base_dir(cfg)}machines/{TV_MACHINE_ID}.json"
+
+
+def fetch_tv_snapshot(tv_cfg, timeout=15):
+    """
+    GET the latest snapshot from the TV Locker web app's /api/guard/sync
+    endpoint (bearer-token protected, same token the Android app uses to
+    POST). Returns the `snapshot` dict ({payload, updatedAt}), or None if
+    nothing has been synced yet. Raises on network/HTTP/auth failure.
+    """
+    base_url = tv_cfg.get("server_url", "").strip().rstrip("/")
+    token = tv_cfg.get("token", "").strip()
+    if not base_url or not token:
+        raise ValueError("TV Locker server URL and token are required.")
+    req = urllib.request.Request(
+        f"{base_url}/api/guard/sync",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        obj = json.loads(resp.read().decode("utf-8"))
+    return obj.get("snapshot")
+
+
+def build_tv_report_data(tv_cfg, snapshot):
+    """
+    Turn a TV Locker Guard snapshot into a machines/tv.json payload, matching
+    the shape build_report_data() produces so the dashboard's generic
+    per-machine merge (screen_time, users, etc.) picks it up with no dashboard
+    changes. Returns None if there's no snapshot yet, or if the device's own
+    "today" total is stale (the TV hasn't synced since local midnight, so
+    accumulatedMinutesToday reflects a previous day, not today) -- same
+    stale-day guard the dashboard already applies per-machine.
+    """
+    if not snapshot:
+        return None
+    payload = snapshot.get("payload") or {}
+    device_generated_at = str(payload.get("deviceGeneratedAt", ""))
+    today = time.strftime("%Y-%m-%d", time.localtime())
+    if device_generated_at[:10] != today:
+        return None    # stale -- TV hasn't synced today, don't report yesterday's total
+    label = (tv_cfg.get("label") or "TV").strip() or "TV"
+    minutes = int(payload.get("accumulatedMinutesToday") or 0)
+    now = time.time()
+    return {
+        "generated_at": int(now),
+        "generated_at_str": time.strftime("%Y-%m-%d %H:%M", time.localtime(now)),
+        "machine": label,
+        "machine_id": TV_MACHINE_ID,
+        "screen_time": {label: max(0, minutes) * 60},
+        "screen_day": today,
+    }
+
+
+def push_tv_snapshot_to_github(sync_cfg, tv_data):
+    """PUT the TV screen-time snapshot to machines/tv.json in the same repo
+    the dashboard already syncs to. `sync_cfg` is state.sync (repo/branch/
+    token) -- the TV bridge reuses that GitHub config, it just needs its own
+    server_url/token for reaching the TV Locker web app."""
+    return push_json_to_github(
+        sync_cfg, tv_data_path(sync_cfg),
+        tv_data, f"Update TV screen time {tv_data.get('generated_at_str', '')}")
 
 
 # --------------------------------------------------------------------------- #
@@ -2854,6 +2965,7 @@ class AppState:
         self.monitor = self._default_monitor()  # website-visit monitoring config
         self.lockdown = {"enabled": False}      # browser incognito lockdown
         self.sync = self._default_sync()        # remote dashboard (GitHub) sync
+        self.tv_sync = self._default_tv_sync()  # TV Locker Guard screen-time bridge
         self.block_adult = False                # built-in adult-content blocklist
         self.web_schedules = []                 # scheduled website blocks (downtime)
         # "Distractions": sites blocked by default (machine-wide) that the parent
@@ -2878,6 +2990,21 @@ class AppState:
             for k in ("repo", "branch", "path", "token"):
                 if value.get(k):
                     cfg[k] = str(value[k]).strip()
+        return cfg
+
+    @staticmethod
+    def _default_tv_sync():
+        return {"enabled": False, "server_url": "", "token": "", "label": "TV"}
+
+    def _normalize_tv_sync(self, value):
+        cfg = self._default_tv_sync()
+        if isinstance(value, dict):
+            cfg["enabled"] = bool(value.get("enabled"))
+            for k in ("server_url", "token", "label"):
+                if value.get(k):
+                    cfg[k] = str(value[k]).strip()
+            if not cfg["label"]:
+                cfg["label"] = "TV"
         return cfg
 
     @staticmethod
@@ -3067,6 +3194,7 @@ class AppState:
             self.lockdown = {"enabled": bool(
                 (data.get("lockdown") or {}).get("enabled"))}
             self.sync = self._normalize_sync(data.get("sync"))
+            self.tv_sync = self._normalize_tv_sync(data.get("tv_sync"))
             self.block_adult = bool(data.get("block_adult"))
             self.web_schedules = self._normalize_web_schedules(
                 data.get("web_schedules"))
@@ -3079,6 +3207,7 @@ class AppState:
             self.monitor = self._default_monitor()
             self.lockdown = {"enabled": False}
             self.sync = self._default_sync()
+            self.tv_sync = self._default_tv_sync()
             self.block_adult = False
             self.web_schedules = []
             self.distractions = []
@@ -3105,6 +3234,7 @@ class AppState:
                 self.lockdown = {"enabled": bool(
                     (data.get("lockdown") or {}).get("enabled"))}
                 self.sync = self._normalize_sync(data.get("sync"))
+                self.tv_sync = self._normalize_tv_sync(data.get("tv_sync"))
                 self.block_adult = bool(data.get("block_adult"))
                 self.web_schedules = self._normalize_web_schedules(
                     data.get("web_schedules"))
@@ -3123,6 +3253,7 @@ class AppState:
                                  "monitor": self.monitor,
                                  "lockdown": self.lockdown,
                                  "sync": self.sync,
+                                 "tv_sync": self.tv_sync,
                                  "block_adult": self.block_adult,
                                  "web_schedules": self.web_schedules,
                                  "distractions": self.distractions,
@@ -3273,6 +3404,12 @@ class AppState:
             self.sync = self._normalize_sync(cfg)
             self.save_locked()
             return dict(self.sync)
+
+    def set_tv_sync(self, cfg):
+        with self.lock:
+            self.tv_sync = self._normalize_tv_sync(cfg)
+            self.save_locked()
+            return dict(self.tv_sync)
 
     def set_block_adult(self, enabled):
         with self.lock:
@@ -4310,6 +4447,98 @@ class AppBlockerUI:
         tk.Button(bar, text="Cancel", command=win.destroy, relief="flat",
                   padx=12, pady=6, cursor="hand2").pack(side="left")
 
+    def tv_sync_dialog(self):
+        with self.state.lock:
+            cfg = dict(self.state.tv_sync)
+        win = tk.Toplevel(self.root)
+        win.title("TV Screen Time")
+        win.configure(bg=COLOR_BG)
+        win.geometry("520x460")
+        win.minsize(440, 360)
+        self._present(win)
+
+        bar = tk.Frame(win, bg=COLOR_BG)
+        bar.pack(side="bottom", fill="x", padx=16, pady=14)
+        body = self._scroll_body(win)
+
+        tk.Label(body, text="📺 TV Screen Time", bg=COLOR_BG, fg=COLOR_HEADER,
+                 font=("Helvetica", 14, "bold")).pack(pady=(14, 2))
+        tk.Label(body, text="Folds the TV Locker Guard Android app's daily "
+                 "screen time into this dashboard as its own card, alongside "
+                 "the computer time above. Reuses the Remote Dashboard's "
+                 "GitHub repo/token above — configure that first.",
+                 bg=COLOR_BG, fg="#7f8c8d", wraplength=470,
+                 justify="left").pack(padx=16, pady=(0, 8))
+
+        enabled = tk.BooleanVar(value=cfg.get("enabled", False))
+        tk.Checkbutton(body, text="Enable TV screen-time bridge",
+                       variable=enabled, bg=COLOR_BG,
+                       font=("Helvetica", 11, "bold")).pack(anchor="w", padx=16)
+
+        form = tk.Frame(body, bg=COLOR_BG)
+        form.pack(fill="x", padx=16, pady=(6, 0))
+        fields = [("TV Locker server URL", "server_url"),
+                  ("Sync token", "token"), ("Dashboard label", "label")]
+        vars_ = {}
+        for i, (label, key) in enumerate(fields):
+            tk.Label(form, text=label + ":", bg=COLOR_BG).grid(
+                row=i, column=0, sticky="w", pady=3)
+            v = tk.StringVar(value=str(cfg.get(key, "") or ""))
+            show = "*" if key == "token" else None
+            tk.Entry(form, textvariable=v, width=34, show=show).grid(
+                row=i, column=1, sticky="we", pady=3)
+            vars_[key] = v
+        form.columnconfigure(1, weight=1)
+        tk.Label(body, text="Server URL and token: the same self-hosted TV "
+                 "Locker app URL and GUARD_SYNC_TOKEN the Android app already "
+                 "uses to sync (Settings on the device). Label: how the TV "
+                 "shows up on the dashboard (defaults to \"TV\").",
+                 bg=COLOR_BG, fg="#7f8c8d", wraplength=470,
+                 justify="left").pack(padx=16, pady=(6, 0))
+
+        status = tk.Label(body, text="", bg=COLOR_BG, fg=COLOR_HEADER,
+                          wraplength=470, justify="left")
+        status.pack(padx=16, pady=(8, 0))
+
+        def collect():
+            return {"enabled": enabled.get(),
+                    "server_url": vars_["server_url"].get().strip(),
+                    "token": vars_["token"].get().strip(),
+                    "label": vars_["label"].get().strip() or "TV"}
+
+        def save():
+            self.state.set_tv_sync(collect())
+            messagebox.showinfo("Saved", "TV screen-time settings saved.",
+                                parent=win)
+            win.destroy()
+
+        def sync_now():
+            self.state.set_tv_sync(collect())
+            with self.state.lock:
+                sync_cfg = dict(self.state.sync)
+            status.config(text="Pulling…")
+            win.update_idletasks()
+            try:
+                snapshot = fetch_tv_snapshot(collect())
+                data = build_tv_report_data(collect(), snapshot)
+                if data is None:
+                    status.config(text="No fresh snapshot from the TV today "
+                                        "yet — nothing to push.")
+                    return
+                n = push_tv_snapshot_to_github(sync_cfg, data)
+                status.config(text=f"✓ Pushed {n} bytes.")
+            except Exception as exc:
+                status.config(text=f"✗ {exc}")
+
+        tk.Button(bar, text="Save", command=save, bg=COLOR_ACTIVE, fg="white",
+                  relief="flat", padx=16, pady=6, cursor="hand2").pack(
+                      side="right")
+        tk.Button(bar, text="Sync now", command=sync_now, bg=COLOR_ACCENT,
+                  fg="white", relief="flat", padx=12, pady=6,
+                  cursor="hand2").pack(side="right", padx=8)
+        tk.Button(bar, text="Cancel", command=win.destroy, relief="flat",
+                  padx=12, pady=6, cursor="hand2").pack(side="left")
+
     def activity_dialog(self):
         store = HistoryStore()
         win = tk.Toplevel(self.root)
@@ -4442,6 +4671,9 @@ class AppBlockerUI:
                   cursor="hand2").pack(side="left")
         tk.Button(bar, text="☁ Remote Dashboard…", command=self.sync_dialog,
                   bg="#8e44ad", fg="white", relief="flat", padx=12, pady=6,
+                  cursor="hand2").pack(side="left", padx=8)
+        tk.Button(bar, text="📺 TV Screen Time…", command=self.tv_sync_dialog,
+                  bg="#2980b9", fg="white", relief="flat", padx=12, pady=6,
                   cursor="hand2").pack(side="left", padx=8)
         tk.Button(bar, text="Refresh now", command=lambda: (
             self._import_history_now(), refresh()), relief="flat",
@@ -5639,9 +5871,13 @@ def main():
         "--sync-now", action="store_true",
         help="build and push the remote dashboard data to GitHub once")
     parser.add_argument(
+        "--sync-tv-now", action="store_true",
+        help="pull the TV Locker Guard app's screen time and push it to the "
+             "dashboard repo once")
+    parser.add_argument(
         "--export-settings", metavar="FILE",
         help="save all settings (apps, rules, websites, email, dashboard, "
-             "password) to FILE, to copy to another machine")
+             "TV bridge, password) to FILE, to copy to another machine")
     parser.add_argument(
         "--import-settings", metavar="FILE",
         help="load settings previously saved with --export-settings")
@@ -5665,6 +5901,30 @@ def main():
             print(f"Pushed {n} bytes to {st.sync['repo']}.")
         except Exception as exc:
             print(f"Sync failed: {exc}")
+        return
+
+    if args.sync_tv_now:
+        configure_paths(system_mode=True)
+        st = AppState()
+        if not st.tv_sync.get("server_url") or not st.tv_sync.get("token"):
+            print("No TV screen-time settings saved. Configure them in the "
+                  "app first.")
+            return
+        if not st.sync.get("repo") or not st.sync.get("token"):
+            print("No dashboard settings saved. Configure them in the app "
+                  "first — the TV bridge publishes into that same repo.")
+            return
+        try:
+            snapshot = fetch_tv_snapshot(st.tv_sync)
+            data = build_tv_report_data(st.tv_sync, snapshot)
+            if data is None:
+                print("No fresh snapshot from the TV today yet — nothing to "
+                      "push.")
+                return
+            n = push_tv_snapshot_to_github(st.sync, data)
+            print(f"Pushed {n} bytes to {st.sync['repo']}.")
+        except Exception as exc:
+            print(f"TV sync failed: {exc}")
         return
 
     if args.email_test:
