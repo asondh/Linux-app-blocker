@@ -80,7 +80,7 @@
                  font-size:12px; }
   .qx { display:inline-block; background:#eef2f7; color:#34495e; border-radius:10px;
         padding:0 7px; font-size:11px; font-weight:600; }
-  /* Time per site: rows expand (tap) to a per-user breakdown, reusing .qrow. */
+  /* Time per site: rows expand (tap) to a per-site breakdown, reusing .qrow. */
   .time-row { cursor:pointer; user-select:none; }
   .time-row:hover { background:#f8f9fa; }
   .time-row .tw { color:var(--muted); font-size:11px; display:inline-block; width:12px; }
@@ -238,7 +238,7 @@
   <div class="card hidden" id="panel-time">
     <h2>Time per site (approx.) <span id="c-time" class="muted"></span></h2>
     <table><thead><tr>
-      <th data-sort="domain">Site</th><th data-sort="visits">Visits</th>
+      <th data-sort="user">User</th><th data-sort="visits">Visits</th>
       <th data-sort="secs">Approx. time</th></tr></thead>
       <tbody id="tb-time"></tbody></table>
     <div id="e-time" class="empty hidden">No data.</div>
@@ -261,7 +261,7 @@ let SEL_CTL = null;            // Controls tab: selected machine id, or "*" = al
 let sortState = {};            // per-table sort
 let openSearch = new Set();    // Searches tab: which site groups are expanded
 let openVisits = new Set();    // Visits tab: which site groups are expanded
-let openTime = new Set();      // Time per site tab: which site rows are expanded
+let openTime = new Set();      // Time per site tab: which user rows are expanded
 let filtersInit = false;       // seed the default date range only once
 let lastId = 0;                // last command id we minted (keep them increasing)
 let SENT = {};                 // id -> {label, targets:[ids]} sent this session
@@ -458,30 +458,27 @@ function fmtDur(s){ const m=Math.floor(s/60);
 
 function computeDurations(rows){
   // gap-based, same as the app: sum gap to next visit by same user, capped.
-  // Bucketed by (domain, user) as well as domain alone, so each site's row
-  // can expand to show who accounted for the total.
+  // Grouped by user first, each with a per-site breakdown, so a user's row
+  // can expand to show which sites made up their total.
   const byUser = {};
   rows.slice().sort((a,b)=>a.ts-b.ts).forEach(v=>{
     (byUser[v.u]=byUser[v.u]||[]).push(v); });
-  const sites={};   // domain -> {visits, secs, users:{user:{visits,secs,ms:Set}}}
-  Object.entries(byUser).forEach(([user,list])=>{
+  return Object.entries(byUser).map(([user,list])=>{
+    const sites={};   // domain -> {visits, secs, ms:Set}
+    let visits=0, secs=0;
     list.forEach((v,i)=>{
-      const site=sites[v.d]||(sites[v.d]={visits:0,secs:0,users:{}});
-      const u=site.users[user]||(site.users[user]={visits:0,secs:0,ms:new Set()});
+      const s=sites[v.d]||(sites[v.d]={visits:0,secs:0,ms:new Set()});
       let dur=0;
       if(i+1<list.length) dur=Math.min(Math.max(0,list[i+1].ts-v.ts),IDLE_CAP);
-      site.visits++; site.secs+=dur;
-      u.visits++; u.secs+=dur;
-      if(v._m) u.ms.add(v._m);
+      visits++; secs+=dur;
+      s.visits++; s.secs+=dur;
+      if(v._m) s.ms.add(v._m);
     });
-  });
-  return Object.keys(sites).map(d=>{
-    const s=sites[d];
-    const users=Object.keys(s.users).map(user=>{
-      const u=s.users[user];
-      return {user, visits:u.visits, secs:u.secs, ms:[...u.ms]};
+    const siteList=Object.keys(sites).map(domain=>{
+      const s=sites[domain];
+      return {domain, visits:s.visits, secs:s.secs, ms:[...s.ms]};
     }).sort((a,b)=>b.secs-a.secs);
-    return {domain:d, visits:s.visits, secs:s.secs, users};
+    return {user, visits, secs, sites:siteList};
   }).sort((a,b)=>b.secs-a.secs);
 }
 
@@ -641,28 +638,32 @@ function render(){
   $("e-newsites").classList.toggle("hidden", nd.length>0);
 
   // Time per site (aggregated across the filtered rows / selected machine).
-  // Tap a site row to expand a per-user breakdown of visits/approx. time.
+  // Tap a user row to expand a per-site breakdown of visits/approx. time;
+  // the user's combined total across every site sits right next to their
+  // name, separate from "on computer" screen time (which counts all activity,
+  // not just browsing).
   const durs = sortRows(computeDurations(rows), "time");
   const tbT=$("tb-time"); tbT.innerHTML="";
   const multiT=document.body.classList.contains("multi");
   durs.forEach(d=>{
-    const open=openTime.has(d.domain);
+    const open=openTime.has(d.user);
     const tr=document.createElement("tr");
     tr.className="time-row"+(open?" open":"");
-    tr.innerHTML=`<td><span class="tw">${open?"▾":"▸"}</span> ${esc(d.domain)}</td>`+
+    tr.innerHTML=`<td><span class="tw">${open?"▾":"▸"}</span> ${esc(d.user)} `+
+                 `<span class="muted">(${fmtDur(d.secs)})</span></td>`+
                  `<td>${d.visits}</td><td>${fmtDur(d.secs)}</td>`;
     const dtr=document.createElement("tr");
     dtr.className="time-detail"+(open?"":" hidden");
     let dh="<td colspan=\"3\">";
-    d.users.forEach(u=>{
-      const who=(multiT&&u.ms.length)?" · "+u.ms.map(esc).join(", "):"";
-      dh+=`<div class="qrow"><span class="q">${esc(u.user)}</span>`+
-          `<span class="qmeta">${u.visits} visit${u.visits!=1?"s":""} · `+
-          `${fmtDur(u.secs)}${who}</span></div>`;
+    d.sites.forEach(s=>{
+      const who=(multiT&&s.ms.length)?" · "+s.ms.map(esc).join(", "):"";
+      dh+=`<div class="qrow"><span class="q">${esc(s.domain)}</span>`+
+          `<span class="qmeta">${s.visits} visit${s.visits!=1?"s":""} · `+
+          `${fmtDur(s.secs)}${who}</span></div>`;
     });
     dtr.innerHTML=dh+"</td>";
     tr.onclick=()=>{
-      if(openTime.has(d.domain)) openTime.delete(d.domain); else openTime.add(d.domain);
+      if(openTime.has(d.user)) openTime.delete(d.user); else openTime.add(d.user);
       const nowOpen=tr.classList.toggle("open");
       tr.querySelector(".tw").textContent=nowOpen?"▾":"▸";
       dtr.classList.toggle("hidden");
