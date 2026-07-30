@@ -216,6 +216,40 @@ def list_human_users():
     return sorted(users.items(), key=lambda kv: kv[0].lower())
 
 
+def active_screen_users():
+    """
+    Usernames with an active *local graphical* session right now (best-effort,
+    via systemd-logind). "Active" means the foreground session on its seat, so
+    it counts real screen-on time — including sitting idle — but not background
+    sessions the user switched away from, nor remote/SSH logins. Returns an
+    empty set when logind isn't available (the feature just records nothing).
+    """
+    users = set()
+    try:
+        out = subprocess.run(["loginctl", "list-sessions", "--no-legend"],
+                             capture_output=True, text=True, timeout=5)
+        session_ids = [ln.split()[0] for ln in out.stdout.splitlines()
+                       if ln.split()]
+        for sid in session_ids:
+            p = subprocess.run(
+                ["loginctl", "show-session", sid, "-p", "Name", "-p", "Active",
+                 "-p", "Remote", "-p", "Type"],
+                capture_output=True, text=True, timeout=5)
+            props = {}
+            for ln in p.stdout.splitlines():
+                if "=" in ln:
+                    k, v = ln.split("=", 1)
+                    props[k] = v
+            if (props.get("Active") == "yes" and props.get("Remote") == "no"
+                    and props.get("Type") in ("x11", "wayland", "mir")):
+                name = props.get("Name")
+                if name:
+                    users.add(name)
+    except Exception:
+        pass
+    return users
+
+
 def usernames_to_uids(names):
     """Map a list of usernames to a set of UIDs, skipping unknown names."""
     uids = set()
@@ -880,7 +914,12 @@ class HistoryStore:
                 " PRIMARY KEY(username, domain));"
                 "CREATE TABLE IF NOT EXISTS new_domain_events ("
                 " username TEXT, domain TEXT, ts INTEGER);"
-                "CREATE INDEX IF NOT EXISTS i_newdom_ts ON new_domain_events(ts);")
+                "CREATE INDEX IF NOT EXISTS i_newdom_ts ON new_domain_events(ts);"
+                # Per-user "computer on" seconds, bucketed by local day. Purely
+                # additive; independent of the visit log.
+                "CREATE TABLE IF NOT EXISTS screen_time ("
+                " username TEXT, day TEXT, seconds INTEGER,"
+                " PRIMARY KEY(username, day));")
             conn.commit()
         finally:
             conn.close()
@@ -1058,6 +1097,32 @@ class HistoryStore:
                 "ON CONFLICT(source) DO UPDATE SET last=excluded.last",
                 (key, int(value)))
             conn.commit()
+        finally:
+            conn.close()
+
+    # -- screen-on time ----------------------------------------------------- #
+    def add_screen_time(self, username, day, seconds):
+        """Add `seconds` of active screen time to (username, day)."""
+        if seconds <= 0:
+            return
+        conn = self._connect()
+        try:
+            conn.execute(
+                "INSERT INTO screen_time(username,day,seconds) VALUES(?,?,?) "
+                "ON CONFLICT(username,day) DO UPDATE SET "
+                "seconds=seconds+excluded.seconds",
+                (username, day, int(seconds)))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def screen_seconds(self, day):
+        """Return {username: seconds} of screen-on time recorded for `day`."""
+        conn = self._connect()
+        try:
+            return {u: int(s) for u, s in conn.execute(
+                "SELECT username, seconds FROM screen_time WHERE day=?",
+                (day,)).fetchall()}
         finally:
             conn.close()
 
@@ -1535,9 +1600,25 @@ class HistoryMonitor(threading.Thread):
         self._newdom_day = ""       # calendar day of the real-time email counter
         self._newdom_sent = 0       # real-time new-domain emails sent today
         self._last_known_push = 0   # last household-ledger refresh (throttle)
+        self._last_screen = None    # last screen-time sample time (epoch)
 
     def stop(self):
         self._stop.set()
+
+    def _sample_screen_time(self, store):
+        """Accrue per-user 'computer on' time for whoever has an active local
+        session. Adds the elapsed interval since the last sample, clamped so a
+        suspend/resume or a long stall doesn't dump a huge block onto anyone."""
+        now = time.time()
+        last, self._last_screen = self._last_screen, now
+        if last is None:
+            return                       # first tick just seeds the clock
+        delta = now - last
+        if delta <= 0 or delta > 3 * MONITOR_HISTORY_INTERVAL:
+            return                       # clock jump / resume from suspend
+        day = time.strftime("%Y-%m-%d", time.localtime(now))
+        for user in active_screen_users():
+            store.add_screen_time(user, day, int(round(delta)))
 
     def run(self):
         store = self.store or HistoryStore()
@@ -1560,6 +1641,7 @@ class HistoryMonitor(threading.Thread):
                 # same visit log, records events + optional real-time email).
                 self._maybe_new_domain_alert(store)
                 store.set_state("__heartbeat__", int(time.time()))
+                self._sample_screen_time(store)
                 self._maybe_digest(store)
                 self._maybe_new_domain_digest(store)
                 self._maybe_prune(store)
@@ -1900,7 +1982,12 @@ def build_report_data(store, days=REPORT_DAYS, limit=REPORT_LIMIT,
     except Exception:
         machine = ""
     now = time.time()
-    users = sorted(set(store.users()) | {a["u"] for a in attempts})
+    # Per-user "computer on" seconds for today (this machine's local day), so
+    # the dashboard can show gross screen time regardless of what they did.
+    screen_time = store.screen_seconds(time.strftime("%Y-%m-%d",
+                                                      time.localtime(now)))
+    users = sorted(set(store.users()) | {a["u"] for a in attempts}
+                   | set(screen_time))
     # New-domain novelty events in the window (sites the child had never
     # visited, or hadn't visited in a while). Newest first.
     win_start = int(now - days * 86400)
@@ -1919,6 +2006,8 @@ def build_report_data(store, days=REPORT_DAYS, limit=REPORT_LIMIT,
         "visits": visits,
         "attempts": attempts,
         "new_domains": new_domains,
+        "screen_time": screen_time,
+        "screen_day": time.strftime("%Y-%m-%d", time.localtime(now)),
         "control_results": list(cmd_results or []),
         "cmd_ts": int(cmd_ts or 0),
     }

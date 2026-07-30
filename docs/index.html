@@ -94,6 +94,9 @@
   #summary .su { flex:1 1 170px; min-width:150px; background:#f8f9fa;
                  border:1px solid var(--line); border-radius:8px; padding:9px 11px; }
   #summary .su .who { font-weight:600; margin-bottom:5px; }
+  #summary .su .screen { font-size:12px; color:var(--muted); margin-bottom:6px;
+                 padding-bottom:6px; border-bottom:1px solid var(--line); }
+  #summary .su .screen b { color:var(--accent,#2d7ff9); font-size:15px; }
   #summary .su .stat { font-size:12px; color:var(--muted); line-height:1.7; }
   #summary .su .stat b { color:#2c3e50; font-size:14px; }
   #summary .su-empty { color:var(--muted); font-size:13px; padding:4px 2px; }
@@ -299,8 +302,13 @@ async function ghGetRaw(path){
   if(!res.ok) throw new Error("GitHub " + res.status);
   return JSON.parse(await res.text());
 }
+function todayStr(){ const d=new Date();
+  return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+
+         String(d.getDate()).padStart(2,"0"); }
 function mergeMachines(){
   const visits=[], attempts=[], blocked_sites=[], new_domains=[], users=new Set();
+  const screen_time={};                 // user -> seconds on a computer today
+  const today=todayStr();
   MACHINES.forEach(m => {
     const nm = m.name;
     (m.data.visits||[]).forEach(v => visits.push(Object.assign({_m:nm}, v)));
@@ -308,8 +316,15 @@ function mergeMachines(){
     (m.data.blocked_sites||[]).forEach(s => { blocked_sites.push(Object.assign({_m:nm}, s)); users.add(s.u); });
     (m.data.new_domains||[]).forEach(n => { new_domains.push(Object.assign({_m:nm}, n)); users.add(n.u); });
     (m.data.users||[]).forEach(u => users.add(u));
+    // Screen-on time counts only if this machine's tally is for the current
+    // local day — a stale/offline machine won't inflate "today".
+    if(m.data.screen_day===today && m.data.screen_time){
+      Object.entries(m.data.screen_time).forEach(([u,s])=>{
+        screen_time[u]=(screen_time[u]||0)+(+s||0); users.add(u); });
+    }
   });
-  DATA = { visits, attempts, blocked_sites, new_domains, users:[...users].sort(),
+  DATA = { visits, attempts, blocked_sites, new_domains, screen_time,
+           users:[...users].sort(),
            machines: MACHINES.map(m=>({id:m.id, name:m.name})),
            truncated: MACHINES.some(m=>m.data.truncated) };
 }
@@ -506,8 +521,9 @@ function renderSummary(){
   const N=(DATA.new_domains||[]).filter(n=>n.ts>=t0);
   const A=(DATA.attempts||[]).filter(a=>a.ts>=t0);
   const BS=(DATA.blocked_sites||[]).filter(s=>s.ts>=t0);
+  const S=DATA.screen_time||{};
   const users=[...new Set([].concat(V.map(v=>v.u),N.map(n=>n.u),
-                A.map(a=>a.u),BS.map(s=>s.u)))].filter(Boolean).sort();
+                A.map(a=>a.u),BS.map(s=>s.u),Object.keys(S)))].filter(Boolean).sort();
   let h=`<div class="su-title">Today so far</div>`;
   if(!users.length){ el.innerHTML=h+`<div class="su-empty">No activity yet today.</div>`; return; }
   h+=`<div class="su-row">`;
@@ -516,7 +532,11 @@ function renderSummary(){
     const searches=uv.filter(v=>v.q).length, pages=uv.length;
     const news=N.filter(n=>n.u===u).length;
     const blocked=A.filter(a=>a.u===u).length + BS.filter(s=>s.u===u).length;
-    h+=`<div class="su"><div class="who">${esc(u)}</div><div class="stat">`+
+    const secs=S[u]||0;
+    h+=`<div class="su"><div class="who">${esc(u)}</div>`+
+       `<div class="screen" title="Total time logged in at a computer today, `+
+       `regardless of activity">🖥️ <b>${fmtDur(secs)}</b> on computer</div>`+
+       `<div class="stat">`+
        `<b>${pages}</b> page${pages!=1?"s":""} · `+
        `<b>${searches}</b> search${searches!=1?"es":""}<br>`+
        `<b>${news}</b> new site${news!=1?"s":""}`+
@@ -524,6 +544,12 @@ function renderSummary(){
   });
   el.innerHTML=h+`</div>`;
 }
+// Humanise a duration in seconds → "2h 5m" / "45m" / "<1m" / "0m".
+function fmtDur(sec){ sec=Math.max(0,Math.round(sec||0));
+  if(sec===0) return "0m";
+  if(sec<60) return "<1m";
+  const h=Math.floor(sec/3600), m=Math.round((sec%3600)/60);
+  return h ? (h+"h "+m+"m") : (m+"m"); }
 
 function render(){
   const rows = activeRows();
