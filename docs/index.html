@@ -105,6 +105,8 @@
   #summary .su .stat { font-size:12px; color:var(--muted); line-height:1.7; }
   #summary .su .stat b { color:#2c3e50; font-size:14px; }
   #summary .su-empty { color:var(--muted); font-size:13px; padding:4px 2px; }
+  #summary .mon-alert { background:#fdecea; color:#922b21; border:1px solid #f5c6cb;
+                 border-radius:8px; padding:8px 11px; margin:0 0 8px; font-size:13px; }
   /* Controls tab */
   .ctl-sec { padding:12px 14px; border-bottom:1px solid var(--line); }
   .ctl-sec:last-child { border-bottom:0; }
@@ -329,7 +331,23 @@ function mergeMachines(){
         screen_time[u]=(screen_time[u]||0)+(+s||0); users.add(u); });
     }
   });
-  DATA = { visits, attempts, blocked_sites, new_domains, screen_time,
+  // Monitoring-health alerts. A device that reports accessibility_enabled:false
+  // was actively turned off (the watchdog still reported) — the crisp tamper
+  // signal. A monitored device (one that reports the flag at all) that hasn't
+  // updated in >45m is flagged as possibly-off. Computers don't send the flag,
+  // so they never trip this (a PC that's simply powered off isn't "tampered").
+  const nowS=Date.now()/1000, monAlerts=[];
+  MACHINES.forEach(m=>{
+    const d=m.data||{};
+    if(d.accessibility_enabled===false){
+      monAlerts.push({name:m.name, why:"monitoring turned OFF"});
+    } else if(d.accessibility_enabled===true && d.generated_at &&
+              nowS - d.generated_at > 2700){
+      monAlerts.push({name:m.name,
+        why:"no update in "+Math.round((nowS-d.generated_at)/60)+" min"});
+    }
+  });
+  DATA = { visits, attempts, blocked_sites, new_domains, screen_time, monAlerts,
            users:[...users].sort(),
            machines: MACHINES.map(m=>({id:m.id, name:m.name})),
            truncated: MACHINES.some(m=>m.data.truncated) };
@@ -541,7 +559,11 @@ function renderSummary(){
   const S=DATA.screen_time||{};
   const users=[...new Set([].concat(V.map(v=>v.u),N.map(n=>n.u),
                 A.map(a=>a.u),BS.map(s=>s.u),Object.keys(S)))].filter(Boolean).sort();
-  let h=`<div class="su-title">Today so far</div>`;
+  let h="";
+  (DATA.monAlerts||[]).forEach(a=>{
+    h+=`<div class="mon-alert">⚠️ <b>${esc(a.name)}</b> — ${esc(a.why)}</div>`;
+  });
+  h+=`<div class="su-title">Today so far</div>`;
   if(!users.length){ el.innerHTML=h+`<div class="su-empty">No activity yet today.</div>`; return; }
   h+=`<div class="su-row">`;
   users.forEach(u=>{

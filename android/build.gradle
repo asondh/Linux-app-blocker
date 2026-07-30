@@ -1,0 +1,6 @@
+// Top-level build file. Versions here are common, recent defaults — if Android
+// Studio flags a mismatch with your installed SDK/AGP, let it update them.
+plugins {
+    id 'com.android.application' version '8.5.2' apply false
+    id 'org.jetbrains.kotlin.android' version '1.9.24' apply false
+}
