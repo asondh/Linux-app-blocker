@@ -85,6 +85,14 @@
   .time-row:hover { background:#f8f9fa; }
   .time-row .tw { color:var(--muted); font-size:11px; display:inline-block; width:12px; }
   .time-detail td { padding:2px 12px 8px 30px; background:#fbfcfc; }
+  /* Time per site: a site row can expand again to show searches made there. */
+  .qrow-site { border-top:1px dashed var(--line); }
+  .qrow-site:first-child { border-top:0; }
+  .qrow-site > .qrow { border-top:0; }
+  .qrow-site .qrow-exp { cursor:pointer; user-select:none; }
+  .qrow-site .qrow-exp:hover { background:#f8f9fa; }
+  .qrow-site .tw { color:var(--muted); font-size:11px; display:inline-block; width:12px; }
+  .qsub { padding:0 0 4px 20px; }
   /* Blocked list: one stacked item per line so long site URLs never get
      crushed into a narrow column on a phone. */
   .brow { padding:9px 14px; border-bottom:1px solid var(--line); }
@@ -262,6 +270,7 @@ let sortState = {};            // per-table sort
 let openSearch = new Set();    // Searches tab: which site groups are expanded
 let openVisits = new Set();    // Visits tab: which site groups are expanded
 let openTime = new Set();      // Time per site tab: which user rows are expanded
+let openTimeSite = new Set();  // Time per site tab: which "user|site" rows show searches
 let filtersInit = false;       // seed the default date range only once
 let lastId = 0;                // last command id we minted (keep them increasing)
 let SENT = {};                 // id -> {label, targets:[ids]} sent this session
@@ -459,24 +468,32 @@ function fmtDur(s){ const m=Math.floor(s/60);
 function computeDurations(rows){
   // gap-based, same as the app: sum gap to next visit by same user, capped.
   // Grouped by user first, each with a per-site breakdown, so a user's row
-  // can expand to show which sites made up their total.
+  // can expand to show which sites made up their total -- and each site can
+  // expand again to show the searches made there (deduped the same way the
+  // Searches tab does: case-/space-insensitive).
   const byUser = {};
   rows.slice().sort((a,b)=>a.ts-b.ts).forEach(v=>{
     (byUser[v.u]=byUser[v.u]||[]).push(v); });
   return Object.entries(byUser).map(([user,list])=>{
-    const sites={};   // domain -> {visits, secs, ms:Set}
+    const sites={};   // domain -> {visits, secs, ms:Set, searches:{term:{label,count,lastTs}}}
     let visits=0, secs=0;
     list.forEach((v,i)=>{
-      const s=sites[v.d]||(sites[v.d]={visits:0,secs:0,ms:new Set()});
+      const s=sites[v.d]||(sites[v.d]={visits:0,secs:0,ms:new Set(),searches:{}});
       let dur=0;
       if(i+1<list.length) dur=Math.min(Math.max(0,list[i+1].ts-v.ts),IDLE_CAP);
       visits++; secs+=dur;
       s.visits++; s.secs+=dur;
       if(v._m) s.ms.add(v._m);
+      if(v.q){
+        const term=v.q.trim(), key=term.toLowerCase();
+        const sr=s.searches[key]||(s.searches[key]={label:term,count:0,lastTs:0});
+        sr.count++; if(v.ts>=sr.lastTs){ sr.lastTs=v.ts; sr.label=term; }
+      }
     });
     const siteList=Object.keys(sites).map(domain=>{
       const s=sites[domain];
-      return {domain, visits:s.visits, secs:s.secs, ms:[...s.ms]};
+      const searches=Object.values(s.searches).sort((a,b)=>b.lastTs-a.lastTs);
+      return {domain, visits:s.visits, secs:s.secs, ms:[...s.ms], searches};
     }).sort((a,b)=>b.secs-a.secs);
     return {user, visits, secs, sites:siteList};
   }).sort((a,b)=>b.secs-a.secs);
@@ -641,7 +658,8 @@ function render(){
   // Tap a user row to expand a per-site breakdown of visits/approx. time;
   // the user's combined total across every site sits right next to their
   // name, separate from "on computer" screen time (which counts all activity,
-  // not just browsing).
+  // not just browsing). A site with searches on it can expand again to show
+  // them -- the same data as the Searches tab, just reachable from here too.
   const durs = sortRows(computeDurations(rows), "time");
   const tbT=$("tb-time"); tbT.innerHTML="";
   const multiT=document.body.classList.contains("multi");
@@ -654,14 +672,41 @@ function render(){
                  `<td>${d.visits}</td><td>${fmtDur(d.secs)}</td>`;
     const dtr=document.createElement("tr");
     dtr.className="time-detail"+(open?"":" hidden");
-    let dh="<td colspan=\"3\">";
+    const td=document.createElement("td");
+    td.colSpan=3;
     d.sites.forEach(s=>{
       const who=(multiT&&s.ms.length)?" · "+s.ms.map(esc).join(", "):"";
-      dh+=`<div class="qrow"><span class="q">${esc(s.domain)}</span>`+
-          `<span class="qmeta">${s.visits} visit${s.visits!=1?"s":""} · `+
-          `${fmtDur(s.secs)}${who}</span></div>`;
+      const hasSearch=s.searches.length>0;
+      const key=d.user+"|"+s.domain;
+      const sOpen=hasSearch && openTimeSite.has(key);
+      const wrap=document.createElement("div");
+      wrap.className="qrow-site";
+      let sh=`<div class="qrow${hasSearch?" qrow-exp":""}">`+
+        (hasSearch?`<span class="tw">${sOpen?"▾":"▸"}</span> `:"")+
+        `<span class="q">${esc(s.domain)}</span>`+
+        `<span class="qmeta">${s.visits} visit${s.visits!=1?"s":""} · `+
+        `${fmtDur(s.secs)}${who}</span></div>`;
+      if(hasSearch){
+        sh+=`<div class="qsub${sOpen?"":" hidden"}">`+
+          s.searches.map(sr=>`<div class="qrow"><span class="q">${esc(sr.label)}</span>`+
+            `<span class="qmeta">`+(sr.count>1?`<span class="qx">×${sr.count}</span> `:"")+
+            `${fmtWhen(sr.lastTs)}</span></div>`).join("")+
+          `</div>`;
+      }
+      wrap.innerHTML=sh;
+      if(hasSearch){
+        const hdr=wrap.querySelector(".qrow-exp");
+        const sub=wrap.querySelector(".qsub");
+        hdr.onclick=()=>{
+          if(openTimeSite.has(key)) openTimeSite.delete(key); else openTimeSite.add(key);
+          const nowOpen=openTimeSite.has(key);
+          sub.classList.toggle("hidden", !nowOpen);
+          hdr.querySelector(".tw").textContent=nowOpen?"▾":"▸";
+        };
+      }
+      td.appendChild(wrap);
     });
-    dtr.innerHTML=dh+"</td>";
+    dtr.appendChild(td);
     tr.onclick=()=>{
       if(openTime.has(d.user)) openTime.delete(d.user); else openTime.add(d.user);
       const nowOpen=tr.classList.toggle("open");
