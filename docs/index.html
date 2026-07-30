@@ -498,16 +498,15 @@ function sortRows(rows, table, keys){
 
 function mcell(m){ return `<td class="col-m"><span class="mtag">${esc(m||"")}</span></td>`; }
 
-// Build collapsible groups from rows. keyFn(row)->item key (the thing that
-// gets deduped within a group, e.g. the search term or the page URL); labelFn
-// is what to show for it. groupKeyFn(row)->the outer grouping key, defaulting
-// to the site domain (Visits); pass v=>v.u to group by user instead (Searches).
-// itemSiteFn (optional) tags each item with its site, shown in the item's meta
-// line -- only meaningful when grouping by something other than site, since
-// otherwise the site is already the group header. Returns
+// Build collapsible groups from rows. groupKeyFn(row)->the outer grouping key
+// (both Visits and Searches group by user, v=>v.u). keyFn(row)->item key (the
+// thing that gets deduped within a group, e.g. the search term or the page
+// URL); labelFn is what to show for it. itemSiteFn (optional) tags each item
+// with its site, shown in the item's meta line -- Searches uses this since
+// its label is just the search term; Visits skips it since the page URL
+// already shows the site. Returns
 // [{group,total,lastTs,items:[{label,count,lastTs,ms,site}]}].
-function buildSiteGroups(rows, keyFn, labelFn, groupKeyFn, itemSiteFn){
-  groupKeyFn = groupKeyFn || (v=>v.d||"(unknown)");
+function buildGroups(rows, groupKeyFn, keyFn, labelFn, itemSiteFn){
   const byGroup={};
   rows.forEach(v=>{
     const gk=groupKeyFn(v)||"(unknown)";
@@ -528,7 +527,7 @@ function buildSiteGroups(rows, keyFn, labelFn, groupKeyFn, itemSiteFn){
 
 // Render groups into a container as a tap-to-expand accordion. openSet
 // persists which groups are expanded across re-renders (30s auto-refresh).
-function renderSiteGroups(containerId, groups, openSet, unitOne, unitMany){
+function renderGroups(containerId, groups, openSet, unitOne, unitMany){
   const cont=$(containerId); cont.innerHTML="";
   const multi=document.body.classList.contains("multi");
   groups.forEach(g=>{
@@ -602,20 +601,21 @@ function render(){
   const rows = activeRows();
   renderSummary();
 
-  // Visits — grouped by website, collapsed. Tap a site to see its pages;
-  // repeated visits to the same page merge into one ×count row.
-  const vg = buildSiteGroups(rows, v=>v.url||v.d||"", v=>v.url||v.d||"(page)");
-  renderSiteGroups("tb-visits", vg, openVisits, "page", "pages");
-  $("c-visits").textContent="("+vg.length+" site"+(vg.length!=1?"s":"")+")";
+  // Visits — grouped by user, collapsed. Tap a user to see their pages
+  // (the URL already shows which site); repeated visits to the same page
+  // merge into one ×count row.
+  const vg = buildGroups(rows, v=>v.u||"(unknown)",
+                         v=>v.url||v.d||"", v=>v.url||v.d||"(page)");
+  renderGroups("tb-visits", vg, openVisits, "page", "pages");
+  $("c-visits").textContent="("+vg.length+" user"+(vg.length!=1?"s":"")+")";
   $("e-visits").classList.toggle("hidden", vg.length>0);
 
   // Searches — grouped by user, collapsed. Tap a user to see their searches
   // (with the site each was made on); identical searches on the same site
   // (same words, case- and space-insensitive) merge into one ×count row.
-  const sg = buildSiteGroups(rows.filter(v=>v.q),
-                             v=>(v.q||"").trim().toLowerCase(), v=>v.q,
-                             v=>v.u||"(unknown)", v=>v.d||"");
-  renderSiteGroups("tb-searches", sg, openSearch, "search", "searches");
+  const sg = buildGroups(rows.filter(v=>v.q), v=>v.u||"(unknown)",
+                         v=>(v.q||"").trim().toLowerCase(), v=>v.q, v=>v.d||"");
+  renderGroups("tb-searches", sg, openSearch, "search", "searches");
   $("c-searches").textContent="("+sg.length+" user"+(sg.length!=1?"s":"")+")";
   $("e-searches").classList.toggle("hidden", sg.length>0);
 
