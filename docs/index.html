@@ -472,6 +472,16 @@ function computeDurations(rows){
   // can expand to show which sites made up their total -- and each site can
   // expand again to show the searches made there (deduped the same way the
   // Searches tab does: case-/space-insensitive).
+  //
+  // On a household with several synced machines, a user's visits from every
+  // machine get merged and time-sorted together here -- so a gap is only a
+  // real "still on this page" gap if the NEXT visit is on the *same*
+  // machine. Otherwise it's a gap between sessions on two different
+  // computers (they stepped away from one, then later showed up on
+  // another), and counting that toward "time on site" wildly inflates the
+  // estimate -- e.g. leaving a tab open on a laptop, then browsing on a
+  // desktop 40 minutes later, would otherwise count that 40-minute gap as
+  // active time on the laptop's last page.
   const byUser = {};
   rows.slice().sort((a,b)=>a.ts-b.ts).forEach(v=>{
     (byUser[v.u]=byUser[v.u]||[]).push(v); });
@@ -481,7 +491,8 @@ function computeDurations(rows){
     list.forEach((v,i)=>{
       const s=sites[v.d]||(sites[v.d]={visits:0,secs:0,ms:new Set(),searches:{}});
       let dur=0;
-      if(i+1<list.length) dur=Math.min(Math.max(0,list[i+1].ts-v.ts),IDLE_CAP);
+      if(i+1<list.length && list[i+1]._m===v._m)
+        dur=Math.min(Math.max(0,list[i+1].ts-v.ts),IDLE_CAP);
       visits++; secs+=dur;
       s.visits++; s.secs+=dur;
       if(v._m) s.ms.add(v._m);
