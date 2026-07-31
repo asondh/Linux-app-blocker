@@ -200,10 +200,11 @@ budget left.
 - The lock screen's **Unlock** button checks the same admin password used
   everywhere else in the app, and grants **+15 minutes** per correct entry —
   a parent can enter it more than once for more time.
-- Its **Shut Down** button needs **no password** — it doesn't grant any
-  extra computer time, it just ends the session gracefully (the same
-  power-off path the desktop's own Shut Down menu uses, so running apps
-  still get a chance to prompt to save).
+- Its **Log Out** and **Shut Down** buttons both need **no password** and
+  grant no extra time — they just let a kid who's out of time end their
+  own session gracefully (Log Out) or power off the machine entirely
+  (Shut Down), the same paths the desktop's own menus use, so running apps
+  still get a chance to prompt to save.
 - The lock **persists across a reboot**: it's driven by the day's actual
   recorded usage, not by the session being open, so restarting the machine
   doesn't reset it. It clears at local midnight, same as the rest of the
@@ -218,8 +219,8 @@ sudo appblocker --lock-test USERNAME
 ```
 
 This launches the real lock overlay for `USERNAME` right now, so you can
-confirm it appears and that Unlock/Shut Down both work, without waiting for
-an actual budget to run out. Requirements: **Python 3.9+** (checked
+confirm it appears and that Unlock/Log Out/Shut Down all work, without
+waiting for an actual budget to run out. Requirements: **Python 3.9+** (checked
 automatically — this feature is skipped with a clear log message on older
 Python, the rest of AppBlocker is unaffected) and the user must be logged
 into a graphical session at the time.

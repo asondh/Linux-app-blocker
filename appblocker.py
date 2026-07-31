@@ -363,6 +363,25 @@ def spawn_as_user(username, argv):
         return None
 
 
+def logout_session_commands(username):
+    """
+    Candidate commands to end `username`'s own session gracefully, tried in
+    order by the lock overlay's "Log Out" button until one runs without
+    raising. Session-manager-agnostic: `XDG_SESSION_ID` (set by logind for
+    graphical sessions) lets us target this exact session precisely; the
+    username-based fallback covers the case where it's unset. Ending your
+    own session this way needs no special privilege -- logind's default
+    policy allows a user to terminate their own session/session-group
+    without authentication, unlike the poweroff/reboot actions above.
+    """
+    cmds = []
+    session_id = os.environ.get("XDG_SESSION_ID")
+    if session_id:
+        cmds.append(["loginctl", "terminate-session", session_id])
+    cmds.append(["loginctl", "terminate-user", username])
+    return cmds
+
+
 def usernames_to_uids(names):
     """Map a list of usernames to a set of UIDs, skipping unknown names."""
     uids = set()
@@ -6425,8 +6444,30 @@ def run_lock_overlay(username):
             except Exception:
                 continue
 
-    tk.Button(root, text="Shut Down", command=shutdown, font=("Helvetica", 11),
-             bg="#7f8c8d", fg="white").pack(side="bottom", pady=30)
+    def logout(event=None):
+        # Ends just this session (not the whole machine) -- lets a kid who's
+        # out of time hand the computer back / switch users without a parent
+        # around, same as shutdown: no password, grants no extra time.
+        for cmd in logout_session_commands(username):
+            try:
+                subprocess.run(cmd, timeout=10)
+                return
+            except Exception:
+                continue
+        # No session manager available at all (e.g. logind not running) --
+        # last resort is ending our own processes directly, which any
+        # desktop environment treats the same as the session going away.
+        try:
+            subprocess.run(["pkill", "-KILL", "-u", username], timeout=10)
+        except Exception:
+            pass
+
+    bottom = tk.Frame(root, bg="#1b2631")
+    bottom.pack(side="bottom", pady=30)
+    tk.Button(bottom, text="Log Out", command=logout, font=("Helvetica", 11),
+             bg="#7f8c8d", fg="white").pack(side="left", padx=10)
+    tk.Button(bottom, text="Shut Down", command=shutdown, font=("Helvetica", 11),
+             bg="#7f8c8d", fg="white").pack(side="left", padx=10)
 
     # Pin the window to the full screen size explicitly. overrideredirect()
     # above takes this window out of window-manager control entirely, and
