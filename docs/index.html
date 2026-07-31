@@ -847,7 +847,8 @@ async function sendToMachine(id, cmd){
 async function sendCommand(baseCmd, label){
   const c=getCfg();
   if(!c||!c.repo||!c.token){ ctlMsg("Not connected.","bad"); return; }
-  const targets = SEL_CTL==="*" ? MACHINES.map(m=>m.id) : [SEL_CTL];
+  const targets = SEL_CTL==="*"
+    ? MACHINES.filter(m=>m.id!==TV_MACHINE_ID).map(m=>m.id) : [SEL_CTL];
   if(!targets.length){ ctlMsg("No machine selected.","bad"); return; }
   let id=Date.now(); if(id<=lastId) id=lastId+1; lastId=id;
   ctlMsg("Sending “"+label+"”…","wait");
@@ -919,14 +920,16 @@ function renderCtlStatus(){
       h+='<div class="line wait">⏳ '+esc(s.label)+' — waiting'+scope+'…</div>';
     }
   });
-  // Recent results from the selected machine(s).
-  const machs = SEL_CTL==="*" ? MACHINES : [machineById(SEL_CTL)].filter(Boolean);
+  // Recent results from the selected machine(s). TV excluded -- it never
+  // executes commands, so it never has control_results to show.
+  const ctlMachines = MACHINES.filter(m=>m.id!==TV_MACHINE_ID);
+  const machs = SEL_CTL==="*" ? ctlMachines : [machineById(SEL_CTL)].filter(Boolean);
   let results=[];
   machs.forEach(m => (m.data.control_results||[]).forEach(r =>
     results.push(Object.assign({_m:m.name}, r))));
   results.sort((a,b)=>(a.id||0)-(b.id||0));
   results.slice(-8).reverse().forEach(r=>{
-    const tag = MACHINES.length>1 ? ('['+esc(r._m)+'] ') : '';
+    const tag = ctlMachines.length>1 ? ('['+esc(r._m)+'] ') : '';
     h+='<div class="line '+(r.ok?"ok":"bad")+'">'+(r.ok?"✓":"✗")+' '+tag+
        esc(r.action)+': '+esc(r.msg)+'</div>'; });
   el.innerHTML=h;
@@ -936,13 +939,19 @@ function ctlRowBtn(act, cls, txt, extra){
 }
 function renderControls(){
   const body=$("ctl-body"); if(!body) return;
-  if(!MACHINES.length){
+  // The TV never runs AppBlocker and can't accept remote-control commands at
+  // all -- excluded from every list/count/broadcast target in this whole
+  // function so the section only ever talks about machines that actually
+  // have controls (it still shows up fine elsewhere, e.g. the Time-on-
+  // computer tab's machine filter, which is about viewing data, not this).
+  const ctlMachines = MACHINES.filter(m=>m.id!==TV_MACHINE_ID);
+  if(!ctlMachines.length){
     body.innerHTML='<div class="ctl-warn">No machines connected yet.</div>';
     renderCtlStatus(); return;
   }
   // Default: broadcast when several machines, else the single machine.
   if(SEL_CTL===null || (SEL_CTL!=="*" && !machineById(SEL_CTL)))
-    SEL_CTL = MACHINES.length>1 ? "*" : MACHINES[0].id;
+    SEL_CTL = ctlMachines.length>1 ? "*" : ctlMachines[0].id;
   const broadcast = SEL_CTL==="*";
   const mach = broadcast ? null : machineById(SEL_CTL);
   const ctl  = broadcast ? null : (mach && mach.data.control);
@@ -951,13 +960,13 @@ function renderControls(){
   let h='<div id="ctl-machine-row"><label for="ctl-machine"><b>Control:</b></label>'+
         '<select id="ctl-machine"><option value="*"'+(broadcast?" selected":"")+
         '>All machines (broadcast)</option>';
-  MACHINES.forEach(m=>{ h+='<option value="'+esc(m.id)+'"'+
+  ctlMachines.forEach(m=>{ h+='<option value="'+esc(m.id)+'"'+
     (SEL_CTL===m.id?" selected":"")+'>'+esc(m.name)+'</option>'; });
   h+='</select></div>';
 
   // Remote-enabled warnings.
   if(broadcast){
-    const off=MACHINES.filter(m=>!(m.data.control&&m.data.control.remote_enabled))
+    const off=ctlMachines.filter(m=>!(m.data.control&&m.data.control.remote_enabled))
                       .map(m=>m.name);
     if(off.length) h+='<div class="ctl-warn">Remote control is OFF on: <b>'+
       off.map(esc).join(", ")+'</b>. Enable “Allow remote control” in AppBlocker '+
@@ -1091,10 +1100,10 @@ function renderControls(){
     return "default "+b.default_minutes+"m/day"+(overrides?" · overrides: "+esc(overrides):"");
   };
   if(broadcast){
-    const on=MACHINES.filter(m=>{ const b=budgetOf(m); return b&&b.enabled; });
+    const on=ctlMachines.filter(m=>{ const b=budgetOf(m); return b&&b.enabled; });
     if(on.length){
-      h+='<div class="ctl-note">Budget on '+on.length+"/"+MACHINES.length+' machine(s): '+
-         fmtBudget(budgetOf(on[0]))+(on.length<MACHINES.length?" (not enabled everywhere)":"")+
+      h+='<div class="ctl-note">Budget on '+on.length+"/"+ctlMachines.length+' machine(s): '+
+         fmtBudget(budgetOf(on[0]))+(on.length<ctlMachines.length?" (not enabled everywhere)":"")+
          '.</div>';
     } else {
       h+='<div class="ctl-note">Screen-time budget isn’t enabled on any synced '+
@@ -1106,8 +1115,18 @@ function renderControls(){
       ? "Budget: "+fmtBudget(b)+"."
       : "Screen-time budget is off on this machine.")+'</div>';
   }
+  // The TV publishes only a screen_time entry (under its own label, "TV" by
+  // default), so a username that comes *solely* from that -- never seen by
+  // any actual computer -- can only be the TV's pseudo-user; granting it
+  // screen time would be a silent no-op (nothing enforces a budget for it).
+  // Checked against every non-TV machine's own known-users list rather than
+  // just filtering the literal string "TV", so a real kid who happens to be
+  // named that (or matches the TV's custom label) is never wrongly excluded.
+  const knownElsewhere = new Set();
+  ctlMachines.forEach(m=>(m.data.users||[]).forEach(u=>knownElsewhere.add(u)));
+  const grantUsers = (DATA.users||[]).filter(u=>knownElsewhere.has(u));
   h+='<div class="ctl-row"><select id="ctl-grant-user" class="ctl-in">'+
-     (DATA.users||[]).map(u=>'<option value="'+esc(u)+'">'+esc(u)+'</option>').join("")+
+     grantUsers.map(u=>'<option value="'+esc(u)+'">'+esc(u)+'</option>').join("")+
      '</select><select id="ctl-grant-min" class="ctl-in">'+
      '<option value="15">+15 min</option><option value="30">+30 min</option>'+
      '<option value="60">+60 min</option></select>'+
