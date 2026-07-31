@@ -6366,7 +6366,6 @@ def run_lock_overlay(username):
     root = tk.Tk()
     root.title("AppBlocker")
     root.configure(bg="#1b2631")
-    root.attributes("-fullscreen", True)
     root.attributes("-topmost", True)
     # No window-manager close: Alt+F4 / the WM close button do nothing.
     root.protocol("WM_DELETE_WINDOW", lambda: None)
@@ -6428,6 +6427,23 @@ def run_lock_overlay(username):
 
     tk.Button(root, text="Shut Down", command=shutdown, font=("Helvetica", 11),
              bg="#7f8c8d", fg="white").pack(side="bottom", pady=30)
+
+    # Pin the window to the full screen size explicitly. overrideredirect()
+    # above takes this window out of window-manager control entirely, and
+    # the "-fullscreen" attribute is a WM-negotiated hint -- with no WM left
+    # to act on it, it silently does nothing, and Tk just auto-sizes the
+    # window to fit its packed content instead (a small box in the corner,
+    # not a fullscreen lock). Setting geometry explicitly, AFTER packing
+    # (not before), is what makes it stick: an earlier call would just get
+    # overridden once Tk recomputes a "shrink to fit" size from the packed
+    # widgets. -fullscreen is kept too as a harmless second attempt, in
+    # case overrideredirect() itself didn't take on a given WM/compositor.
+    root.update_idletasks()
+    root.geometry(f"{root.winfo_screenwidth()}x{root.winfo_screenheight()}+0+0")
+    try:
+        root.attributes("-fullscreen", True)
+    except tk.TclError:
+        pass
 
     def grab_input(attempt=0):
         # grab_set_global() raises "window not viewable" if attempted before
