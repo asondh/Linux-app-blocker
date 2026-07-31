@@ -250,6 +250,119 @@ def active_screen_users():
     return users
 
 
+# Minimum Python for subprocess's user=/group=/extra_groups= parameters --
+# the safe, documented way to fork-and-drop-privileges from a process that
+# has other threads running (which the daemon always does). Older Python
+# only offers preexec_fn for this, which the subprocess docs explicitly call
+# out as unsafe in a multi-threaded parent (the child can inherit a lock
+# another thread held at fork time and deadlock before it ever reaches
+# exec()). Rather than take that risk, the lock-overlay feature simply
+# refuses to run on older Python -- see can_drop_privileges().
+MIN_PYTHON_FOR_PRIV_DROP = (3, 9)
+
+
+def can_drop_privileges():
+    return sys.version_info >= MIN_PYTHON_FOR_PRIV_DROP
+
+
+def find_user_display(username, proc_root="/proc"):
+    """
+    Best-effort discovery of a DISPLAY + XAUTHORITY for `username`'s active
+    graphical session, by scanning /proc for a process owned by that user
+    that has DISPLAY set in its environment (root can always read any
+    process's environ, regardless of who owns it). Covers X11 sessions and
+    Wayland sessions running the common XWayland compatibility layer, since
+    either way some process of the user's ends up with DISPLAY set; Tkinter
+    itself is an X11 toolkit, so it needs exactly that. A pure-Wayland
+    session with no XWayland active won't be found this way.
+
+    `proc_root` defaults to "/proc" and only exists so this can be pointed
+    at a fake directory tree in tests -- never pass it in real use.
+
+    Returns (display, xauthority) on success -- xauthority may be a guessed
+    default path (~user/.Xauthority) if the process didn't have it set in
+    its environment. Returns (None, None) if nothing was found; never
+    raises (every failure mode here is just "couldn't find a display yet").
+    """
+    try:
+        pw = pwd.getpwnam(username)
+    except KeyError:
+        return None, None
+    try:
+        pids = sorted(int(n) for n in os.listdir(proc_root) if n.isdigit())
+    except OSError:
+        return None, None
+    for pid in pids:
+        pid_dir = os.path.join(proc_root, str(pid))
+        try:
+            if os.stat(pid_dir).st_uid != pw.pw_uid:
+                continue
+            with open(os.path.join(pid_dir, "environ"), "rb") as fh:
+                raw = fh.read()
+        except (OSError, PermissionError):
+            continue
+        env = {}
+        for item in raw.split(b"\0"):
+            if b"=" not in item:
+                continue
+            k, _, v = item.partition(b"=")
+            try:
+                env[k.decode()] = v.decode()
+            except UnicodeDecodeError:
+                continue
+        display = env.get("DISPLAY")
+        if display:
+            xauth = env.get("XAUTHORITY") or os.path.join(pw.pw_dir, ".Xauthority")
+            return display, xauth
+    return None, None
+
+
+def spawn_as_user(username, argv):
+    """
+    Launch `argv` as `username` (dropping from root via subprocess's
+    user=/group=/extra_groups=), with DISPLAY/XAUTHORITY set from that
+    user's active graphical session. Returns a Popen with raw (non-text)
+    stdin/stdout pipes on success, or None if this isn't currently possible
+    (no active display found, unknown user, privilege drop unsupported on
+    this Python) -- always fails safe, this never raises into the caller.
+    """
+    if not can_drop_privileges():
+        sys.stderr.write(
+            "[lock] Python 3.9+ is required to safely drop root privileges "
+            "for the lock overlay; this machine has an older Python, so the "
+            "screen-time lock feature can't run here.\n")
+        return None
+    try:
+        pw = pwd.getpwnam(username)
+    except KeyError:
+        return None
+    display, xauth = find_user_display(username)
+    if not display:
+        sys.stderr.write(
+            f"[lock] no active graphical DISPLAY found for {username} yet; "
+            f"will retry.\n")
+        return None
+    env = dict(os.environ)
+    env["DISPLAY"] = display
+    env["XAUTHORITY"] = xauth
+    env["HOME"] = pw.pw_dir
+    env["USER"] = env["LOGNAME"] = username
+    try:
+        groups = os.getgrouplist(username, pw.pw_gid)
+    except Exception:
+        groups = [pw.pw_gid]
+    try:
+        return subprocess.Popen(
+            argv, env=env, cwd=pw.pw_dir,
+            user=pw.pw_uid, group=pw.pw_gid, extra_groups=groups,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL)
+    except Exception as exc:
+        sys.stderr.write(f"[lock] failed to launch overlay for {username}: "
+                         f"{exc}\n")
+        return None
+
+
 def usernames_to_uids(names):
     """Map a list of usernames to a set of UIDs, skipping unknown names."""
     uids = set()
@@ -719,6 +832,19 @@ MONITOR_HISTORY_INTERVAL = 45     # seconds between history imports
 VISIT_IDLE_CAP = 1800             # cap a single visit's duration at 30 min
 ALERT_DEBOUNCE = 600              # don't re-alert same user+site within 10 min
 ATTEMPT_DEBOUNCE = 300            # don't re-log same user+app block within 5 min
+
+# --------------------------------------------------------------------------- #
+# Screen-time budget lock.
+# --------------------------------------------------------------------------- #
+BUDGET_WARN_FRACTION = 1 / 6      # grace notice fires with this fraction of
+                                   # the day's total budget left (once/day)
+BUDGET_GRANT_MINUTES = 15         # bonus minutes granted per correct
+                                   # password entry on the lock overlay
+LOCK_WATCHDOG_INTERVAL = 3        # seconds between overlay-liveness checks --
+                                   # deliberately much faster than the 45s
+                                   # budget-decision cadence above, so a kid
+                                   # closing the overlay gets it back almost
+                                   # immediately
 TAMPER_GAP = 900                  # a monitoring gap over 15 min = "was off"
 CHROME_EPOCH_OFFSET = 11644473600  # seconds between 1601-01-01 and 1970-01-01
 
@@ -918,6 +1044,13 @@ class HistoryStore:
                 # Per-user "computer on" seconds, bucketed by local day. Purely
                 # additive; independent of the visit log.
                 "CREATE TABLE IF NOT EXISTS screen_time ("
+                " username TEXT, day TEXT, seconds INTEGER,"
+                " PRIMARY KEY(username, day));"
+                # Per-user bonus seconds granted for a day (screen-time budget
+                # top-ups, from the lock overlay's password unlock or a future
+                # remote "grant minutes" command). Purely additive; the budget
+                # check adds this to screen_time when deciding whether to lock.
+                "CREATE TABLE IF NOT EXISTS bonus_minutes ("
                 " username TEXT, day TEXT, seconds INTEGER,"
                 " PRIMARY KEY(username, day));")
             conn.commit()
@@ -1123,6 +1256,33 @@ class HistoryStore:
             return {u: int(s) for u, s in conn.execute(
                 "SELECT username, seconds FROM screen_time WHERE day=?",
                 (day,)).fetchall()}
+        finally:
+            conn.close()
+
+    # -- screen-time budget bonus --------------------------------------------#
+    def add_bonus_seconds(self, username, day, seconds):
+        """Add `seconds` of bonus screen-time budget to (username, day)."""
+        if seconds <= 0:
+            return
+        conn = self._connect()
+        try:
+            conn.execute(
+                "INSERT INTO bonus_minutes(username,day,seconds) VALUES(?,?,?) "
+                "ON CONFLICT(username,day) DO UPDATE SET "
+                "seconds=seconds+excluded.seconds",
+                (username, day, int(seconds)))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def bonus_seconds(self, username, day):
+        """Bonus seconds granted to `username` for `day` (0 if none)."""
+        conn = self._connect()
+        try:
+            r = conn.execute(
+                "SELECT seconds FROM bonus_minutes WHERE username=? AND day=?",
+                (username, day)).fetchone()
+            return int(r[0]) if r else 0
         finally:
             conn.close()
 
@@ -1585,13 +1745,178 @@ def _within_quiet_hours(cfg, now=None):
     return cur >= start or cur < end   # overnight window (e.g. 21:00–07:00)
 
 
+class LockRuntime:
+    """
+    Thread-safe, in-memory-only (never persisted -- there is nothing here
+    that needs to survive a daemon restart, since it's fully recomputed from
+    durable data on the next tick) record of who's currently over their
+    screen-time budget. HistoryMonitor's _check_screen_budget() recomputes
+    and replaces the whole locked set fresh every ~45s; LockWatchdog reads
+    it every ~3s to keep exactly one overlay alive per locked user, and can
+    discard() a user immediately on a correct password without waiting for
+    the next recompute -- the next recompute will independently agree,
+    since it reads the same durable bonus total LockWatchdog just wrote.
+    """
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._locked = set()
+        self._pending = []   # fire-and-forget Popens (grace notices) awaiting reap
+
+    def replace(self, users):
+        with self._lock:
+            self._locked = set(users)
+
+    def discard(self, user):
+        with self._lock:
+            self._locked.discard(user)
+
+    def snapshot(self):
+        with self._lock:
+            return set(self._locked)
+
+    def track_fire_and_forget(self, proc):
+        with self._lock:
+            self._pending.append(proc)
+
+    def reap_fire_and_forget(self):
+        """Poll (and thereby reap) any finished fire-and-forget processes.
+        Must be called periodically by someone -- an un-awaited finished
+        child otherwise sits as a zombie, since nothing else ever waits on
+        it. Never raises."""
+        with self._lock:
+            self._pending = [p for p in self._pending if p.poll() is None]
+
+
+# --------------------------------------------------------------------------- #
+# Screen-time budget lock: overlay subprocess protocol.
+#
+# The overlay (run_lock_overlay(), --lock-overlay) runs unprivileged, as the
+# locked-out user -- it deliberately CANNOT verify the parent password itself,
+# since the config file holding its hash is root-only readable (0600) by
+# design, so a kid's own process could never read it even if it tried. The
+# overlay instead relays password attempts to the daemon (its parent process)
+# over the pipe it inherited, base64-encoded one line per attempt:
+#
+#   child -> parent:  PW:<base64 password>\n
+#   parent -> child:  OK\n | DENY\n | UNLOCK\n
+#
+# OK and UNLOCK both mean "close now" to the overlay; the daemon uses UNLOCK
+# specifically for unprompted unlocks (e.g. the feature got disabled) so logs
+# can tell the two apart. Never logs the password itself, only outcomes.
+# --------------------------------------------------------------------------- #
+class LockOverlaySession:
+    """Owns one running --lock-overlay subprocess for one user: the Popen,
+    its non-blocking stdout, and a byte buffer for partial lines (reads can
+    split a line across two calls). One instance per currently-locked user."""
+
+    def __init__(self, username, proc):
+        self.username = username
+        self.proc = proc
+        self._buf = b""
+        os.set_blocking(proc.stdout.fileno(), False)
+
+    def alive(self):
+        return self.proc.poll() is None
+
+    def send(self, line):
+        """Write a line (+ newline) to the overlay's stdin. Best-effort --
+        a dead/closing child's broken pipe is not an error worth surfacing."""
+        try:
+            self.proc.stdin.write((line + "\n").encode())
+            self.proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            pass
+
+    def poll_lines(self):
+        """Non-blocking read of whatever's arrived since the last call.
+        Returns a list of complete lines (newline stripped); never blocks,
+        never raises. Partial data is buffered for the next call."""
+        try:
+            chunk = os.read(self.proc.stdout.fileno(), 4096)
+        except (BlockingIOError, OSError):
+            chunk = b""
+        if chunk:
+            self._buf += chunk
+        lines = []
+        while b"\n" in self._buf:
+            line, self._buf = self._buf.split(b"\n", 1)
+            lines.append(line.decode(errors="replace"))
+        return lines
+
+    def close(self):
+        try:
+            self.proc.terminate()
+        except OSError:
+            pass
+
+
+def service_overlay_password(session, store, pm):
+    """
+    Read any pending password attempts from `session` and respond. On a
+    correct password, grants BUDGET_GRANT_MINUTES of bonus for today and
+    tells the overlay OK. Returns True if a correct password was entered
+    (caller should then treat this user as unlocked), False otherwise.
+    """
+    unlocked = False
+    for line in session.poll_lines():
+        if not line.startswith("PW:"):
+            continue
+        try:
+            password = base64.b64decode(line[3:].encode()).decode()
+        except Exception:
+            session.send("DENY")
+            continue
+        if pm.verify(password):
+            day = time.strftime("%Y-%m-%d")
+            store.add_bonus_seconds(session.username, day,
+                                    BUDGET_GRANT_MINUTES * 60)
+            session.send("OK")
+            unlocked = True
+            sys.stderr.write(f"[lock] {session.username}: unlocked via "
+                             f"password, +{BUDGET_GRANT_MINUTES}min\n")
+        else:
+            session.send("DENY")
+            sys.stderr.write(f"[lock] {session.username}: incorrect "
+                             f"password attempt on lock overlay\n")
+    return unlocked
+
+
+def kill_lock_overlays():
+    """
+    Emergency cleanup: SIGTERM every running --lock-overlay/--grace-notice
+    process on the machine, regardless of which user it's running as (root
+    can signal any process). Returns how many were found. Used by
+    --unlock-clear; never raises.
+    """
+    killed = 0
+    try:
+        pids = [int(n) for n in os.listdir("/proc") if n.isdigit()]
+    except OSError:
+        return 0
+    for pid in pids:
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                argv = fh.read().split(b"\0")
+        except (OSError, PermissionError):
+            continue
+        if any(b"--lock-overlay" in a or b"--grace-notice" in a for a in argv):
+            try:
+                os.kill(pid, signal.SIGTERM)
+                killed += 1
+            except OSError:
+                pass
+    return killed
+
+
 class HistoryMonitor(threading.Thread):
     """Daemon thread: periodically import browser history and send alerts."""
 
-    def __init__(self, state, store=None):
+    def __init__(self, state, store=None, lock_runtime=None):
         super().__init__(daemon=True)
         self.state = state
         self.store = store
+        self.lock_runtime = lock_runtime  # None = screen-time lock feature off
         self._stop = threading.Event()
         self._alert_state = {}
         self._last_sync = 0
@@ -1621,6 +1946,63 @@ class HistoryMonitor(threading.Thread):
         for user in active_screen_users():
             store.add_screen_time(user, day, int(round(delta)))
 
+    def _check_screen_budget(self, store):
+        """
+        Recompute, from scratch, exactly who is currently over their daily
+        screen-time budget, and replace lock_runtime's locked set wholesale
+        with the fresh result -- recomputing fresh (rather than incrementally
+        adding/removing) means this is self-correcting every ~45s regardless
+        of what LockWatchdog did in between (e.g. an early unlock via a
+        correct password): both sides derive "remaining" from the same
+        durable screen_time/bonus_minutes totals, so they never disagree.
+
+        Also fires the one-time-per-day grace notice at BUDGET_WARN_FRACTION
+        of the budget remaining. No-op if the lock feature isn't wired up
+        (lock_runtime is None, e.g. running under the GUI, not the daemon)
+        or is disabled in settings.
+        """
+        if self.lock_runtime is None:
+            return
+        with self.state.lock:
+            budget_cfg = dict(self.state.screen_budget)
+        if not budget_cfg.get("enabled"):
+            self.lock_runtime.replace(set())
+            return
+        day = time.strftime("%Y-%m-%d")
+        used = store.screen_seconds(day)
+        per_user = budget_cfg.get("per_user") or {}
+        default_minutes = budget_cfg.get("default_minutes", 0)
+        locked = set()
+        for user in active_screen_users():
+            budget_minutes = per_user.get(user, default_minutes)
+            if budget_minutes <= 0:
+                continue   # 0 = no budget configured for this user -- exempt
+            bonus = store.bonus_seconds(user, day)
+            remaining = budget_minutes * 60 + bonus - used.get(user, 0)
+            if remaining <= 0:
+                locked.add(user)
+                continue
+            warn_at = budget_minutes * 60 * BUDGET_WARN_FRACTION
+            if remaining <= warn_at:
+                warn_key = f"__budget_warned__{user}__{day}"
+                if not store.get_state(warn_key):
+                    store.set_state(warn_key, 1)
+                    self._spawn_grace_notice(user, int(remaining // 60))
+        self.lock_runtime.replace(locked)
+
+    def _spawn_grace_notice(self, user, minutes_remaining):
+        """Fire-and-forget the one-time "N minutes left" dialog. Tracked on
+        lock_runtime so LockWatchdog can reap the process once it exits
+        (otherwise an un-awaited child becomes a zombie)."""
+        try:
+            proc = spawn_as_user(
+                user, [sys.executable, os.path.abspath(__file__),
+                      "--grace-notice", user, str(max(0, minutes_remaining))])
+            if proc is not None:
+                self.lock_runtime.track_fire_and_forget(proc)
+        except Exception as exc:
+            sys.stderr.write(f"[lock] grace notice for {user} failed: {exc}\n")
+
     def run(self):
         store = self.store or HistoryStore()
         while not self._stop.is_set():
@@ -1643,6 +2025,7 @@ class HistoryMonitor(threading.Thread):
                 self._maybe_new_domain_alert(store)
                 store.set_state("__heartbeat__", int(time.time()))
                 self._sample_screen_time(store)
+                self._check_screen_budget(store)
                 self._maybe_digest(store)
                 self._maybe_new_domain_digest(store)
                 self._maybe_prune(store)
@@ -2609,6 +2992,79 @@ def apply_remote_command(state, cmd):
 
 
 # --------------------------------------------------------------------------- #
+# Screen-time budget lock: overlay watchdog.
+# --------------------------------------------------------------------------- #
+class LockWatchdog(threading.Thread):
+    """
+    Daemon thread: keeps exactly one live --lock-overlay process running for
+    each currently-locked user (per LockRuntime.snapshot()), relays the
+    password protocol on it, and closes overlays for anyone no longer
+    locked. Runs on LOCK_WATCHDOG_INTERVAL (a few seconds) rather than the
+    much slower budget-decision cadence in HistoryMonitor, so a kid closing
+    the overlay -- or a parent granting more time -- takes effect almost
+    immediately instead of waiting up to 45s.
+    """
+
+    def __init__(self, state, store, runtime):
+        super().__init__(daemon=True)
+        self.state = state
+        self.store = store
+        self.runtime = runtime
+        self._stop = threading.Event()
+        self._sessions = {}   # username -> LockOverlaySession
+
+    def stop(self):
+        self._stop.set()
+
+    def run(self):
+        while not self._stop.is_set():
+            try:
+                self._tick()
+            except Exception as exc:
+                sys.stderr.write(f"[lock] watchdog sweep error: {exc}\n")
+            self._stop.wait(LOCK_WATCHDOG_INTERVAL)
+        # On shutdown, tell every still-open overlay to close rather than
+        # leaving a kid's screen stuck locked with a now-dead parent.
+        for session in self._sessions.values():
+            session.send("UNLOCK")
+            session.close()
+
+    def _tick(self):
+        self.runtime.reap_fire_and_forget()
+        locked = self.runtime.snapshot()
+
+        # Anyone tracked but no longer in the locked set: tell them to close.
+        for user in list(self._sessions):
+            if user not in locked:
+                session = self._sessions.pop(user)
+                session.send("UNLOCK")
+                session.close()
+
+        # Fresh read of the password hash every tick, so a password changed
+        # while the daemon is running takes effect immediately rather than
+        # needing a restart.
+        pm = PasswordManager()
+
+        for user in locked:
+            session = self._sessions.get(user)
+            if session is None or not session.alive():
+                if session is not None:
+                    del self._sessions[user]
+                proc = spawn_as_user(
+                    user, [sys.executable, os.path.abspath(__file__),
+                          "--lock-overlay", user])
+                if proc is not None:
+                    self._sessions[user] = LockOverlaySession(user, proc)
+                continue
+            if service_overlay_password(session, self.store, pm):
+                # Correct password just now -- unlock immediately rather
+                # than waiting for the next ~45s budget recompute to agree.
+                self.runtime.discard(user)
+                session.close()
+                del self._sessions[user]
+
+
+# --------------------------------------------------------------------------- #
 # Process monitor — kills blocked apps in the background.
 # --------------------------------------------------------------------------- #
 class ProcessMonitor(threading.Thread):
@@ -2966,6 +3422,7 @@ class AppState:
         self.lockdown = {"enabled": False}      # browser incognito lockdown
         self.sync = self._default_sync()        # remote dashboard (GitHub) sync
         self.tv_sync = self._default_tv_sync()  # TV Locker Guard screen-time bridge
+        self.screen_budget = self._default_screen_budget()  # daily computer-time lock
         self.block_adult = False                # built-in adult-content blocklist
         self.web_schedules = []                 # scheduled website blocks (downtime)
         # "Distractions": sites blocked by default (machine-wide) that the parent
@@ -3005,6 +3462,37 @@ class AppState:
                     cfg[k] = str(value[k]).strip()
             if not cfg["label"]:
                 cfg["label"] = "TV"
+        return cfg
+
+    @staticmethod
+    def _default_screen_budget():
+        return {"enabled": False, "default_minutes": 120, "per_user": {}}
+
+    def _normalize_screen_budget(self, value):
+        """
+        per_user overrides default_minutes for that username. A minutes value
+        of 0 (default or per-user) means "no budget for this user" -- exempt,
+        not "locked immediately" -- matching the feature being opt-in overall.
+        """
+        cfg = self._default_screen_budget()
+        if isinstance(value, dict):
+            cfg["enabled"] = bool(value.get("enabled"))
+            try:
+                cfg["default_minutes"] = max(0, int(value.get("default_minutes", 120)))
+            except (TypeError, ValueError):
+                cfg["default_minutes"] = 120
+            per_user = value.get("per_user") or {}
+            clean = {}
+            if isinstance(per_user, dict):
+                for k, v in per_user.items():
+                    name = str(k).strip()
+                    if not name:
+                        continue
+                    try:
+                        clean[name] = max(0, int(v))
+                    except (TypeError, ValueError):
+                        continue
+            cfg["per_user"] = clean
         return cfg
 
     @staticmethod
@@ -3195,6 +3683,8 @@ class AppState:
                 (data.get("lockdown") or {}).get("enabled"))}
             self.sync = self._normalize_sync(data.get("sync"))
             self.tv_sync = self._normalize_tv_sync(data.get("tv_sync"))
+            self.screen_budget = self._normalize_screen_budget(
+                data.get("screen_budget"))
             self.block_adult = bool(data.get("block_adult"))
             self.web_schedules = self._normalize_web_schedules(
                 data.get("web_schedules"))
@@ -3208,6 +3698,7 @@ class AppState:
             self.lockdown = {"enabled": False}
             self.sync = self._default_sync()
             self.tv_sync = self._default_tv_sync()
+            self.screen_budget = self._default_screen_budget()
             self.block_adult = False
             self.web_schedules = []
             self.distractions = []
@@ -3235,6 +3726,8 @@ class AppState:
                     (data.get("lockdown") or {}).get("enabled"))}
                 self.sync = self._normalize_sync(data.get("sync"))
                 self.tv_sync = self._normalize_tv_sync(data.get("tv_sync"))
+                self.screen_budget = self._normalize_screen_budget(
+                    data.get("screen_budget"))
                 self.block_adult = bool(data.get("block_adult"))
                 self.web_schedules = self._normalize_web_schedules(
                     data.get("web_schedules"))
@@ -3254,6 +3747,7 @@ class AppState:
                                  "lockdown": self.lockdown,
                                  "sync": self.sync,
                                  "tv_sync": self.tv_sync,
+                                 "screen_budget": self.screen_budget,
                                  "block_adult": self.block_adult,
                                  "web_schedules": self.web_schedules,
                                  "distractions": self.distractions,
@@ -3410,6 +3904,12 @@ class AppState:
             self.tv_sync = self._normalize_tv_sync(cfg)
             self.save_locked()
             return dict(self.tv_sync)
+
+    def set_screen_budget(self, cfg):
+        with self.lock:
+            self.screen_budget = self._normalize_screen_budget(cfg)
+            self.save_locked()
+            return dict(self.screen_budget)
 
     def set_block_adult(self, enabled):
         with self.lock:
@@ -4539,6 +5039,98 @@ class AppBlockerUI:
         tk.Button(bar, text="Cancel", command=win.destroy, relief="flat",
                   padx=12, pady=6, cursor="hand2").pack(side="left")
 
+    def screen_budget_dialog(self):
+        with self.state.lock:
+            cfg = dict(self.state.screen_budget)
+        win = tk.Toplevel(self.root)
+        win.title("Screen Time Budget")
+        win.configure(bg=COLOR_BG)
+        win.geometry("520x520")
+        win.minsize(440, 400)
+        self._present(win)
+
+        bar = tk.Frame(win, bg=COLOR_BG)
+        bar.pack(side="bottom", fill="x", padx=16, pady=14)
+        body = self._scroll_body(win)
+
+        tk.Label(body, text="⏰ Screen Time Budget", bg=COLOR_BG, fg=COLOR_HEADER,
+                 font=("Helvetica", 14, "bold")).pack(pady=(14, 2))
+        tk.Label(body, text="Shows a full-screen lock once a user's daily "
+                 "computer time runs out (separate from any app/website "
+                 "blocks). A one-time heads-up appears with about 1/6 of "
+                 "the budget left. The lock screen's Unlock button (admin "
+                 f"password) grants +{BUDGET_GRANT_MINUTES} minutes; its "
+                 "Shut Down button needs no password, since it doesn't "
+                 "grant extra time — it only ends the session.",
+                 bg=COLOR_BG, fg="#7f8c8d", wraplength=470,
+                 justify="left").pack(padx=16, pady=(0, 8))
+
+        enabled = tk.BooleanVar(value=cfg.get("enabled", False))
+        tk.Checkbutton(body, text="Enable the screen-time lock",
+                       variable=enabled, bg=COLOR_BG,
+                       font=("Helvetica", 11, "bold")).pack(anchor="w", padx=16)
+
+        drow = tk.Frame(body, bg=COLOR_BG)
+        drow.pack(fill="x", padx=16, pady=(8, 0))
+        tk.Label(drow, text="Default daily budget:", bg=COLOR_BG).pack(side="left")
+        default_minutes = tk.StringVar(value=str(cfg.get("default_minutes", 120)))
+        tk.Spinbox(drow, from_=0, to=1440, width=6, textvariable=default_minutes
+                   ).pack(side="left", padx=6)
+        tk.Label(drow, text="minutes/day", bg=COLOR_BG).pack(side="left")
+        tk.Label(body, text="0 means nobody is budgeted unless listed below.",
+                 bg=COLOR_BG, fg="#7f8c8d").pack(anchor="w", padx=16)
+
+        tk.Label(body, text="Per-user overrides (one per line: username = "
+                 "minutes; 0 exempts that user entirely):", bg=COLOR_BG,
+                 fg="#7f8c8d", wraplength=460, justify="left").pack(
+                     anchor="w", padx=16, pady=(10, 0))
+        per_user_text = tk.Text(body, height=4, width=38, font=("monospace", 10))
+        per_user_text.pack(fill="x", padx=16)
+        per_user_text.insert("1.0", "\n".join(
+            f"{k} = {v}" for k, v in (cfg.get("per_user") or {}).items()))
+
+        tk.Label(body, text="Needs Python 3.9+ on this machine (checked "
+                 "automatically) and the user to be logged into a graphical "
+                 "session. Verify it actually works here before relying on "
+                 "it — from a terminal:\n"
+                 "  sudo appblocker --lock-test USERNAME\n"
+                 "Emergency off switch if anything misbehaves:\n"
+                 "  sudo appblocker --unlock-clear",
+                 bg=COLOR_BG, fg="#7f8c8d", wraplength=470, justify="left"
+                 ).pack(padx=16, pady=(10, 0))
+
+        def collect():
+            try:
+                default_min = max(0, int(default_minutes.get()))
+            except ValueError:
+                default_min = 120
+            per_user = {}
+            for ln in per_user_text.get("1.0", tk.END).splitlines():
+                if "=" not in ln:
+                    continue
+                lk, lv = ln.split("=", 1)
+                lk = lk.strip()
+                if not lk:
+                    continue
+                try:
+                    per_user[lk] = max(0, int(lv.strip()))
+                except ValueError:
+                    continue
+            return {"enabled": enabled.get(), "default_minutes": default_min,
+                    "per_user": per_user}
+
+        def save():
+            self.state.set_screen_budget(collect())
+            messagebox.showinfo("Saved", "Screen time budget settings saved.",
+                                parent=win)
+            win.destroy()
+
+        tk.Button(bar, text="Save", command=save, bg=COLOR_ACTIVE, fg="white",
+                  relief="flat", padx=16, pady=6, cursor="hand2").pack(
+                      side="right")
+        tk.Button(bar, text="Cancel", command=win.destroy, relief="flat",
+                  padx=12, pady=6, cursor="hand2").pack(side="left")
+
     def activity_dialog(self):
         store = HistoryStore()
         win = tk.Toplevel(self.root)
@@ -4675,6 +5267,10 @@ class AppBlockerUI:
         tk.Button(bar, text="📺 TV Screen Time…", command=self.tv_sync_dialog,
                   bg="#2980b9", fg="white", relief="flat", padx=12, pady=6,
                   cursor="hand2").pack(side="left", padx=8)
+        tk.Button(bar, text="⏰ Screen Time Budget…",
+                  command=self.screen_budget_dialog, bg="#c0392b", fg="white",
+                  relief="flat", padx=12, pady=6, cursor="hand2").pack(
+                      side="left", padx=8)
         tk.Button(bar, text="Refresh now", command=lambda: (
             self._import_history_now(), refresh()), relief="flat",
             padx=12, pady=6, cursor="hand2").pack(side="left", padx=8)
@@ -5740,6 +6336,182 @@ def import_settings(path, include_password=True):
 
 
 # --------------------------------------------------------------------------- #
+# Screen-time budget lock: overlay UI processes.
+#
+# Both of these are entry points for THIS SAME SCRIPT re-invoked with a
+# special flag (--lock-overlay / --grace-notice) as a subprocess, already
+# running unprivileged as the target user (spawn_as_user() dropped root
+# before exec'ing here) -- neither of these functions ever touches
+# BLOCKED_FILE/CONFIG_FILE, and neither needs to: they have no permission to
+# read them anyway (0600, root-owned), by the same design that keeps kids
+# from reading the password hash directly.
+# --------------------------------------------------------------------------- #
+def run_lock_overlay(username):
+    """
+    --lock-overlay USERNAME: a fullscreen, un-closable "time's up" window.
+    Relays password attempts to the parent daemon over the inherited
+    stdin/stdout pipe (see the LockOverlaySession docs above for the wire
+    protocol) rather than checking the password itself. Exits as soon as
+    the parent sends OK or UNLOCK. The Shut Down button needs no parent
+    involvement at all -- it's the same power-off action available from the
+    user's own desktop menu, run directly as that user.
+    """
+    if not HAS_TK:
+        sys.stderr.write("[lock-overlay] tkinter not available\n")
+        sys.exit(1)
+
+    os.set_blocking(sys.stdin.fileno(), False)
+    state = {"buf": b""}
+
+    root = tk.Tk()
+    root.title("AppBlocker")
+    root.configure(bg="#1b2631")
+    root.attributes("-fullscreen", True)
+    root.attributes("-topmost", True)
+    # No window-manager close: Alt+F4 / the WM close button do nothing.
+    root.protocol("WM_DELETE_WINDOW", lambda: None)
+    try:
+        root.overrideredirect(True)   # strip decorations entirely
+    except tk.TclError:
+        pass
+
+    tk.Label(root, text="⏰ Time's up for today",
+             font=("Helvetica", 28, "bold"), fg="white", bg="#1b2631"
+             ).pack(pady=(120, 10))
+    tk.Label(root, text=f"Hi {username} — ask a parent to unlock more time.",
+             font=("Helvetica", 15), fg="#bdc3c7", bg="#1b2631"
+             ).pack(pady=(0, 40))
+
+    form = tk.Frame(root, bg="#1b2631")
+    form.pack(pady=10)
+    tk.Label(form, text="Parent password:", font=("Helvetica", 12),
+             fg="white", bg="#1b2631").pack()
+    pw_var = tk.StringVar()
+    entry = tk.Entry(form, textvariable=pw_var, show="*",
+                     font=("Helvetica", 14), width=24, justify="center")
+    entry.pack(pady=8)
+
+    status = tk.Label(root, text="", font=("Helvetica", 12), fg="#e74c3c",
+                      bg="#1b2631")
+    status.pack(pady=6)
+
+    def submit(event=None):
+        pw = pw_var.get()
+        if not pw:
+            return
+        submit_btn.config(state="disabled")
+        b64 = base64.b64encode(pw.encode()).decode()
+        try:
+            sys.stdout.buffer.write(f"PW:{b64}\n".encode())
+            sys.stdout.buffer.flush()
+        except (BrokenPipeError, OSError):
+            pass
+        status.config(text="Checking…", fg="#f1c40f")
+
+    submit_btn = tk.Button(form, text=f"Unlock (+{BUDGET_GRANT_MINUTES} min)",
+                           command=submit, font=("Helvetica", 12, "bold"),
+                           bg="#2980b9", fg="white")
+    submit_btn.pack(pady=4)
+    entry.bind("<Return>", submit)
+
+    def shutdown(event=None):
+        # Same graceful power-off path the user's own desktop "Shut Down"
+        # menu already uses -- lets running apps prompt to save first,
+        # rather than cutting power. No password needed: this doesn't grant
+        # any extra computer time, it only ends the session.
+        for cmd in (["systemctl", "poweroff"], ["loginctl", "poweroff"]):
+            try:
+                subprocess.run(cmd, timeout=10)
+                break
+            except Exception:
+                continue
+
+    tk.Button(root, text="Shut Down", command=shutdown, font=("Helvetica", 11),
+             bg="#7f8c8d", fg="white").pack(side="bottom", pady=30)
+
+    def grab_input(attempt=0):
+        # grab_set_global() raises "window not viewable" if attempted before
+        # the window manager has actually mapped the window -- polling
+        # winfo_viewable() and retrying (rather than grabbing immediately
+        # after creating the widgets, before mainloop has processed the map
+        # event) is what makes the grab actually succeed.
+        if not root.winfo_viewable() and attempt < 30:
+            root.after(100, lambda: grab_input(attempt + 1))
+            return
+        try:
+            root.grab_set_global()
+        except tk.TclError:
+            # Best-effort -- not airtight even when it succeeds (a determined
+            # kid can still reach a raw text console via a WM/compositor
+            # shortcut no userspace window can block), and some window
+            # managers/compositors restrict global grabs outright. Either
+            # way the window stays fullscreen and topmost regardless.
+            pass
+        root.focus_force()
+        entry.focus_set()
+
+    def poll_parent():
+        try:
+            chunk = os.read(sys.stdin.fileno(), 4096)
+        except (BlockingIOError, OSError):
+            chunk = b""
+        if chunk:
+            state["buf"] += chunk
+        while b"\n" in state["buf"]:
+            line, state["buf"] = state["buf"].split(b"\n", 1)
+            text = line.decode(errors="replace").strip()
+            if text in ("OK", "UNLOCK"):
+                root.destroy()
+                return
+            if text == "DENY":
+                pw_var.set("")
+                status.config(text="Incorrect password", fg="#e74c3c")
+                submit_btn.config(state="normal")
+                entry.focus_set()
+        root.after(300, poll_parent)
+
+    root.after(50, grab_input)
+    root.after(300, poll_parent)
+    root.mainloop()
+
+
+def run_grace_notice(username, minutes_remaining):
+    """
+    --grace-notice USERNAME MINUTES: a small, dismissible one-time heads-up
+    shown when a user crosses the warn threshold. No password, no pipe
+    protocol -- dismissing it doesn't grant or restrict anything, it's
+    purely informational. Fire-and-forget from the daemon's side; if the
+    kid never clicks OK, that's fine, it just sits there.
+    """
+    if not HAS_TK:
+        sys.exit(1)
+    root = tk.Tk()
+    root.title("AppBlocker")
+    root.attributes("-topmost", True)
+    root.resizable(False, False)
+    plural = "s" if minutes_remaining != 1 else ""
+    tk.Label(root, text="⏰ Heads up", font=("Helvetica", 16, "bold")
+             ).pack(padx=30, pady=(20, 6))
+    tk.Label(root, text=f"About {minutes_remaining} minute{plural} of "
+             "computer time left today.", font=("Helvetica", 12)
+             ).pack(padx=30, pady=(0, 16))
+    ok_btn = tk.Button(root, text="OK", command=root.destroy, width=10,
+                       font=("Helvetica", 11, "bold"))
+    ok_btn.pack(pady=(0, 20))
+    try:
+        root.eval("tk::PlaceWindow . center")
+    except tk.TclError:
+        pass
+    # Keyboard-dismissible too, not just by clicking -- bound on root since
+    # a freshly-mapped window isn't guaranteed to hand keyboard focus to any
+    # particular child widget without a window manager's help.
+    root.bind("<Return>", lambda e: root.destroy())
+    root.bind("<Escape>", lambda e: root.destroy())
+    root.after(100, lambda: (root.focus_force(), ok_btn.focus_set()))
+    root.mainloop()
+
+
+# --------------------------------------------------------------------------- #
 # Headless root daemon (system mode)
 # --------------------------------------------------------------------------- #
 def run_daemon():
@@ -5760,16 +6532,20 @@ def run_daemon():
     ensure_app_dir()
     state = AppState()
     store = HistoryStore()           # shared by the history monitor and kill log
-    history = HistoryMonitor(state, store)  # history logging + alerts + digests
+    lock_runtime = LockRuntime()     # screen-time budget lock (in-memory only)
+    history = HistoryMonitor(state, store, lock_runtime)  # history + alerts +
+                                                           # digests + budget
     # The kill sweep reports blocked-app attempts to the history monitor, which
     # logs them and (optionally) emails.
     monitor = ProcessMonitor(state, on_block=history.block_alert)
+    lock_watchdog = LockWatchdog(state, store, lock_runtime)
 
     # Run the sweep loop in the foreground so systemd supervises this process
     # directly (Type=simple). Translate SIGTERM into a clean stop.
     def _handle_term(signum, frame):
         monitor.stop()
         history.stop()
+        lock_watchdog.stop()
 
     signal.signal(signal.SIGTERM, _handle_term)
     signal.signal(signal.SIGINT, _handle_term)
@@ -5779,11 +6555,14 @@ def run_daemon():
         f"blocklist={BLOCKED_FILE})\n")
     sys.stderr.flush()
 
-    history.start()  # background thread
+    history.start()        # background thread
+    lock_watchdog.start()  # background thread
     # ProcessMonitor.run() is the same sweep loop the GUI uses in a thread; we
     # just call it inline here so the daemon has no extra moving parts.
     monitor.run()
     history.stop()
+    lock_watchdog.stop()
+    lock_watchdog.join(timeout=LOCK_WATCHDOG_INTERVAL + 2)
 
     # Final catch-up on shutdown: import any last visits and push the dashboard
     # once more, so activity right up to power-off shows up without waiting for
@@ -5881,7 +6660,97 @@ def main():
     parser.add_argument(
         "--import-settings", metavar="FILE",
         help="load settings previously saved with --export-settings")
+    parser.add_argument(
+        "--lock-test", metavar="USERNAME",
+        help="manually trigger the screen-time lock overlay for USERNAME, "
+             "to verify it works on this machine before relying on it "
+             "(requires root; the user must be logged into a graphical "
+             "session right now)")
+    parser.add_argument(
+        "--unlock-clear", action="store_true",
+        help="emergency: disable the screen-time lock and close any open "
+             "lock-overlay windows immediately")
+    # Internal, not meant to be run by hand -- these are how the daemon
+    # re-invokes this same script as an unprivileged overlay subprocess.
+    parser.add_argument("--lock-overlay", metavar="USERNAME",
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--grace-notice", nargs=2,
+                        metavar=("USERNAME", "MINUTES"),
+                        help=argparse.SUPPRESS)
     args = parser.parse_args()
+
+    # These two run fully unprivileged (as whichever user spawn_as_user()
+    # dropped to) and must never touch BLOCKED_FILE/CONFIG_FILE -- handle
+    # them before anything below gets a chance to call configure_paths().
+    if args.lock_overlay:
+        run_lock_overlay(args.lock_overlay)
+        return
+
+    if args.grace_notice:
+        user, minutes_text = args.grace_notice
+        try:
+            minutes = int(minutes_text)
+        except ValueError:
+            minutes = 0
+        run_grace_notice(user, minutes)
+        return
+
+    if args.lock_test:
+        configure_paths(system_mode=True)
+        if os.geteuid() != 0:
+            print("--lock-test must be run as root (sudo) so it can drop "
+                  "privileges into the target user's own session.")
+            return
+        if not can_drop_privileges():
+            print(f"Python {sys.version_info[0]}.{sys.version_info[1]} is "
+                  "too old for this feature -- Python 3.9+ is required.")
+            return
+        if not PasswordManager().is_set:
+            print("No admin password is set yet -- set one in the app "
+                  "first (the overlay's Unlock button checks against it).")
+            return
+        print(f"Launching a test lock overlay for {args.lock_test}...")
+        print("Use the overlay's own Unlock (with the admin password) or "
+              "Shut Down button to end the test -- closing this terminal "
+              "won't dismiss it.")
+        store = HistoryStore()
+        session = None
+        proc = spawn_as_user(
+            args.lock_test, [sys.executable, os.path.abspath(__file__),
+                             "--lock-overlay", args.lock_test])
+        if proc is None:
+            print("Could not launch the overlay -- see the error above. "
+                  "Common causes: the user isn't logged into a graphical "
+                  "session right now, or this is a pure-Wayland session "
+                  "with no XWayland compatibility layer running.")
+            return
+        session = LockOverlaySession(args.lock_test, proc)
+        pm = PasswordManager()
+        try:
+            while session.alive():
+                if service_overlay_password(session, store, pm):
+                    print("Correct password -- overlay unlocked itself.")
+                    break
+                time.sleep(0.5)
+        except KeyboardInterrupt:
+            session.send("UNLOCK")
+        session.close()
+        print("Test overlay closed.")
+        return
+
+    if args.unlock_clear:
+        configure_paths(system_mode=True)
+        st = AppState()
+        cfg = dict(st.screen_budget)
+        cfg["enabled"] = False
+        st.set_screen_budget(cfg)
+        killed = kill_lock_overlays()
+        print(f"Screen-time lock disabled and {killed} overlay window(s) "
+              "closed." if killed else
+              "Screen-time lock disabled. No overlay windows were open.")
+        print("Re-enable it from the app's Screen Time Budget settings "
+              "when you're ready.")
+        return
 
     if args.lockdown_clear:
         changed = apply_browser_lockdown(False)

@@ -185,6 +185,61 @@ and alerts can go to **multiple recipients** (comma-separate the addresses).
 Useful from a terminal: `sudo appblocker --email-test` (send a test alert) and
 `sudo appblocker --import-history` (import history once now).
 
+## Screen-time budget (lock the computer after N minutes)
+
+In the admin window, click **⏰ Screen Time Budget** to set a daily computer-time
+limit — separate from any app or website blocks. Once a user's "computer on"
+time (the same tracking behind the dashboard's screen-time cards) reaches
+their budget, a full-screen lock appears on their own session: "Ask a parent
+to unlock more time." A one-time heads-up shows first, with about 1/6 of the
+budget left.
+
+- **Enable it**, set a **default daily budget** (minutes), and optionally
+  **per-user overrides** (one per line: `username = minutes`; `0` exempts
+  that user entirely).
+- The lock screen's **Unlock** button checks the same admin password used
+  everywhere else in the app, and grants **+15 minutes** per correct entry —
+  a parent can enter it more than once for more time.
+- Its **Shut Down** button needs **no password** — it doesn't grant any
+  extra computer time, it just ends the session gracefully (the same
+  power-off path the desktop's own Shut Down menu uses, so running apps
+  still get a chance to prompt to save).
+- The lock **persists across a reboot**: it's driven by the day's actual
+  recorded usage, not by the session being open, so restarting the machine
+  doesn't reset it. It clears at local midnight, same as the rest of the
+  screen-time tracking.
+
+**Before relying on this**, verify it actually works on each machine — the
+mechanism (a root daemon showing a window in another user's own graphical
+session) needs testing per machine/desktop environment:
+
+```bash
+sudo appblocker --lock-test USERNAME
+```
+
+This launches the real lock overlay for `USERNAME` right now, so you can
+confirm it appears and that Unlock/Shut Down both work, without waiting for
+an actual budget to run out. Requirements: **Python 3.9+** (checked
+automatically — this feature is skipped with a clear log message on older
+Python, the rest of AppBlocker is unaffected) and the user must be logged
+into a graphical session at the time.
+
+If anything misbehaves, the emergency off switch is:
+
+```bash
+sudo appblocker --unlock-clear
+```
+
+This disables the screen-time lock and immediately closes any open lock
+overlays, machine-wide.
+
+Honest limits: like the rest of AppBlocker's enforcement, this is userspace,
+not kernel-level — a technically determined kid could in principle reach a
+raw text console via a keyboard shortcut no ordinary window can block. The
+overlay does grab keyboard focus where the window manager allows it, and
+respawns within a few seconds if closed, but it isn't the same guarantee as
+a login-level lock.
+
 ## Remote dashboard (view activity from your phone)
 
 You can view the activity from anywhere — no logging into the monitored machine.
