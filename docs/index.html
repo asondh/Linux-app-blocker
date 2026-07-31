@@ -232,7 +232,7 @@
     <h2>Time per user (approx.) <span id="c-time" class="muted"></span></h2>
     <table><thead><tr>
       <th data-sort="user">User</th><th data-sort="visits">Visits</th>
-      <th data-sort="total">Approx. total screen time</th></tr></thead>
+      <th data-sort="total">Approx. total time on computer</th></tr></thead>
       <tbody id="tb-time"></tbody></table>
     <div id="e-time" class="empty hidden">No data.</div>
   </div>
@@ -326,7 +326,6 @@ function todayStr(){ const d=new Date();
 function mergeMachines(){
   const visits=[], attempts=[], blocked_sites=[], new_domains=[], users=new Set();
   const screen_time={};                 // user -> seconds on a computer today (all machines, incl. TV)
-  const tv_screen_time={};              // user -> seconds on the TV specifically, today
   const today=todayStr();
   MACHINES.forEach(m => {
     const nm = m.name;
@@ -339,9 +338,7 @@ function mergeMachines(){
     // local day — a stale/offline machine won't inflate "today".
     if(m.data.screen_day===today && m.data.screen_time){
       Object.entries(m.data.screen_time).forEach(([u,s])=>{
-        screen_time[u]=(screen_time[u]||0)+(+s||0); users.add(u);
-        if(m.id===TV_MACHINE_ID) tv_screen_time[u]=(tv_screen_time[u]||0)+(+s||0);
-      });
+        screen_time[u]=(screen_time[u]||0)+(+s||0); users.add(u); });
     }
   });
   // Monitoring-health alerts. A device that reports accessibility_enabled:false
@@ -360,7 +357,7 @@ function mergeMachines(){
         why:"no update in "+Math.round((nowS-d.generated_at)/60)+" min"});
     }
   });
-  DATA = { visits, attempts, blocked_sites, new_domains, screen_time, tv_screen_time, monAlerts,
+  DATA = { visits, attempts, blocked_sites, new_domains, screen_time, monAlerts,
            users:[...users].sort(),
            machines: MACHINES.map(m=>({id:m.id, name:m.name})),
            truncated: MACHINES.some(m=>m.data.truncated) };
@@ -660,25 +657,38 @@ function render(){
 
   // Time per site (aggregated across the filtered rows / selected machine).
   // Tap a user row to expand a per-site breakdown of visits/approx. time; the
-  // bracketed number next to their name is that browsing-time total (computer
-  // only), same as before. The "Approx. total screen time" column folds in
-  // today's TV time on top of it -- TV only ever reports a running total for
-  // today (no history), so it's only added when the active date filter
-  // includes today and no single non-TV machine is selected, to avoid
-  // misattributing today's TV time to a different day/machine's numbers.
-  // A site with searches on it can expand again to show them -- the same
-  // data as the Searches tab, just reachable from here too.
+  // bracketed number next to their name is that browsing-time estimate, same
+  // as before. The "Approx. total time on computer" column instead shows
+  // actual logged-in-at-a-computer time (the same tracking behind the "on
+  // computer" figure in the "Today so far" strip up top) -- deliberately
+  // computer-only, the TV is never folded in here (TV Locker Guard has no
+  // concept of separate users, so there's no reliable way to attribute TV
+  // time to one person's row). That real tracking only ever covers *today*
+  // (no per-day history is exported), so it's only used when the active date
+  // filter includes today and no single other machine is selected; outside
+  // that it falls back to the browsing-time estimate, the best information
+  // available for a past day/other machine. A site with searches on it can
+  // expand again to show them -- the same data as the Searches tab, just
+  // reachable from here too.
   const todayMid=new Date(); todayMid.setHours(0,0,0,0);
   const todayTs=todayMid.getTime()/1000;
-  // fx-machine's options are machine *names*, not ids -- resolve the TV's
-  // display name (if a TV snapshot is present at all) to compare against it.
-  const tvMachine=(DATA.machines||[]).find(m=>m.id===TV_MACHINE_ID);
-  const includeTv = (fromN===null || fromN<=todayTs) &&
-                    (toN===null || toN>todayTs) &&
-                    (macN==="All machines" || (tvMachine && macN===tvMachine.name));
-  const tvSecsByUser = includeTv ? (DATA.tv_screen_time||{}) : {};
+  const dateIncludesToday = (fromN===null || fromN<=todayTs) &&
+                            (toN===null || toN>todayTs);
+  // Sum today's screen_time across every synced machine *except* the TV,
+  // honoring the current machine filter the same way the visit rows already do.
+  const computerSecsByUser={};
+  if(dateIncludesToday){
+    MACHINES.forEach(m=>{
+      if(m.id===TV_MACHINE_ID) return;
+      if(macN!=="All machines" && m.name!==macN) return;
+      if(m.data.screen_day===todayStr() && m.data.screen_time){
+        Object.entries(m.data.screen_time).forEach(([u,s])=>{
+          computerSecsByUser[u]=(computerSecsByUser[u]||0)+(+s||0); });
+      }
+    });
+  }
   let durs = computeDurations(rows).map(d=>Object.assign(d,
-               {total: d.secs + (tvSecsByUser[d.user]||0)}));
+               {total: dateIncludesToday ? (computerSecsByUser[d.user]||0) : d.secs}));
   durs.sort((a,b)=>b.total-a.total);
   durs = sortRows(durs, "time");
   const tbT=$("tb-time"); tbT.innerHTML="";
