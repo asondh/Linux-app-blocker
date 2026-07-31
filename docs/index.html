@@ -895,6 +895,12 @@ function onCtlButton(b){
     return sendCommand({action:"add_distraction",domain:d}, "add distraction "+d); }
   if(act==="remove_distraction") return sendCommand({action:"remove_distraction",domain:b.dataset.dom}, "remove distraction "+b.dataset.dom);
   if(act==="allow_distraction")  return sendCommand({action:"allow_distraction",domain:b.dataset.dom,minutes:parseInt(b.dataset.min,10)}, "allow "+b.dataset.dom+" "+b.dataset.min+"m");
+  if(act==="grant_screen_time"){
+    const u=($("ctl-grant-user")||{}).value;
+    const m=parseInt(($("ctl-grant-min")||{}).value,10);
+    if(!u){ ctlMsg("No user to grant to yet — one shows up here once they have some activity.","bad"); return; }
+    return sendCommand({action:"grant_screen_time",user:u,minutes:m}, "grant "+u+" +"+m+"m");
+  }
 }
 function fmtClock(ts){ const d=new Date(ts*1000);
   return String(d.getHours()).padStart(2,"0")+":"+String(d.getMinutes()).padStart(2,"0"); }
@@ -1070,6 +1076,44 @@ function renderControls(){
      '<div class="ctl-note">Blocked by default so schoolwork on any site stays '+
      'focused. Grant free time or allow one site, and it re-locks on its own'+
      (broadcast?", on every machine":"")+'.</div></div>';
+
+  // Screen-time budget: a read-only status line (from _control_snapshot's
+  // screen_budget, which now syncs across machines when saved from the app)
+  // plus a Grant control -- the same +minutes mechanic as the lock screen's
+  // own Unlock button, just usable from here instead of standing at the
+  // computer. Works in broadcast or single-machine mode like every other
+  // section here; broadcasting to a machine the picked user never uses is
+  // harmless (an unused bonus credit that nothing reads).
+  h+='<div class="ctl-sec"><h3>Screen time'+(broadcast?" (all machines)":"")+'</h3>';
+  const budgetOf = m => (m && m.data && m.data.control && m.data.control.screen_budget) || null;
+  const fmtBudget = b => {
+    const overrides=Object.entries(b.per_user||{}).map(([u,mn])=>u+"="+mn+"m").join(", ");
+    return "default "+b.default_minutes+"m/day"+(overrides?" · overrides: "+esc(overrides):"");
+  };
+  if(broadcast){
+    const on=MACHINES.filter(m=>{ const b=budgetOf(m); return b&&b.enabled; });
+    if(on.length){
+      h+='<div class="ctl-note">Budget on '+on.length+"/"+MACHINES.length+' machine(s): '+
+         fmtBudget(budgetOf(on[0]))+(on.length<MACHINES.length?" (not enabled everywhere)":"")+
+         '.</div>';
+    } else {
+      h+='<div class="ctl-note">Screen-time budget isn’t enabled on any synced '+
+         'machine. Turn it on from ⏰ Screen Time Budget in the app.</div>';
+    }
+  } else {
+    const b=budgetOf(mach);
+    h+='<div class="ctl-note">'+(b && b.enabled
+      ? "Budget: "+fmtBudget(b)+"."
+      : "Screen-time budget is off on this machine.")+'</div>';
+  }
+  h+='<div class="ctl-row"><select id="ctl-grant-user" class="ctl-in">'+
+     (DATA.users||[]).map(u=>'<option value="'+esc(u)+'">'+esc(u)+'</option>').join("")+
+     '</select><select id="ctl-grant-min" class="ctl-in">'+
+     '<option value="15">+15 min</option><option value="30">+30 min</option>'+
+     '<option value="60">+60 min</option></select>'+
+     ctlRowBtn("grant_screen_time","green small","Grant")+'</div>'+
+     '<div class="ctl-note">Grants extra time on top of today’s budget, the same '+
+     'way a correct password at the lock screen does.</div></div>';
 
   // Protection.
   h+='<div class="ctl-sec"><h3>Protection'+(broadcast?" (all machines)":"")+'</h3>';

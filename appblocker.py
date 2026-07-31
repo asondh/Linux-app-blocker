@@ -1305,6 +1305,17 @@ class HistoryStore:
         finally:
             conn.close()
 
+    def bonus_seconds_all(self, day):
+        """Return {username: seconds} of bonus screen-time granted for `day`
+        (mirrors screen_seconds(), for publishing alongside it)."""
+        conn = self._connect()
+        try:
+            return {u: int(s) for u, s in conn.execute(
+                "SELECT username, seconds FROM bonus_minutes WHERE day=?",
+                (day,)).fetchall()}
+        finally:
+            conn.close()
+
     # -- retention ---------------------------------------------------------- #
     def prune(self, days):
         """Delete visits/attempts older than `days`. Returns rows removed.
@@ -1946,6 +1957,9 @@ class HistoryMonitor(threading.Thread):
         self._last_known_push = 0   # last household-ledger refresh (throttle)
         self._last_screen = None    # last screen-time sample time (epoch)
         self._last_tv_sync = 0      # last TV Locker Guard bridge push
+        self._last_budget_sync = 0  # last combined screen-budget usage fetch
+        self._remote_used = {}      # user -> today's screen seconds on other machines
+        self._remote_bonus = {}     # user -> today's bonus seconds granted on other machines
 
     def stop(self):
         self._stop.set()
@@ -1975,6 +1989,15 @@ class HistoryMonitor(threading.Thread):
         correct password): both sides derive "remaining" from the same
         durable screen_time/bonus_minutes totals, so they never disagree.
 
+        "Used" and "bonus" both fold in the other synced machines' today
+        totals (self._remote_used/_remote_bonus, refreshed roughly every
+        SYNC_INTERVAL by _sync_combined_budget_usage) on top of this
+        machine's own, so a kid can't reset their budget by switching to a
+        different computer -- only how fast that combined view catches up is
+        limited by the sync interval, not whether it eventually does. The TV
+        is deliberately never included here: its screen_time/bonus_time never
+        gets pulled in, by construction of _sync_combined_budget_usage.
+
         Also fires the one-time-per-day grace notice at BUDGET_WARN_FRACTION
         of the budget remaining. No-op if the lock feature isn't wired up
         (lock_runtime is None, e.g. running under the GUI, not the daemon)
@@ -1996,8 +2019,9 @@ class HistoryMonitor(threading.Thread):
             budget_minutes = per_user.get(user, default_minutes)
             if budget_minutes <= 0:
                 continue   # 0 = no budget configured for this user -- exempt
-            bonus = store.bonus_seconds(user, day)
-            remaining = budget_minutes * 60 + bonus - used.get(user, 0)
+            bonus = store.bonus_seconds(user, day) + self._remote_bonus.get(user, 0)
+            total_used = used.get(user, 0) + self._remote_used.get(user, 0)
+            remaining = budget_minutes * 60 + bonus - total_used
             if remaining <= 0:
                 locked.add(user)
                 continue
@@ -2008,6 +2032,63 @@ class HistoryMonitor(threading.Thread):
                     store.set_state(warn_key, 1)
                     self._spawn_grace_notice(user, int(remaining // 60))
         self.lock_runtime.replace(locked)
+
+    def _sync_combined_budget_usage(self, store):
+        """
+        Refresh self._remote_used/_remote_bonus from every other synced
+        machine's most recently published snapshot, so _check_screen_budget
+        can enforce one combined daily budget across every computer instead
+        of each enforcing its own independent total. Runs on the same
+        SYNC_INTERVAL cadence as the dashboard push -- reusing the existing
+        opportunistic sync rather than a separate faster channel, which
+        means a kid hopping machines can gain a few extra minutes before this
+        catches up (the same honest, userspace-not-kernel-level limits
+        already documented for the rest of this feature).
+
+        Deliberately excludes the TV's published snapshot (fetch just skips
+        it by never listing it -- list_sync_machines() already filters it
+        out), so watching TV never counts against the computer budget.
+
+        Fails open: any error leaves the last-known totals in place rather
+        than zeroing them out on a transient network blip, and if sync isn't
+        configured at all, both maps just stay empty forever (equivalent to
+        pure per-machine enforcement, exactly like before this feature).
+        No-op if the lock feature isn't wired up (lock_runtime is None).
+        """
+        if self.lock_runtime is None:
+            return
+        with self.state.lock:
+            cfg = dict(self.state.sync)
+        if not (cfg.get("enabled") and cfg.get("repo") and cfg.get("token")):
+            self._remote_used = {}
+            self._remote_bonus = {}
+            return
+        today = time.strftime("%Y-%m-%d")
+        this_id = machine_id()
+        used, bonus = {}, {}
+        try:
+            # The raising variant: a genuine fetch failure here must abort
+            # this whole refresh (below) rather than silently contribute an
+            # empty machine list, which is what list_sync_machines() would
+            # do -- that's right for broadcast_command()'s "best effort,
+            # zero is a valid outcome" use, but wrong here, where "couldn't
+            # check" and "checked, found nothing" need to be told apart to
+            # keep the fail-open promise in this method's docstring.
+            for mid in _list_sync_machine_ids(cfg):
+                if mid == this_id:
+                    continue    # this machine's own local totals, not "remote"
+                snap = fetch_machine_snapshot(cfg, mid)
+                if not snap or snap.get("screen_day") != today:
+                    continue    # no snapshot yet, or stale (hasn't synced today)
+                for u, s in (snap.get("screen_time") or {}).items():
+                    used[u] = used.get(u, 0) + int(s or 0)
+                for u, s in (snap.get("bonus_time") or {}).items():
+                    bonus[u] = bonus.get(u, 0) + int(s or 0)
+        except Exception as exc:
+            sys.stderr.write(f"[lock] combined-budget usage fetch failed: {exc}\n")
+            return    # keep the last-known cache rather than clobbering it
+        self._remote_used = used
+        self._remote_bonus = bonus
 
     def _spawn_grace_notice(self, user, minutes_remaining):
         """Fire-and-forget the one-time "N minutes left" dialog. Tracked on
@@ -2069,6 +2150,9 @@ class HistoryMonitor(threading.Thread):
                             sys.stderr.write(f"[tv-sync] pushed {n} bytes\n")
                     except Exception as exc:
                         sys.stderr.write(f"[tv-sync] failed: {exc}\n")
+                if now - self._last_budget_sync >= SYNC_INTERVAL:
+                    self._last_budget_sync = now
+                    self._sync_combined_budget_usage(store)
             except Exception as exc:
                 sys.stderr.write(f"[monitor] sweep error: {exc}\n")
             self._stop.wait(MONITOR_HISTORY_INTERVAL)
@@ -2129,7 +2213,7 @@ class HistoryMonitor(threading.Thread):
             cid = int(c.get("id", 0))
             maxid = max(maxid, cid)
             try:
-                ok, msg = apply_remote_command(self.state, c)
+                ok, msg = apply_remote_command(self.state, c, store)
             except Exception as exc:
                 ok, msg = False, str(exc)
             self._cmd_results.append({
@@ -2379,6 +2463,7 @@ def _control_snapshot(state):
         now = int(time.time())
         distract_allow = {d: int(t) for d, t in state.distract_allow.items()
                           if int(t) > now}
+        screen_budget = dict(state.screen_budget)
     try:
         human_users = [name for name, _uid in list_human_users()]
     except Exception:
@@ -2387,7 +2472,7 @@ def _control_snapshot(state):
             "lockdown": lockdown, "block_adult": adult,
             "human_users": human_users, "remote_enabled": remote_enabled,
             "distractions": distractions, "distract_free_until": free_until,
-            "distract_allow": distract_allow}
+            "distract_allow": distract_allow, "screen_budget": screen_budget}
 
 
 def build_report_data(store, days=REPORT_DAYS, limit=REPORT_LIMIT,
@@ -2415,10 +2500,15 @@ def build_report_data(store, days=REPORT_DAYS, limit=REPORT_LIMIT,
     except Exception:
         machine = ""
     now = time.time()
+    today_str = time.strftime("%Y-%m-%d", time.localtime(now))
     # Per-user "computer on" seconds for today (this machine's local day), so
     # the dashboard can show gross screen time regardless of what they did.
-    screen_time = store.screen_seconds(time.strftime("%Y-%m-%d",
-                                                      time.localtime(now)))
+    screen_time = store.screen_seconds(today_str)
+    # Bonus screen-time budget minutes granted today (locally via the lock
+    # overlay's password unlock, or remotely from the dashboard) -- published
+    # alongside screen_time so sibling machines can fold it into one combined
+    # daily budget instead of each enforcing its own independent total.
+    bonus_time = store.bonus_seconds_all(today_str)
     users = sorted(set(store.users()) | {a["u"] for a in attempts}
                    | set(screen_time))
     # New-domain novelty events in the window (sites the child had never
@@ -2440,7 +2530,8 @@ def build_report_data(store, days=REPORT_DAYS, limit=REPORT_LIMIT,
         "attempts": attempts,
         "new_domains": new_domains,
         "screen_time": screen_time,
-        "screen_day": time.strftime("%Y-%m-%d", time.localtime(now)),
+        "bonus_time": bonus_time,
+        "screen_day": today_str,
         "control_results": list(cmd_results or []),
         "cmd_ts": int(cmd_ts or 0),
     }
@@ -2515,6 +2606,171 @@ def machine_data_path(cfg):
 def machine_commands_path(cfg):
     """The per-machine command queue the dashboard writes and this machine reads."""
     return f"{_sync_base_dir(cfg)}machines/{machine_id()}.commands.json"
+
+
+def _list_sync_machine_ids(cfg):
+    """
+    List machine ids with a published snapshot (machines/<id>.json) in the
+    sync repo -- the same discovery the dashboard already does in JS
+    (ghList). Excludes the TV's pseudo-machine entry and command-queue files,
+    which share the folder. Returns [] if sync isn't configured, or if the
+    machines/ folder simply doesn't exist yet (a legitimate "nothing
+    published so far" state, not an error) -- but *raises* on a genuine
+    fetch failure (network error, bad credentials, malformed response), so a
+    caller that needs to tell "empty" apart from "couldn't check" can.
+
+    Prefer list_sync_machines() (below) unless you specifically need that
+    distinction -- it's the same lookup with failures swallowed to [], which
+    is what every caller except the combined-budget usage sync wants.
+    """
+    repo = cfg.get("repo", "").strip()
+    token = cfg.get("token", "").strip()
+    branch = cfg.get("branch", "main").strip() or "main"
+    if not repo or not token:
+        return []
+    api = f"https://api.github.com/repos/{repo}/contents/{_sync_base_dir(cfg)}machines"
+    try:
+        entries = _gh_request(f"{api}?ref={branch}", token)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return []    # no machines/ folder published yet -- not an error
+        raise
+    if not isinstance(entries, list):
+        return []
+    ids = []
+    for e in entries:
+        name = e.get("name", "") if isinstance(e, dict) else ""
+        if name.endswith(".json") and not name.endswith(".commands.json"):
+            mid = name[:-len(".json")]
+            if mid and mid != TV_MACHINE_ID:
+                ids.append(mid)
+    return ids
+
+
+def list_sync_machines(cfg):
+    """
+    Same as _list_sync_machine_ids(), except it never raises -- any failure
+    (not just a missing machines/ folder) is treated as "no machines found".
+    This is what broadcast_command() wants: if discovery fails there's
+    nothing safe to do but deliver to zero machines and report that,
+    exactly like any other machine being unreachable.
+    """
+    try:
+        return _list_sync_machine_ids(cfg)
+    except Exception:
+        return []
+
+
+def fetch_machine_snapshot(cfg, target_machine_id):
+    """
+    GET one machine's published machines/<id>.json snapshot. Returns None if
+    it genuinely doesn't exist yet (a 404 -- that machine hasn't published a
+    snapshot, which is normal on a first run) or sync isn't configured, but
+    *raises* on anything else (network error, bad credentials, malformed
+    JSON). That distinction matters to _sync_combined_budget_usage: "not
+    published yet" should count as zero for that sibling, but a transient
+    fetch failure shouldn't quietly do the same -- it should abort the whole
+    refresh and keep the last-known combined totals instead.
+    """
+    repo = cfg.get("repo", "").strip()
+    token = cfg.get("token", "").strip()
+    branch = cfg.get("branch", "main").strip() or "main"
+    if not repo or not token:
+        return None
+    path = f"{_sync_base_dir(cfg)}machines/{target_machine_id}.json"
+    api = f"https://api.github.com/repos/{repo}/contents/{path}"
+    try:
+        obj = _gh_request(f"{api}?ref={branch}", token)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return None
+        raise
+    raw = obj.get("content", "")
+    if obj.get("encoding") == "base64":
+        raw = base64.b64decode(raw).decode("utf-8", "replace")
+    data = json.loads(raw)
+    return data if isinstance(data, dict) else None
+
+
+def append_command_to_machine(cfg, target_machine_id, cmd):
+    """
+    Append one remote command to `target_machine_id`'s command queue. This is
+    the Python-side twin of the dashboard's own sendToMachine() (JS) -- same
+    read-modify-write-with-retry shape, just used for machine-to-machine
+    broadcasts (screen-budget config changes, remote grants relayed onward)
+    instead of phone-to-machine. Retries once on a sha conflict (another
+    writer raced it) before giving up. Returns True on success, False if
+    both attempts failed.
+    """
+    repo = cfg.get("repo", "").strip()
+    token = cfg.get("token", "").strip()
+    branch = cfg.get("branch", "main").strip() or "main"
+    if not repo or not token:
+        return False
+    path = f"{_sync_base_dir(cfg)}machines/{target_machine_id}.commands.json"
+    api = f"https://api.github.com/repos/{repo}/contents/{path}"
+    for attempt in range(2):
+        sha = None
+        commands = []
+        try:
+            existing = _gh_request(f"{api}?ref={branch}", token)
+            sha = existing.get("sha")
+            raw = existing.get("content", "")
+            if existing.get("encoding") == "base64":
+                raw = base64.b64decode(raw).decode("utf-8", "replace")
+            data = json.loads(raw)
+            got = data.get("commands") if isinstance(data, dict) else data
+            if isinstance(got, list):
+                commands = got
+        except urllib.error.HTTPError as exc:
+            if exc.code != 404:
+                if attempt == 0:
+                    continue
+                return False
+        except Exception:
+            pass    # malformed existing file -- overwrite with a fresh one
+        commands = commands + [cmd]
+        payload = json.dumps({"commands": commands},
+                             separators=(",", ":")).encode("utf-8")
+        body = {"message": f"appblocker command {cmd.get('action', '')}",
+                "content": base64.b64encode(payload).decode("ascii"),
+                "branch": branch}
+        if sha:
+            body["sha"] = sha
+        try:
+            _gh_request(api, token, method="PUT", body=body)
+            return True
+        except urllib.error.HTTPError as exc:
+            if exc.code == 409 and attempt == 0:
+                continue    # sha race -- re-read and retry once
+            return False
+        except Exception:
+            return False
+    return False
+
+
+def broadcast_command(cfg, cmd, exclude_ids=()):
+    """
+    Send `cmd` to every synced machine's command queue except the TV and any
+    excluded ids (typically this machine itself, which applies the change
+    locally instead). Best-effort per machine -- one machine being offline or
+    unreachable doesn't stop delivery to the others. Every recipient gets the
+    exact same command id, so the dashboard's own "waiting on N/M machines"
+    bookkeeping (which is keyed by id) works for these broadcasts too.
+    Returns the number of machines it was successfully queued on.
+    """
+    cmd_with_id = dict(cmd)
+    cmd_with_id.setdefault("id", int(time.time() * 1000))
+    ok = 0
+    for mid in list_sync_machines(cfg):
+        if mid in exclude_ids:
+            continue
+        try:
+            if append_command_to_machine(cfg, mid, cmd_with_id):
+                ok += 1
+        except Exception as exc:
+            sys.stderr.write(f"[sync] broadcast to {mid} failed: {exc}\n")
+    return ok
 
 
 def _gh_request(url, token, method="GET", body=None):
@@ -2877,11 +3133,17 @@ def fetch_commands(cfg):
     return cmds if isinstance(cmds, list) else []
 
 
-def apply_remote_command(state, cmd):
+def apply_remote_command(state, cmd, store=None):
     """
     Apply one command dict to the shared AppState. The 5-second enforcement
     sweep (which both daemon threads share) then propagates website / lockdown /
     kill effects, so we only mutate state here. Returns (ok, message).
+
+    `store` is only needed for the two screen-budget actions (grant_screen_time
+    writes to it directly; set_screen_budget doesn't touch it but takes the
+    parameter for a consistent signature) -- every other action only touches
+    `state`. Falls back to a fresh HistoryStore() if not given, so existing
+    callers that don't pass one still work.
     """
     action = str(cmd.get("action", ""))
 
@@ -3006,6 +3268,29 @@ def apply_remote_command(state, cmd):
         mins = cmd.get("minutes")
         return True, (f"allowed {dom} for {mins} min" if mins
                       else f"re-blocked {dom}")
+
+    if action == "grant_screen_time":
+        user = str(cmd.get("user", "")).strip()
+        try:
+            minutes = max(0, int(cmd.get("minutes", 0)))
+        except (TypeError, ValueError):
+            minutes = 0
+        if not user or minutes <= 0:
+            return False, "user and minutes required"
+        day = time.strftime("%Y-%m-%d")
+        (store or HistoryStore()).add_bonus_seconds(user, day, minutes * 60)
+        return True, f"granted {user} +{minutes}m screen time"
+
+    if action == "set_screen_budget":
+        # Lets the screen-time budget config (default minutes + per-user
+        # overrides) sync across machines: whichever machine an admin edits
+        # it on broadcasts this same command to the others, so there's one
+        # shared setting instead of each machine drifting independently.
+        # set_screen_budget() already sanitizes whatever it's given, so the
+        # raw command dict (with its extra action/id keys) is safe to pass
+        # through as-is.
+        state.set_screen_budget(cmd)
+        return True, "screen-time budget updated"
 
     return False, f"unknown action '{action}'"
 
@@ -5079,8 +5364,17 @@ class AppBlockerUI:
                  "blocks). A one-time heads-up appears with about 1/6 of "
                  "the budget left. The lock screen's Unlock button (admin "
                  f"password) grants +{BUDGET_GRANT_MINUTES} minutes; its "
-                 "Shut Down button needs no password, since it doesn't "
-                 "grant extra time — it only ends the session.",
+                 "Log Out and Shut Down buttons need no password, since "
+                 "neither grants extra time — they only end the session.",
+                 bg=COLOR_BG, fg="#7f8c8d", wraplength=470,
+                 justify="left").pack(padx=16, pady=(0, 8))
+        tk.Label(body, text="If Remote Dashboard syncing is set up above, "
+                 "saving here shares these settings with your other "
+                 "machines automatically, and a user's time used (and any "
+                 "bonus minutes granted, locally or from the dashboard) "
+                 "combines across all of them into one shared daily "
+                 "budget — switching computers doesn't reset it. The TV is "
+                 "never part of this combined total.",
                  bg=COLOR_BG, fg="#7f8c8d", wraplength=470,
                  justify="left").pack(padx=16, pady=(0, 8))
 
@@ -5139,9 +5433,27 @@ class AppBlockerUI:
                     "per_user": per_user}
 
         def save():
-            self.state.set_screen_budget(collect())
-            messagebox.showinfo("Saved", "Screen time budget settings saved.",
-                                parent=win)
+            cfg = collect()
+            self.state.set_screen_budget(cfg)
+            # Broadcast to sibling machines so the budget number itself stays
+            # one shared setting instead of drifting apart per machine --
+            # matters now that usage/bonus combine across machines too, or a
+            # mismatched budget on one machine would make the combined total
+            # confusing to reason about. Skipped entirely (no network call,
+            # same as before this feature) if sync isn't configured.
+            with self.state.lock:
+                sync_cfg = dict(self.state.sync)
+            extra = ""
+            if (sync_cfg.get("enabled") and sync_cfg.get("repo")
+                    and sync_cfg.get("token")):
+                n = broadcast_command(
+                    sync_cfg, dict(cfg, action="set_screen_budget"),
+                    exclude_ids={machine_id()})
+                if n:
+                    extra = f" Synced to {n} other machine(s)."
+            messagebox.showinfo(
+                "Saved", "Screen time budget settings saved." + extra,
+                parent=win)
             win.destroy()
 
         tk.Button(bar, text="Save", command=save, bg=COLOR_ACTIVE, fg="white",
@@ -6805,6 +7117,19 @@ def main():
         print(f"Screen-time lock disabled and {killed} overlay window(s) "
               "closed." if killed else
               "Screen-time lock disabled. No overlay windows were open.")
+        # An emergency stop should be household-wide if the budget is
+        # combined across machines -- broadcast the disable to siblings the
+        # same way saving the budget dialog does, rather than leaving other
+        # machines still enforcing on this machine's old (now-stale) numbers.
+        with st.lock:
+            sync_cfg = dict(st.sync)
+        if (sync_cfg.get("enabled") and sync_cfg.get("repo")
+                and sync_cfg.get("token")):
+            n = broadcast_command(
+                sync_cfg, dict(cfg, action="set_screen_budget"),
+                exclude_ids={machine_id()})
+            if n:
+                print(f"Also disabled on {n} other synced machine(s).")
         print("Re-enable it from the app's Screen Time Budget settings "
               "when you're ready.")
         return

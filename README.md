@@ -210,6 +210,37 @@ budget left.
   doesn't reset it. It clears at local midnight, same as the rest of the
   screen-time tracking.
 
+### Combined across multiple computers
+
+If you have **Remote Dashboard** syncing set up on more than one machine
+(same private repo), the budget stops being a per-machine setting:
+
+- **Saving the budget on any machine syncs it to the others** — set it once,
+  not once per computer.
+- **Usage combines too.** A kid's time on any of your synced computers all
+  counts against the same daily total, so switching machines doesn't reset
+  the clock. This rides on the same ~5-minute opportunistic sync the
+  dashboard already uses, so there's a short lag before a just-switched-to
+  computer "notices" — a kid could pick up a few extra minutes hopping
+  machines right at that boundary, the same honest, userspace-not-kernel-level
+  limits as the rest of this feature.
+- **The TV is never part of this combined total**, even for a kid whose TV
+  is labeled with their username elsewhere on the dashboard — watching TV
+  never locks a computer.
+- Without any Remote Dashboard syncing configured (or on a single-machine
+  household), the budget behaves exactly as before: purely local, purely
+  per-machine.
+
+### Granting time remotely
+
+The **Remote Dashboard**'s **Controls** tab has a **Screen time** section:
+pick a user and an amount, then **Grant** — it adds those minutes the same
+way a correct password at the lock screen does, without needing to be
+standing at the computer. It's sent to whichever machine(s) are targeted at
+the top of Controls (**All machines (broadcast)** by default), so sending it
+"everywhere" is fine even if you're not sure which computer a kid is
+currently on — it's a harmless unused credit on any machine they're not.
+
 **Before relying on this**, verify it actually works on each machine — the
 mechanism (a root daemon showing a window in another user's own graphical
 session) needs testing per machine/desktop environment:
@@ -232,7 +263,8 @@ sudo appblocker --unlock-clear
 ```
 
 This disables the screen-time lock and immediately closes any open lock
-overlays, machine-wide.
+overlays on this machine — and, if Remote Dashboard syncing is configured,
+disables it on every other synced machine too (never touches the TV).
 
 Honest limits: like the rest of AppBlocker's enforcement, this is userspace,
 not kernel-level — a technically determined kid could in principle reach a
