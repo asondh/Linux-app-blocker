@@ -462,7 +462,9 @@ function fmtWhen(ts){ const d=new Date(ts*1000);
   const day=d.toLocaleDateString([], {year:"numeric",month:"2-digit",day:"2-digit"});
   const tm=d.toLocaleTimeString([], {hour:"2-digit",minute:"2-digit"});
   return '<span class="nw">'+day+'</span> <span class="nw">'+tm+'</span>'; }
-function fmtDur(s){ const m=Math.floor(s/60);
+// Humanise a duration in seconds → "2h 5m" / "45m" / "<1m" / "0m".
+function fmtDur(s){ s=Math.max(0,Math.round(s||0)); if(s===0) return "0m";
+  const m=Math.floor(s/60);
   if(m>=60) return Math.floor(m/60)+"h "+(m%60)+"m";
   return m? m+"m" : "<1m"; }
 
@@ -616,12 +618,6 @@ function renderSummary(){
   });
   el.innerHTML=h+`</div>`;
 }
-// Humanise a duration in seconds → "2h 5m" / "45m" / "<1m" / "0m".
-function fmtDur(sec){ sec=Math.max(0,Math.round(sec||0));
-  if(sec===0) return "0m";
-  if(sec<60) return "<1m";
-  const h=Math.floor(sec/3600), m=Math.round((sec%3600)/60);
-  return h ? (h+"h "+m+"m") : (m+"m"); }
 
 function render(){
   const rows = activeRows();
