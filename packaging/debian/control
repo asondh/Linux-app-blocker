@@ -1,11 +1,11 @@
 Package: appblocker
-Version: 0.39.0
+Version: 0.40.0
 Section: utils
 Priority: optional
 Architecture: all
 Maintainer: AppBlocker <appblocker@example.com>
 Depends: python3 (>= 3.6), python3-tk, policykit-1, wmctrl
-Recommends: python3-pil, python3-pystray
+Recommends: python3-pil, python3-pystray, x11-utils
 Homepage: https://github.com/asondh/Linux-app-blocker
 Description: Parent-friendly application blocker with timers and schedules
  AppBlocker lets a parent block applications (especially web browsers) for

@@ -85,6 +85,9 @@
   .time-row:hover { background:#f8f9fa; }
   .time-row .tw { color:var(--muted); font-size:11px; display:inline-block; width:12px; }
   .time-detail td { padding:2px 12px 8px 30px; background:#fbfcfc; }
+  .app-bd { margin:2px 0 8px; padding-bottom:6px; border-bottom:1px dashed var(--line); }
+  .app-bd-t { font-size:11px; font-weight:600; color:var(--muted);
+              text-transform:uppercase; letter-spacing:.03em; margin:2px 0 4px; }
   /* Time per site: a site row can expand again to show searches made there. */
   .qrow-site { border-top:1px dashed var(--line); }
   .qrow-site:first-child { border-top:0; }
@@ -326,6 +329,7 @@ function todayStr(){ const d=new Date();
 function mergeMachines(){
   const visits=[], attempts=[], blocked_sites=[], new_domains=[], users=new Set();
   const screen_time={};                 // user -> seconds on a computer today (all machines, incl. TV)
+  const app_time={};                    // user -> {app_key: {label, secs}} today, summed across computers
   const today=todayStr();
   MACHINES.forEach(m => {
     const nm = m.name;
@@ -339,6 +343,18 @@ function mergeMachines(){
     if(m.data.screen_day===today && m.data.screen_time){
       Object.entries(m.data.screen_time).forEach(([u,s])=>{
         screen_time[u]=(screen_time[u]||0)+(+s||0); users.add(u); });
+    }
+    // Accurate per-app time (X11 machines only), summed across computers by
+    // app key, keeping the latest human label.
+    if(m.data.screen_day===today && m.data.app_time){
+      Object.entries(m.data.app_time).forEach(([u,list])=>{
+        const bucket=(app_time[u]=app_time[u]||{});
+        (list||[]).forEach(a=>{
+          const cur=bucket[a.app]||{label:a.label, secs:0};
+          cur.secs+=(+a.secs||0); cur.label=a.label||cur.label;
+          bucket[a.app]=cur;
+        });
+      });
     }
   });
   // Monitoring-health alerts. A device that reports accessibility_enabled:false
@@ -357,8 +373,8 @@ function mergeMachines(){
         why:"no update in "+Math.round((nowS-d.generated_at)/60)+" min"});
     }
   });
-  DATA = { visits, attempts, blocked_sites, new_domains, screen_time, monAlerts,
-           users:[...users].sort(),
+  DATA = { visits, attempts, blocked_sites, new_domains, screen_time, app_time,
+           monAlerts, users:[...users].sort(),
            machines: MACHINES.map(m=>({id:m.id, name:m.name})),
            truncated: MACHINES.some(m=>m.data.truncated) };
 }
@@ -711,6 +727,20 @@ function render(){
     dtr.className="time-detail"+(open?"":" hidden");
     const td=document.createElement("td");
     td.colSpan=3;
+    // Accurate per-app time (X11 machines). Shown above the browsing breakdown;
+    // this is the real focused-window time, so a PWA reads correctly here.
+    const apps=(DATA.app_time||{})[d.user];
+    if(apps){
+      const arr=Object.values(apps).filter(a=>a.secs>=30)
+                     .sort((a,b)=>b.secs-a.secs);
+      if(arr.length){
+        const ab=document.createElement("div"); ab.className="app-bd";
+        ab.innerHTML='<div class="app-bd-t">Actual time per app (focused window)</div>'+
+          arr.map(a=>`<div class="qrow"><span class="q">${esc(a.label)}</span>`+
+            `<span class="qmeta">${fmtDur(a.secs)}</span></div>`).join("");
+        td.appendChild(ab);
+      }
+    }
     d.sites.forEach(s=>{
       const who=(multiT&&s.ms.length)?" · "+s.ms.map(esc).join(", "):"";
       const hasSearch=s.searches.length>0;
