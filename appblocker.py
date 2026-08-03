@@ -37,6 +37,7 @@ import time
 import signal
 import hashlib
 import glob
+import re
 import ssl
 import shutil
 import sqlite3
@@ -248,6 +249,100 @@ def active_screen_users():
     except Exception:
         pass
     return users
+
+
+def user_x_env(uid):
+    """DISPLAY / XAUTHORITY for a uid's graphical session, read from one of its
+    session processes' environment, or None if it has no X session."""
+    try:
+        home = pwd.getpwuid(uid).pw_dir
+    except Exception:
+        home = None
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        base = f"/proc/{pid}"
+        try:
+            if os.stat(base).st_uid != uid:
+                continue
+            with open(f"{base}/environ", "rb") as fh:
+                raw = fh.read()
+        except Exception:
+            continue
+        disp = xauth = None
+        for e in raw.split(b"\0"):
+            if e.startswith(b"DISPLAY="):
+                disp = e[8:].decode("utf-8", "replace")
+            elif e.startswith(b"XAUTHORITY="):
+                xauth = e[11:].decode("utf-8", "replace")
+        if disp:
+            if not xauth and home:
+                xauth = os.path.join(home, ".Xauthority")
+            return {"DISPLAY": disp, "XAUTHORITY": xauth}
+    return None
+
+
+def active_window_app(uid, env=None):
+    """(app_key, label) of a uid's currently-focused X11 window, or None.
+
+    app_key is a stable per-app bucket (WM_CLASS "instance.class", lowercased —
+    so each Chromium PWA, which has its own instance, is its own bucket while a
+    normal app groups its windows together). label is the human-readable window
+    title for display. Returns None on Wayland or when xprop/xdotool aren't
+    available, so the caller simply records no per-app time (screen-on time and
+    the browsing estimate still work) — that's the graceful Wayland fallback.
+    """
+    env = env or user_x_env(uid)
+    if not env or not env.get("DISPLAY"):
+        return None
+    run_env = dict(os.environ)
+    run_env["DISPLAY"] = env["DISPLAY"]
+    if env.get("XAUTHORITY"):
+        run_env["XAUTHORITY"] = env["XAUTHORITY"]
+
+    def run(cmd):
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               timeout=5, env=run_env)
+            return r.stdout if r.returncode == 0 else ""
+        except Exception:
+            return ""
+
+    have_xprop, have_xdotool = which("xprop"), which("xdotool")
+    # Active window id.
+    wid = None
+    if have_xprop:
+        m = re.search(r"0x[0-9a-fA-F]+",
+                      run(["xprop", "-root", "-notype", "_NET_ACTIVE_WINDOW"]))
+        if m:
+            wid = m.group(0)
+    if not wid and have_xdotool:
+        out = run(["xdotool", "getactivewindow"]).strip()
+        if out.isdigit():
+            wid = out
+    if not wid or wid in ("0x0", "0"):
+        return None
+
+    inst = cls = title = ""
+    if have_xprop:
+        out = run(["xprop", "-id", wid, "-notype",
+                   "WM_CLASS", "_NET_WM_NAME", "WM_NAME"])
+        mc = re.search(r'WM_CLASS[^=]*=\s*"([^"]*)"(?:,\s*"([^"]*)")?', out)
+        if mc:
+            inst, cls = mc.group(1) or "", mc.group(2) or ""
+        mt = (re.search(r'_NET_WM_NAME[^=]*=\s*"(.*)"', out)
+              or re.search(r'\bWM_NAME[^=]*=\s*"(.*)"', out))
+        if mt:
+            title = mt.group(1)
+    elif have_xdotool:
+        cls = run(["xdotool", "getwindowclassname", wid]).strip()
+        title = run(["xdotool", "getwindowname", wid]).strip()
+
+    app_key = (inst.strip().lower() + "." + cls.strip().lower()).strip(".")
+    if not app_key:
+        return None
+    label = title.strip() or cls.strip() or inst.strip() or app_key
+    return (app_key, label)
 
 
 # Minimum Python for subprocess's user=/group=/extra_groups= parameters --
@@ -1071,7 +1166,13 @@ class HistoryStore:
                 # check adds this to screen_time when deciding whether to lock.
                 "CREATE TABLE IF NOT EXISTS bonus_minutes ("
                 " username TEXT, day TEXT, seconds INTEGER,"
-                " PRIMARY KEY(username, day));")
+                " PRIMARY KEY(username, day));"
+                # Per-user, per-app focused-window seconds, bucketed by local
+                # day. app = stable WM_CLASS key; label = latest window title.
+                # X11 only (empty on Wayland). Purely additive.
+                "CREATE TABLE IF NOT EXISTS app_time ("
+                " username TEXT, day TEXT, app TEXT, label TEXT, seconds INTEGER,"
+                " PRIMARY KEY(username, day, app));")
             conn.commit()
         finally:
             conn.close()
@@ -1277,6 +1378,40 @@ class HistoryStore:
                 (day,)).fetchall()}
         finally:
             conn.close()
+
+    # -- per-app focused-window time (X11 only) ----------------------------- #
+    def add_app_time(self, username, day, app, label, seconds):
+        """Add focused-window `seconds` to (username, day, app); refresh label."""
+        if seconds <= 0 or not app:
+            return
+        conn = self._connect()
+        try:
+            conn.execute(
+                "INSERT INTO app_time(username,day,app,label,seconds) "
+                "VALUES(?,?,?,?,?) ON CONFLICT(username,day,app) DO UPDATE SET "
+                "seconds=seconds+excluded.seconds, label=excluded.label",
+                (username, day, app, label or app, int(seconds)))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def app_seconds(self, day):
+        """{username: [{app, label, secs}]} of per-app time for `day`, each
+        user's list sorted longest-first."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT username, app, label, seconds FROM app_time WHERE day=?",
+                (day,)).fetchall()
+        finally:
+            conn.close()
+        out = {}
+        for u, app, label, secs in rows:
+            out.setdefault(u, []).append(
+                {"app": app, "label": label, "secs": int(secs)})
+        for u in out:
+            out[u].sort(key=lambda x: x["secs"], reverse=True)
+        return out
 
     # -- screen-time budget bonus --------------------------------------------#
     def add_bonus_seconds(self, username, day, seconds):
@@ -1956,6 +2091,7 @@ class HistoryMonitor(threading.Thread):
         self._newdom_sent = 0       # real-time new-domain emails sent today
         self._last_known_push = 0   # last household-ledger refresh (throttle)
         self._last_screen = None    # last screen-time sample time (epoch)
+        self._last_app = None       # last per-app sample time (epoch)
         self._last_tv_sync = 0      # last TV Locker Guard bridge push
         self._last_budget_sync = 0  # last combined screen-budget usage fetch
         self._remote_used = {}      # user -> today's screen seconds on other machines
@@ -1978,6 +2114,28 @@ class HistoryMonitor(threading.Thread):
         day = time.strftime("%Y-%m-%d", time.localtime(now))
         for user in active_screen_users():
             store.add_screen_time(user, day, int(round(delta)))
+
+    def _sample_app_time(self, store):
+        """Accrue per-app focused-window time for active users (X11 only). Same
+        clamped-delta scheme as _sample_screen_time; a no-op on Wayland or when
+        xprop/xdotool aren't present (active_window_app returns None)."""
+        now = time.time()
+        last, self._last_app = self._last_app, now
+        if last is None:
+            return
+        delta = now - last
+        if delta <= 0 or delta > 3 * MONITOR_HISTORY_INTERVAL:
+            return
+        day = time.strftime("%Y-%m-%d", time.localtime(now))
+        secs = int(round(delta))
+        for user in active_screen_users():
+            try:
+                uid = pwd.getpwnam(user).pw_uid
+            except KeyError:
+                continue
+            app = active_window_app(uid)
+            if app:
+                store.add_app_time(user, day, app[0], app[1], secs)
 
     def _check_screen_budget(self, store):
         """
@@ -2125,6 +2283,7 @@ class HistoryMonitor(threading.Thread):
                 self._maybe_new_domain_alert(store)
                 store.set_state("__heartbeat__", int(time.time()))
                 self._sample_screen_time(store)
+                self._sample_app_time(store)
                 self._check_screen_budget(store)
                 self._maybe_digest(store)
                 self._maybe_new_domain_digest(store)
@@ -2509,6 +2668,9 @@ def build_report_data(store, days=REPORT_DAYS, limit=REPORT_LIMIT,
     # alongside screen_time so sibling machines can fold it into one combined
     # daily budget instead of each enforcing its own independent total.
     bonus_time = store.bonus_seconds_all(today_str)
+    # Per-app focused-window time for today (X11 only; empty on Wayland) — the
+    # accurate per-app/PWA breakdown, in contrast to the history-gap estimate.
+    app_time = store.app_seconds(today_str)
     users = sorted(set(store.users()) | {a["u"] for a in attempts}
                    | set(screen_time))
     # New-domain novelty events in the window (sites the child had never
@@ -2531,6 +2693,7 @@ def build_report_data(store, days=REPORT_DAYS, limit=REPORT_LIMIT,
         "new_domains": new_domains,
         "screen_time": screen_time,
         "bonus_time": bonus_time,
+        "app_time": app_time,
         "screen_day": today_str,
         "control_results": list(cmd_results or []),
         "cmd_ts": int(cmd_ts or 0),
@@ -3553,34 +3716,8 @@ class ProcessMonitor(threading.Thread):
         return changed
 
     def _user_x_env(self, uid):
-        """DISPLAY / XAUTHORITY for a uid's graphical session, read from one of
-        its session processes' environment, or None if it has no X session."""
-        try:
-            home = pwd.getpwuid(uid).pw_dir
-        except Exception:
-            home = None
-        for pid in os.listdir("/proc"):
-            if not pid.isdigit():
-                continue
-            base = f"/proc/{pid}"
-            try:
-                if os.stat(base).st_uid != uid:
-                    continue
-                with open(f"{base}/environ", "rb") as fh:
-                    raw = fh.read()
-            except Exception:
-                continue
-            disp = xauth = None
-            for e in raw.split(b"\0"):
-                if e.startswith(b"DISPLAY="):
-                    disp = e[8:].decode("utf-8", "replace")
-                elif e.startswith(b"XAUTHORITY="):
-                    xauth = e[11:].decode("utf-8", "replace")
-            if disp:
-                if not xauth and home:
-                    xauth = os.path.join(home, ".Xauthority")
-                return {"DISPLAY": disp, "XAUTHORITY": xauth}
-        return None
+        """DISPLAY / XAUTHORITY for a uid's graphical session (module helper)."""
+        return user_x_env(uid)
 
     def _list_user_windows(self, uid):
         """Lowercased 'wm_class title' strings for a user's open windows, or
