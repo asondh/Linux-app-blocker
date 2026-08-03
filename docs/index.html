@@ -735,7 +735,9 @@ function render(){
                      .sort((a,b)=>b.secs-a.secs);
       if(arr.length){
         const ab=document.createElement("div"); ab.className="app-bd";
-        ab.innerHTML='<div class="app-bd-t">Actual time per app (focused window)</div>'+
+        ab.innerHTML='<div class="app-bd-t" title="Time each app was the focused '+
+          'window with recent activity (idle time excluded). X11 machines only.">'+
+          'Active time per app (focused, not idle)</div>'+
           arr.map(a=>`<div class="qrow"><span class="q">${esc(a.label)}</span>`+
             `<span class="qmeta">${fmtDur(a.secs)}</span></div>`).join("");
         td.appendChild(ab);

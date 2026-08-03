@@ -345,6 +345,27 @@ def active_window_app(uid, env=None):
     return (app_key, label)
 
 
+def user_idle_seconds(env):
+    """Seconds since the last keyboard/mouse input in a uid's X11 session, or
+    None if it can't be determined (xprintidle missing, or Wayland). Uses the
+    XScreenSaver idle counter via the xprintidle utility."""
+    if not which("xprintidle") or not env or not env.get("DISPLAY"):
+        return None
+    run_env = dict(os.environ)
+    run_env["DISPLAY"] = env["DISPLAY"]
+    if env.get("XAUTHORITY"):
+        run_env["XAUTHORITY"] = env["XAUTHORITY"]
+    try:
+        r = subprocess.run(["xprintidle"], capture_output=True, text=True,
+                           timeout=5, env=run_env)
+    except Exception:
+        return None
+    out = r.stdout.strip()
+    if r.returncode != 0 or not out.isdigit():
+        return None
+    return int(out) / 1000.0
+
+
 # Minimum Python for subprocess's user=/group=/extra_groups= parameters --
 # the safe, documented way to fork-and-drop-privileges from a process that
 # has other threads running (which the daemon always does). Older Python
@@ -943,6 +964,12 @@ def _firefox_program_dirs():
 # with approximate time-on-site, and raises email alerts on watched sites.
 # --------------------------------------------------------------------------- #
 MONITOR_HISTORY_INTERVAL = 45     # seconds between history imports
+# Per-app time only counts while the child is actually active: if there's been
+# no keyboard/mouse input for longer than this, a focused window stops accruing
+# time (so a PWA parked in front while they walked away doesn't rack up time).
+# Generous enough not to punish quiet reading; only applied when xprintidle is
+# available (else per-app time is focus-only, as before).
+APP_IDLE_CUTOFF = 120             # seconds of no input before "idle"
 VISIT_IDLE_CAP = 1800             # cap a single visit's duration at 30 min
 ALERT_DEBOUNCE = 600              # don't re-alert same user+site within 10 min
 ATTEMPT_DEBOUNCE = 300            # don't re-log same user+app block within 5 min
@@ -2133,7 +2160,16 @@ class HistoryMonitor(threading.Thread):
                 uid = pwd.getpwnam(user).pw_uid
             except KeyError:
                 continue
-            app = active_window_app(uid)
+            env = user_x_env(uid)
+            if not env:
+                continue
+            # Skip crediting when the child has been idle past the cutoff, so a
+            # window left in front while they walked away doesn't accrue time.
+            # (No-op when xprintidle isn't installed: idle is None.)
+            idle = user_idle_seconds(env)
+            if idle is not None and idle > APP_IDLE_CUTOFF:
+                continue
+            app = active_window_app(uid, env)
             if app:
                 store.add_app_time(user, day, app[0], app[1], secs)
 
