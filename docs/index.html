@@ -326,6 +326,13 @@ async function ghGetRaw(path){
 function todayStr(){ const d=new Date();
   return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+
          String(d.getDate()).padStart(2,"0"); }
+// Local-midnight epoch (seconds) for a "YYYY-MM-DD" string, or null. Built with
+// new Date(y,m-1,d) so it's the VIEWER's local midnight — Date.parse() on a
+// date-only string is UTC, which leaked the prior evening into the "today" view.
+function dayStartTs(str){ if(!str) return null;
+  const p=(str||"").split("-").map(Number);
+  if(p.length!==3 || p.some(isNaN)) return null;
+  return new Date(p[0], p[1]-1, p[2]).getTime()/1000; }
 function mergeMachines(){
   const visits=[], attempts=[], blocked_sites=[], new_domains=[], users=new Set();
   const screen_time={};                 // user -> seconds on a computer today (all machines, incl. TV)
@@ -462,8 +469,8 @@ function activeRows(){
   const u = $("fx-user").value;
   const mac = $("fx-machine").value;
   const site = ($("fx-site").value||"").toLowerCase().trim();
-  const from = $("fx-from").value ? Date.parse($("fx-from").value)/1000 : null;
-  const to = $("fx-to").value ? Date.parse($("fx-to").value)/1000 + 86400 : null;
+  const from = dayStartTs($("fx-from").value);
+  const to = $("fx-to").value ? dayStartTs($("fx-to").value) + 86400 : null;
   return (DATA.visits||[]).filter(v => {
     if(u !== "All users" && v.u !== u) return false;
     if(mac !== "All machines" && v._m !== mac) return false;
@@ -661,8 +668,8 @@ function render(){
   // site-text filters as the other tabs.
   const uN=$("fx-user").value, macN=$("fx-machine").value;
   const siteN=($("fx-site").value||"").toLowerCase().trim();
-  const fromN=$("fx-from").value?Date.parse($("fx-from").value)/1000:null;
-  const toN=$("fx-to").value?Date.parse($("fx-to").value)/1000+86400:null;
+  const fromN=dayStartTs($("fx-from").value);
+  const toN=$("fx-to").value?dayStartTs($("fx-to").value)+86400:null;
   let nd=(DATA.new_domains||[]).filter(n=>{
     if(uN!=="All users"&&n.u!==uN) return false;
     if(macN!=="All machines"&&n._m!==macN) return false;
@@ -791,8 +798,8 @@ function render(){
   // (user + machine + date filters; the site-text filter also narrows sites.)
   const u=$("fx-user").value, mac=$("fx-machine").value;
   const siteF=($("fx-site").value||"").toLowerCase().trim();
-  const from=$("fx-from").value?Date.parse($("fx-from").value)/1000:null;
-  const to=$("fx-to").value?Date.parse($("fx-to").value)/1000+86400:null;
+  const from=dayStartTs($("fx-from").value);
+  const to=$("fx-to").value?dayStartTs($("fx-to").value)+86400:null;
   const combined = (DATA.attempts||[]).map(a=>(
       {ts:a.ts,user:a.u,m:a._m,type:"App",what:a.app,site:false}))
     .concat((DATA.blocked_sites||[]).map(s=>(
