@@ -1102,8 +1102,14 @@ def iter_history_sources(home):
 def _read_browser_history(kind, db_path, since_native):
     """
     Read visits newer than `since_native` (the browser's own time units).
-    Returns (rows, max_native) where rows = [(epoch_seconds, url, title)].
-    Copies the DB (and WAL/SHM) first so we can read it while the browser runs.
+    Returns (rows, max_native) with rows = [(epoch_seconds, url, title,
+    duration_seconds_or_None, background_0_or_1)].
+
+    duration is the browser's real foreground time (Chromium's visit_duration;
+    None on Firefox, which has no such column). background=1 marks
+    automatically-loaded entries (embedded/subframe/download) that aren't a
+    real page the child looked at. Falls back to the old columns-only read on
+    an unexpected schema. Copies the DB (and WAL/SHM) so we can read it live.
     """
     rows = []
     max_native = since_native
@@ -1121,26 +1127,60 @@ def _read_browser_history(kind, db_path, since_native):
         try:
             cur = conn.cursor()
             if kind == "firefox":
-                cur.execute(
-                    "SELECT v.visit_date, p.url, p.title "
-                    "FROM moz_historyvisits v JOIN moz_places p ON p.id = v.place_id "
-                    "WHERE v.visit_date > ? ORDER BY v.visit_date", (since_native,))
-                for visit_date, url, title in cur.fetchall():
+                # Firefox: visit_type distinguishes real navigations from
+                # embedded (4) / download (7) entries; no duration column.
+                try:
+                    cur.execute(
+                        "SELECT v.visit_date, p.url, p.title, v.visit_type "
+                        "FROM moz_historyvisits v "
+                        "JOIN moz_places p ON p.id = v.place_id "
+                        "WHERE v.visit_date > ? ORDER BY v.visit_date",
+                        (since_native,))
+                    extra = True
+                except sqlite3.OperationalError:
+                    cur.execute(
+                        "SELECT v.visit_date, p.url, p.title "
+                        "FROM moz_historyvisits v "
+                        "JOIN moz_places p ON p.id = v.place_id "
+                        "WHERE v.visit_date > ? ORDER BY v.visit_date",
+                        (since_native,))
+                    extra = False
+                for row in cur.fetchall():
+                    visit_date, url, title = row[0], row[1], row[2]
                     if visit_date is None:
                         continue
                     max_native = max(max_native, visit_date)
-                    rows.append((visit_date / 1_000_000.0, url, title or ""))
+                    bg = 1 if (extra and (row[3] or 0) in (4, 7)) else 0
+                    rows.append((visit_date / 1_000_000.0, url, title or "",
+                                 None, bg))
             else:  # chromium family
-                cur.execute(
-                    "SELECT v.visit_time, u.url, u.title "
-                    "FROM visits v JOIN urls u ON u.id = v.url "
-                    "WHERE v.visit_time > ? ORDER BY v.visit_time", (since_native,))
-                for visit_time, url, title in cur.fetchall():
+                # Chromium: visit_duration = real foreground time (microseconds);
+                # transition core-type 3 = auto_subframe (embedded/background).
+                try:
+                    cur.execute(
+                        "SELECT v.visit_time, u.url, u.title, v.visit_duration, "
+                        "v.transition FROM visits v JOIN urls u ON u.id = v.url "
+                        "WHERE v.visit_time > ? ORDER BY v.visit_time",
+                        (since_native,))
+                    extra = True
+                except sqlite3.OperationalError:
+                    cur.execute(
+                        "SELECT v.visit_time, u.url, u.title "
+                        "FROM visits v JOIN urls u ON u.id = v.url "
+                        "WHERE v.visit_time > ? ORDER BY v.visit_time",
+                        (since_native,))
+                    extra = False
+                for row in cur.fetchall():
+                    visit_time, url, title = row[0], row[1], row[2]
                     if visit_time is None:
                         continue
                     max_native = max(max_native, visit_time)
                     epoch = visit_time / 1_000_000.0 - CHROME_EPOCH_OFFSET
-                    rows.append((epoch, url, title or ""))
+                    dur = bg = None
+                    if extra:
+                        dur = int((row[3] or 0) / 1_000_000)   # µs -> seconds
+                        bg = 1 if ((row[4] or 0) & 0xFF) == 3 else 0
+                    rows.append((epoch, url, title or "", dur, bg))
         finally:
             conn.close()
     except Exception as exc:
@@ -1166,7 +1206,8 @@ class HistoryStore:
         try:
             conn.executescript(
                 "CREATE TABLE IF NOT EXISTS visits ("
-                " username TEXT, domain TEXT, url TEXT, title TEXT, ts INTEGER);"
+                " username TEXT, domain TEXT, url TEXT, title TEXT, ts INTEGER,"
+                " duration INTEGER, background INTEGER DEFAULT 0);"
                 "CREATE INDEX IF NOT EXISTS i_visits_user_ts ON visits(username, ts);"
                 "CREATE INDEX IF NOT EXISTS i_visits_domain ON visits(domain);"
                 "CREATE TABLE IF NOT EXISTS cursors ("
@@ -1200,6 +1241,15 @@ class HistoryStore:
                 "CREATE TABLE IF NOT EXISTS app_time ("
                 " username TEXT, day TEXT, app TEXT, label TEXT, seconds INTEGER,"
                 " PRIMARY KEY(username, day, app));")
+            # Migration: add real-duration + background columns to a visits
+            # table created before this feature. Safe/idempotent.
+            cols = {r[1] for r in conn.execute(
+                "PRAGMA table_info(visits)").fetchall()}
+            if "duration" not in cols:
+                conn.execute("ALTER TABLE visits ADD COLUMN duration INTEGER")
+            if "background" not in cols:
+                conn.execute(
+                    "ALTER TABLE visits ADD COLUMN background INTEGER DEFAULT 0")
             conn.commit()
         finally:
             conn.close()
@@ -1219,18 +1269,22 @@ class HistoryStore:
             conn.close()
 
     def add_visits(self, username, rows, source, last_native):
-        """rows = [(epoch, url, title)]. Stores web visits, updates the cursor."""
+        """rows = [(epoch, url, title, duration_or_None, background_0_or_1)].
+        Stores web visits (with real duration + background flag) and updates
+        the cursor."""
         conn = self._connect()
         try:
             data = []
-            for epoch, url, title in rows:
+            for epoch, url, title, dur, bg in rows:
                 dom = domain_of(url)
                 if dom:
-                    data.append((username, dom, url, title, int(epoch)))
+                    data.append((username, dom, url, title, int(epoch),
+                                 int(dur) if dur is not None else None,
+                                 int(bg or 0)))
             if data:
                 conn.executemany(
-                    "INSERT INTO visits(username,domain,url,title,ts) "
-                    "VALUES (?,?,?,?,?)", data)
+                    "INSERT INTO visits(username,domain,url,title,ts,"
+                    "duration,background) VALUES (?,?,?,?,?,?,?)", data)
             conn.execute(
                 "INSERT INTO cursors(source,last) VALUES(?,?) "
                 "ON CONFLICT(source) DO UPDATE SET last=excluded.last",
@@ -1549,9 +1603,12 @@ class HistoryStore:
         return lo, hi
 
     def query(self, username=None, domain_like=None, start_day=None,
-              end_day=None, limit=5000):
-        """Return visit rows (username, domain, url, ts) matching filters."""
-        sql = "SELECT username, domain, url, ts FROM visits WHERE 1=1"
+              end_day=None, limit=5000, extra=False):
+        """Return visit rows matching filters: (username, domain, url, ts), or
+        (username, domain, url, ts, duration, background) when extra=True."""
+        cols = "username, domain, url, ts" + (", duration, background"
+                                              if extra else "")
+        sql = f"SELECT {cols} FROM visits WHERE 1=1"
         args = []
         if username and username != "All users":
             sql += " AND username=?"
@@ -2681,13 +2738,15 @@ def build_report_data(store, days=REPORT_DAYS, limit=REPORT_LIMIT,
     """
     start_day = time.strftime("%Y-%m-%d",
                               time.localtime(time.time() - days * 86400))
-    rows = store.query(start_day=start_day, limit=limit + 1)
+    rows = store.query(start_day=start_day, limit=limit + 1, extra=True)
     truncated = len(rows) > limit
     rows = rows[:limit]
     visits = []
-    for username, domain, url, ts in rows:
+    for username, domain, url, ts, dur, bg in rows:
         visits.append({"u": username, "d": domain, "url": url, "ts": int(ts),
-                       "q": extract_search_query(url)})
+                       "q": extract_search_query(url),
+                       "dur": int(dur) if dur is not None else None,
+                       "bg": 1 if bg else 0})
     attempts = [{"u": u, "app": app, "ts": int(ts)}
                 for u, app, ts in store.attempts(start_day=start_day, limit=2000)]
     try:

@@ -27,6 +27,9 @@
                    flex-direction:column; gap:2px; }
   .filters input, .filters select { padding:6px 8px; border:1px solid var(--line);
            border-radius:6px; font-size:14px; min-width:120px; }
+  .filters label.chkbox { flex-direction:row; align-items:center; gap:5px;
+           align-self:flex-end; cursor:pointer; }
+  .filters label.chkbox input { min-width:0; width:auto; }
   .tabs { display:flex; gap:8px; margin-bottom:10px; flex-wrap:wrap; }
   .tabs button { background:#ecf0f1; color:#2c3e50; flex:1 1 auto;
                  white-space:nowrap; }
@@ -275,6 +278,7 @@
     <label>From <input id="fx-from" type="date"></label>
     <label>To <input id="fx-to" type="date"></label>
     <label>Site contains <input id="fx-site" placeholder="e.g. youtube"></label>
+    <label class="chkbox" title="Ads, trackers, embedded frames and redirects that loaded automatically — not pages the child actually opened."><input type="checkbox" id="fx-bg"> Show background loads</label>
     <button id="fx-clear" class="ghost" style="align-self:flex-end;">Clear</button>
   </div>
 </div>
@@ -488,12 +492,14 @@ function activeRows(){
   const site = ($("fx-site").value||"").toLowerCase().trim();
   const from = dayStartTs($("fx-from").value);
   const to = $("fx-to").value ? dayStartTs($("fx-to").value) + 86400 : null;
+  const showBg = $("fx-bg") && $("fx-bg").checked;
   return (DATA.visits||[]).filter(v => {
     if(u !== "All users" && v.u !== u) return false;
     if(mac !== "All machines" && v._m !== mac) return false;
     if(site && !(v.d||"").toLowerCase().includes(site)) return false;
     if(from !== null && v.ts < from) return false;
     if(to !== null && v.ts >= to) return false;
+    if(!showBg && v.bg===1) return false;
     return true;
   });
 }
@@ -532,9 +538,14 @@ function computeDurations(rows){
     let visits=0, secs=0;
     list.forEach((v,i)=>{
       const s=sites[v.d]||(sites[v.d]={visits:0,secs:0,ms:new Set(),searches:{}});
-      let dur=0;
-      if(i+1<list.length && list[i+1]._m===v._m)
+      // Prefer the browser's real foreground time (Chromium visit_duration,
+      // uncapped — it's a true measure); fall back to the capped gap estimate
+      // when it's absent (Firefox / older data).
+      let dur;
+      if(typeof v.dur==="number") dur=Math.max(0,v.dur);
+      else if(i+1<list.length && list[i+1]._m===v._m)
         dur=Math.min(Math.max(0,list[i+1].ts-v.ts),IDLE_CAP);
+      else dur=0;
       visits++; secs+=dur;
       s.visits++; s.secs+=dur;
       if(v._m) s.ms.add(v._m);
@@ -1284,9 +1295,10 @@ document.querySelectorAll("th[data-sort]").forEach(th=>{
 });
 ["fx-machine","fx-user","fx-from","fx-to","fx-site"].forEach(id=>
   $(id).addEventListener("input", render));
+$("fx-bg").addEventListener("change", render);
 $("fx-clear").onclick=()=>{ $("fx-machine").value="All machines";
   $("fx-user").value="All users"; $("fx-from").value="";
-  $("fx-to").value=""; $("fx-site").value=""; render(); };
+  $("fx-to").value=""; $("fx-site").value=""; $("fx-bg").checked=false; render(); };
 $("btn-refresh").onclick=loadData;
 $("btn-settings").onclick=()=>showSetup("");
 $("f-cancel").onclick=()=>{ if(getCfg()){ hideSetup(); $("app").classList
