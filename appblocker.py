@@ -1294,6 +1294,47 @@ class HistoryStore:
         finally:
             conn.close()
 
+    def backfill_visits(self, username, rows):
+        """One-time re-scan of the browser's retained history.
+
+        rows = [(epoch, url, title, duration_or_None, background_0_or_1)].
+        For each retained visit: if we already logged it (same user+url+ts),
+        fill in its real duration + background flag; otherwise insert it. Keyed
+        on (username, url, ts) so re-reading never duplicates a visit. Does NOT
+        touch the import cursor (going-forward capture is independent) and does
+        NOT move the new-domain watermark, so no historical site fires a "new
+        website" alert. Returns (updated, inserted) counts.
+        """
+        conn = self._connect()
+        updated = inserted = 0
+        try:
+            for epoch, url, title, dur, bg in rows:
+                dom = domain_of(url)
+                if not dom:
+                    continue
+                ts = int(epoch)
+                d = int(dur) if dur is not None else None
+                b = int(bg or 0)
+                # Fill duration/background on the visit if it's already logged;
+                # COALESCE keeps an existing duration when this read has none
+                # (Firefox), but a real value always wins.
+                cur = conn.execute(
+                    "UPDATE visits SET duration=COALESCE(?, duration), "
+                    "background=? WHERE username=? AND url=? AND ts=?",
+                    (d, b, username, url, ts))
+                if cur.rowcount:
+                    updated += cur.rowcount
+                else:
+                    conn.execute(
+                        "INSERT INTO visits(username,domain,url,title,ts,"
+                        "duration,background) VALUES (?,?,?,?,?,?,?)",
+                        (username, dom, url, title, ts, d, b))
+                    inserted += 1
+            conn.commit()
+        finally:
+            conn.close()
+        return updated, inserted
+
     def users(self):
         conn = self._connect()
         try:
@@ -1730,6 +1771,44 @@ def import_all_history(state, store):
                 continue
             total += store.add_visits(username, rows, source, last_native)
     return total
+
+
+def backfill_all_history(state, store):
+    """One-time backfill of each browser's retained history (~90 days).
+
+    Reads every retained visit (not just those after the import cursor) and
+    fills in real foreground duration + the background flag, inserting any older
+    visits that predate when AppBlocker started logging. Historical sites do not
+    trigger new-website alerts: the new-domain scan only looks at visits newer
+    than its watermark (which sits at "now"), and we re-seed the known-domain
+    baseline afterwards. Returns (updated, inserted) totals across all users.
+    """
+    tot_upd = tot_ins = 0
+    for username, _uid in list_human_users():
+        try:
+            home = pwd.getpwnam(username).pw_dir
+        except KeyError:
+            continue
+        if not os.path.isdir(home):
+            continue
+        for _label, kind, db in iter_history_sources(home):
+            try:
+                rows, _last = _read_browser_history(kind, db, 0)  # all retained
+            except Exception as exc:
+                sys.stderr.write(f"[backfill] {username} {db}: {exc}\n")
+                continue
+            if not rows:
+                continue
+            upd, ins = store.backfill_visits(username, rows)
+            tot_upd += upd
+            tot_ins += ins
+    # Treat the now-fuller history as the known baseline so a site last visited
+    # weeks ago (only just backfilled) isn't misreported as brand-new next time.
+    try:
+        store.seed_known_domains()
+    except Exception as exc:
+        sys.stderr.write(f"[backfill] seed known domains: {exc}\n")
+    return tot_upd, tot_ins
 
 
 def notify_email(email_cfg, subject, body, respect_quiet=True):
@@ -2176,6 +2255,7 @@ class HistoryMonitor(threading.Thread):
         self._last_known_push = 0   # last household-ledger refresh (throttle)
         self._last_screen = None    # last screen-time sample time (epoch)
         self._last_app = None       # last per-app sample time (epoch)
+        self._backfilled = False    # one-time retained-history backfill guard
         self._last_tv_sync = 0      # last TV Locker Guard bridge push
         self._last_budget_sync = 0  # last combined screen-budget usage fetch
         self._remote_used = {}      # user -> today's screen seconds on other machines
@@ -2354,6 +2434,30 @@ class HistoryMonitor(threading.Thread):
         except Exception as exc:
             sys.stderr.write(f"[lock] grace notice for {user} failed: {exc}\n")
 
+    # One-time marker so the retained-history backfill runs exactly once.
+    BACKFILL_KEY = "__backfill_dur_v1__"
+
+    def _maybe_backfill(self, store):
+        """Run the retained-history backfill once (real durations + background
+        flags for the browser's ~90-day history), then remember it's done so it
+        never repeats. Failures are swallowed and simply retried next start."""
+        if self._backfilled:
+            return
+        try:
+            if store.get_state(self.BACKFILL_KEY):
+                self._backfilled = True
+                return
+        except Exception:
+            return
+        try:
+            upd, ins = backfill_all_history(self.state, store)
+            store.set_state(self.BACKFILL_KEY, int(time.time()))
+            self._backfilled = True
+            sys.stderr.write(
+                f"[backfill] retained history: {upd} filled, {ins} added\n")
+        except Exception as exc:
+            sys.stderr.write(f"[backfill] failed (will retry): {exc}\n")
+
     def run(self):
         store = self.store or HistoryStore()
         while not self._stop.is_set():
@@ -2374,6 +2478,10 @@ class HistoryMonitor(threading.Thread):
                 # Detect never-seen / long-unseen domains (additive: reads the
                 # same visit log, records events + optional real-time email).
                 self._maybe_new_domain_alert(store)
+                # Once, after the watermark is safely at "now": fill real
+                # durations + background flags for the browser's retained
+                # history (no historical site can fire a new-website alert).
+                self._maybe_backfill(store)
                 store.set_state("__heartbeat__", int(time.time()))
                 self._sample_screen_time(store)
                 self._sample_app_time(store)
@@ -7245,6 +7353,11 @@ def main():
         "--import-history", action="store_true",
         help="import browser history once now (normally the daemon does this)")
     parser.add_argument(
+        "--backfill-history", action="store_true",
+        help="one-time: re-scan the browser's retained history to fill in real "
+             "per-page time and mark background/auto-loaded pages (no new-site "
+             "alerts fire for historical pages)")
+    parser.add_argument(
         "--lockdown-clear", action="store_true",
         help="emergency: remove AppBlocker's browser incognito-lockdown policies")
     parser.add_argument(
@@ -7430,6 +7543,16 @@ def main():
         st = AppState()
         n = import_all_history(st, HistoryStore())
         print(f"Imported {n} new visit(s).")
+        return
+
+    if args.backfill_history:
+        configure_paths(system_mode=True)
+        st = AppState()
+        store = HistoryStore()
+        upd, ins = backfill_all_history(st, store)
+        store.set_state(HistoryMonitor.BACKFILL_KEY, int(time.time()))
+        print(f"Backfilled retained history: {upd} visit(s) filled with real "
+              f"time/background, {ins} older visit(s) added.")
         return
 
     if args.web_clear:
