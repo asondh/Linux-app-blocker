@@ -190,6 +190,8 @@
               margin:2px 0 6px; }
   .rule-form .ctl-in { display:block; width:100%; margin-top:6px; box-sizing:border-box; }
   .rule-row-btn { margin-top:10px; }
+  .brk-num { width:64px; min-width:0; padding:5px 6px; border:1px solid var(--line);
+             border-radius:6px; font-size:14px; margin:0 4px; }
 </style>
 </head>
 <body>
@@ -1056,6 +1058,18 @@ function onCtlButton(b){
                 block_distractions:bd,users};
     return sendCommand({action:"add_rule",rule}, "add rule"+(name?" "+name:""), true);
   }
+  // Forced breaks — always broadcast so every device shares one schedule/state.
+  if(act==="end_break")
+    return sendCommand({action:"end_break",user:b.dataset.user}, "end "+b.dataset.user+"’s break", true);
+  if(act==="set_break_rule"){
+    const en=!!($("brk-en")||{}).checked;
+    const wk=parseInt(($("brk-work")||{}).value,10);
+    const bk=parseInt(($("brk-break")||{}).value,10);
+    if(en && (!(wk>=1) || !(bk>=1))){ ctlMsg("Work and break minutes must be at least 1.","bad"); return; }
+    return sendCommand({action:"set_break_rule",enabled:en,
+                        work_minutes:wk>=1?wk:30,break_minutes:bk>=1?bk:20},
+                       en?("breaks "+wk+"m/"+bk+"m"):"breaks off", true);
+  }
 }
 function fmtClock(ts){ const d=new Date(ts*1000);
   return String(d.getHours()).padStart(2,"0")+":"+String(d.getMinutes()).padStart(2,"0"); }
@@ -1104,6 +1118,50 @@ function ruleSummary(rule, apps){
   const who=(rule.users||[]).length ? esc(rule.users.join(", ")) : "any user";
   return "While <b>"+esc(nm(rule.trigger))+"</b> is running → block "+what+
          " · for "+who;
+}
+// Forced-breaks section: a live "who's on a break" list (with End-now), plus
+// the enable/timings form. Config is edited per-machine and broadcast to all
+// (like the screen-time budget); status is aggregated across every machine.
+function ctlBreakSection(ctl, broadcast){
+  let h='<div class="ctl-sec"><h3>Forced breaks'+(broadcast?" (all machines)":"")+'</h3>';
+  // Live status across all control machines: user -> soonest break-until.
+  const now=Math.floor(Date.now()/1000), onBreak={};
+  MACHINES.filter(m=>m.id!==TV_MACHINE_ID).forEach(m=>{
+    const bs=(m.data&&m.data.break_status)||{};
+    Object.entries(bs).forEach(([u,until])=>{
+      if(until>now && (!onBreak[u]||until<onBreak[u])) onBreak[u]=until; });
+  });
+  const users=Object.keys(onBreak).sort();
+  if(users.length){
+    users.forEach(u=>{
+      h+='<div class="ctl-row"><span class="name">☕ '+esc(u)+' on a break → '+
+         fmtClock(onBreak[u])+'</span><span class="spacer"></span>'+
+         ctlRowBtn("end_break","green small","End now",' data-user="'+esc(u)+'"')+'</div>';
+    });
+  } else {
+    h+='<div class="ctl-note">Nobody is on a break right now.</div>';
+  }
+  // Config form: shown per-machine (broadcasts to all); a note in broadcast mode.
+  if(broadcast || !ctl){
+    h+='<div class="ctl-note">Pick a specific machine above to turn forced '+
+       'breaks on/off and set the timings (they broadcast to every device).</div>'+
+       '</div>';
+    return h;
+  }
+  const br=ctl.break_rule||{enabled:false,work_minutes:30,break_minutes:20};
+  h+='<div class="rule-form"><div class="rule-form-h">Break schedule (all devices)</div>'+
+     '<label class="rule-chk"><input type="checkbox" id="brk-en"'+(br.enabled?" checked":"")+'> '+
+     '<b>Enable forced breaks</b></label>'+
+     '<label class="rule-lbl" style="margin-top:6px;">Work for '+
+     '<input id="brk-work" class="brk-num" type="number" min="1" max="600" value="'+
+     (br.work_minutes||30)+'"> min, then break for '+
+     '<input id="brk-break" class="brk-num" type="number" min="1" max="600" value="'+
+     (br.break_minutes||20)+'"> min</label>'+
+     '<div class="rule-row-btn">'+ctlRowBtn("set_break_rule","red small","Save breaks")+'</div>'+
+     '<div class="ctl-note">Active use only (idle time doesn’t count; a long idle '+
+     'stretch counts as a break). A parent password on the lock screen — or “End '+
+     'now” above — ends a break early.</div></div></div>';
+  return h;
 }
 // The Auto-block rules section: list + toggle + remove existing rules, and a
 // form to add one (broadcast to every device). Shown per-machine because the
@@ -1368,6 +1426,9 @@ function renderControls(){
      ctlRowBtn("grant_screen_time","green small","Grant")+'</div>'+
      '<div class="ctl-note">Grants extra time on top of today’s budget, the same '+
      'way a correct password at the lock screen does.</div></div>';
+
+  // Forced breaks (work/break cycle).
+  h+=ctlBreakSection(ctl, broadcast);
 
   // Protection.
   h+='<div class="ctl-sec"><h3>Protection'+(broadcast?" (all machines)":"")+'</h3>';

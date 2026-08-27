@@ -498,6 +498,22 @@ def logout_session_commands(username):
     return cmds
 
 
+def perform_root_shutdown():
+    """Power the machine off. Meant to run in the ROOT daemon (uid 0), where
+    systemctl/loginctl need no polkit authorization -- which is exactly why the
+    unprivileged lock overlay can't do it itself and relays a SHUTDOWN request
+    up the pipe instead. Tries a few equivalent commands; returns True on the
+    first that runs without raising."""
+    for cmd in (["systemctl", "poweroff"], ["loginctl", "poweroff"],
+                ["shutdown", "-h", "now"], ["poweroff"]):
+        try:
+            subprocess.run(cmd, timeout=10)
+            return True
+        except Exception:
+            continue
+    return False
+
+
 def usernames_to_uids(names):
     """Map a list of usernames to a set of UIDs, skipping unknown names."""
     uids = set()
@@ -981,6 +997,9 @@ BUDGET_WARN_FRACTION = 1 / 6      # grace notice fires with this fraction of
                                    # the day's total budget left (once/day)
 BUDGET_GRANT_MINUTES = 15         # bonus minutes granted per correct
                                    # password entry on the lock overlay
+BREAK_WORK_MINUTES = 30           # default active-use minutes before a forced
+                                   # break kicks in
+BREAK_MINUTES = 20                # default forced-break length (screen locked)
 LOCK_WATCHDOG_INTERVAL = 3        # seconds between overlay-liveness checks --
                                    # deliberately much faster than the 45s
                                    # budget-decision cadence above, so a kid
@@ -2088,20 +2107,39 @@ class LockRuntime:
 
     def __init__(self):
         self._lock = threading.RLock()
-        self._locked = set()
+        self._budget = set()    # users over their daily screen-time budget
+        self._break = {}        # user -> break-until epoch (forced-break lock)
         self._pending = []   # fire-and-forget Popens (grace notices) awaiting reap
 
-    def replace(self, users):
+    def replace_budget(self, users):
         with self._lock:
-            self._locked = set(users)
+            self._budget = set(users)
+
+    def replace_breaks(self, mapping):
+        """mapping: {user: break_until_epoch}. Replaces the whole break set."""
+        with self._lock:
+            self._break = {u: int(t) for u, t in (mapping or {}).items()}
 
     def discard(self, user):
+        """Unlock a user now (correct password) -- clears both lock reasons."""
         with self._lock:
-            self._locked.discard(user)
+            self._budget.discard(user)
+            self._break.pop(user, None)
 
     def snapshot(self):
         with self._lock:
-            return set(self._locked)
+            return set(self._budget) | set(self._break)
+
+    def lock_info(self, user):
+        """Why `user` is locked: {'reason':'budget'} (takes precedence -- a
+        password there grants time) or {'reason':'break','until':epoch}, or
+        None if not locked."""
+        with self._lock:
+            if user in self._budget:
+                return {"reason": "budget"}
+            if user in self._break:
+                return {"reason": "break", "until": self._break[user]}
+            return None
 
     def track_fire_and_forget(self, proc):
         with self._lock:
@@ -2179,15 +2217,30 @@ class LockOverlaySession:
             pass
 
 
-def service_overlay_password(session, store, pm):
+def service_overlay_password(session, store, pm, runtime=None):
     """
-    Read any pending password attempts from `session` and respond. On a
-    correct password, grants BUDGET_GRANT_MINUTES of bonus for today and
-    tells the overlay OK. Returns True if a correct password was entered
-    (caller should then treat this user as unlocked), False otherwise.
+    Read any pending messages from `session` and respond. Handles two kinds of
+    line the overlay sends up the pipe:
+
+      * SHUTDOWN  -> power the machine off as root (the overlay itself can't,
+                     being unprivileged). Not an unlock.
+      * PW:<b64>  -> a parent password attempt. On success the effect depends
+                     on WHY the user is locked (runtime.lock_info): a forced
+                     BREAK is ended (its durable counters are cleared) and the
+                     user is let straight back in; a daily-BUDGET lock instead
+                     grants BUDGET_GRANT_MINUTES of bonus time. Either way the
+                     overlay is told OK.
+
+    Returns True if a correct password unlocked the user (caller should then
+    treat them as unlocked), False otherwise.
     """
     unlocked = False
     for line in session.poll_lines():
+        if line == "SHUTDOWN":
+            sys.stderr.write(f"[lock] {session.username}: shutdown requested "
+                             f"from lock overlay\n")
+            perform_root_shutdown()
+            continue
         if not line.startswith("PW:"):
             continue
         try:
@@ -2196,13 +2249,23 @@ def service_overlay_password(session, store, pm):
             session.send("DENY")
             continue
         if pm.verify(password):
-            day = time.strftime("%Y-%m-%d")
-            store.add_bonus_seconds(session.username, day,
-                                    BUDGET_GRANT_MINUTES * 60)
-            session.send("OK")
+            info = (runtime.lock_info(session.username) if runtime else None) or {}
+            if info.get("reason") == "break":
+                # End the forced break: clear its durable counters so the work
+                # streak starts fresh and the break won't immediately re-fire.
+                store.set_state(f"__break_until__{session.username}", 0)
+                store.set_state(f"__break_work__{session.username}", 0)
+                session.send("OK")
+                sys.stderr.write(f"[lock] {session.username}: break ended by "
+                                 f"password\n")
+            else:
+                day = time.strftime("%Y-%m-%d")
+                store.add_bonus_seconds(session.username, day,
+                                        BUDGET_GRANT_MINUTES * 60)
+                session.send("OK")
+                sys.stderr.write(f"[lock] {session.username}: unlocked via "
+                                 f"password, +{BUDGET_GRANT_MINUTES}min\n")
             unlocked = True
-            sys.stderr.write(f"[lock] {session.username}: unlocked via "
-                             f"password, +{BUDGET_GRANT_MINUTES}min\n")
         else:
             session.send("DENY")
             sys.stderr.write(f"[lock] {session.username}: incorrect "
@@ -2255,6 +2318,7 @@ class HistoryMonitor(threading.Thread):
         self._last_known_push = 0   # last household-ledger refresh (throttle)
         self._last_screen = None    # last screen-time sample time (epoch)
         self._last_app = None       # last per-app sample time (epoch)
+        self._last_break = None     # last forced-break sample time (epoch)
         self._backfilled = False    # one-time retained-history backfill guard
         self._last_tv_sync = 0      # last TV Locker Guard bridge push
         self._last_budget_sync = 0  # last combined screen-budget usage fetch
@@ -2339,7 +2403,7 @@ class HistoryMonitor(threading.Thread):
         with self.state.lock:
             budget_cfg = dict(self.state.screen_budget)
         if not budget_cfg.get("enabled"):
-            self.lock_runtime.replace(set())
+            self.lock_runtime.replace_budget(set())
             return
         day = time.strftime("%Y-%m-%d")
         used = store.screen_seconds(day)
@@ -2362,7 +2426,71 @@ class HistoryMonitor(threading.Thread):
                 if not store.get_state(warn_key):
                     store.set_state(warn_key, 1)
                     self._spawn_grace_notice(user, int(remaining // 60))
-        self.lock_runtime.replace(locked)
+        self.lock_runtime.replace_budget(locked)
+
+    def _check_forced_break(self, store):
+        """Enforce the work/break cycle: after `work_minutes` of active use,
+        lock the screen for `break_minutes`. Per-user state is durable (kept in
+        the store, keyed by user) so logging out or rebooting can't reset the
+        streak. A correct parent password on the overlay, or a dashboard
+        'end break' command, clears it early. No-op when disabled or when the
+        lock feature isn't wired up (lock_runtime is None, e.g. under the GUI).
+
+        Active time is idle-gated exactly like per-app time: a window left in
+        front while the child walks away doesn't count, and an idle stretch as
+        long as a full break is itself treated as a break (the streak resets),
+        so they aren't force-broken right after stepping away. On Wayland or
+        without xprintidle (idle is None) it falls back to counting session-
+        active time, same graceful degradation as the rest of the feature."""
+        if self.lock_runtime is None:
+            return
+        with self.state.lock:
+            cfg = dict(self.state.break_rule)
+        now_f = time.time()
+        last, self._last_break = self._last_break, now_f
+        if not cfg.get("enabled"):
+            self.lock_runtime.replace_breaks({})
+            return
+        now = int(now_f)
+        work = max(1, int(cfg.get("work_minutes", BREAK_WORK_MINUTES))) * 60
+        brk = max(1, int(cfg.get("break_minutes", BREAK_MINUTES))) * 60
+        delta = 0 if last is None else int(now_f - last)
+        if delta < 0 or delta > 3 * MONITOR_HISTORY_INTERVAL:
+            delta = 0                  # first tick / clock jump / resume
+        breaks = {}
+        for user in active_screen_users():
+            wkey = f"__break_work__{user}"
+            ukey = f"__break_until__{user}"
+            until = int(store.get_state(ukey) or 0)
+            if until > now:
+                breaks[user] = until   # mid-break -> stay locked
+                continue
+            if until:                  # break just elapsed -> fresh start
+                store.set_state(ukey, 0)
+                store.set_state(wkey, 0)
+                continue
+            idle = None
+            try:
+                uid = pwd.getpwnam(user).pw_uid
+                env = user_x_env(uid)
+                idle = user_idle_seconds(env) if env else None
+            except KeyError:
+                pass
+            if idle is not None and idle > APP_IDLE_CUTOFF:
+                if idle >= brk:        # a real, break-length idle -> reset
+                    store.set_state(wkey, 0)
+                continue               # don't accrue work time while idle
+            acc = int(store.get_state(wkey) or 0) + delta
+            if acc >= work:
+                until = now + brk
+                store.set_state(ukey, until)
+                store.set_state(wkey, 0)
+                breaks[user] = until
+                sys.stderr.write(f"[break] {user}: {work // 60}min reached -> "
+                                 f"{brk // 60}min break\n")
+            else:
+                store.set_state(wkey, acc)
+        self.lock_runtime.replace_breaks(breaks)
 
     def _sync_combined_budget_usage(self, store):
         """
@@ -2486,6 +2614,7 @@ class HistoryMonitor(threading.Thread):
                 self._sample_screen_time(store)
                 self._sample_app_time(store)
                 self._check_screen_budget(store)
+                self._check_forced_break(store)
                 self._maybe_digest(store)
                 self._maybe_new_domain_digest(store)
                 self._maybe_prune(store)
@@ -2583,6 +2712,15 @@ class HistoryMonitor(threading.Thread):
                 f"[control] {'OK ' if ok else 'ERR'} {c.get('action')}: {msg}\n")
         self._cmd_results = self._cmd_results[-40:]
         store.set_state("__cmd_ts__", maxid)
+        # If a break command just landed, recompute the break locks now so an
+        # "end break" frees the screen within seconds instead of waiting for
+        # the next ~45s enforcement tick.
+        if any(c.get("action") in ("end_break", "set_break_rule")
+               for c in pending):
+            try:
+                self._check_forced_break(store)
+            except Exception as exc:
+                sys.stderr.write(f"[break] post-command recompute failed: {exc}\n")
         # Push immediately so the phone sees the change and the confirmation.
         try:
             self._push_dashboard(store)
@@ -2824,6 +2962,7 @@ def _control_snapshot(state):
         distract_allow = {d: int(t) for d, t in state.distract_allow.items()
                           if int(t) > now}
         screen_budget = dict(state.screen_budget)
+        break_rule = dict(state.break_rule)
         # Auto-block rules, so the dashboard can list / toggle / remove them and
         # add new ones. Proc names are resolved to human labels client-side via
         # the apps list above.
@@ -2844,7 +2983,7 @@ def _control_snapshot(state):
             "human_users": human_users, "remote_enabled": remote_enabled,
             "distractions": distractions, "distract_free_until": free_until,
             "distract_allow": distract_allow, "screen_budget": screen_budget,
-            "rules": rules}
+            "break_rule": break_rule, "rules": rules}
 
 
 def build_report_data(store, days=REPORT_DAYS, limit=REPORT_LIMIT,
@@ -2915,6 +3054,16 @@ def build_report_data(store, days=REPORT_DAYS, limit=REPORT_LIMIT,
     }
     if state is not None:
         data["control"] = _control_snapshot(state)
+        # Live forced-break status: who is on a break right now and until when,
+        # so the dashboard can show it and offer "end break now". Reads the same
+        # durable per-user counters the break enforcer writes.
+        now_i = int(time.time())
+        brk_status = {}
+        for uname in data["control"].get("human_users", []):
+            until = int(store.get_state(f"__break_until__{uname}") or 0)
+            if until > now_i:
+                brk_status[uname] = until
+        data["break_status"] = brk_status
         # Flag recorded visits whose domain is on the effective blocklist — these
         # are attempts to reach a blocked site (adult list or your own list). We
         # can only surface the ones the browser wrote to history, so it's a
@@ -3696,6 +3845,31 @@ def apply_remote_command(state, cmd, store=None):
         state.set_screen_budget(cmd)
         return True, "screen-time budget updated"
 
+    if action == "set_break_rule":
+        # Forced work/break cycle config, synced across machines the same way
+        # as the budget. set_break_rule() sanitizes the dict (extra keys like
+        # action/id are ignored).
+        cfg = state.set_break_rule(cmd)
+        return True, ("forced breaks on ("
+                      f"{cfg['work_minutes']}m work / {cfg['break_minutes']}m "
+                      "break)" if cfg["enabled"] else "forced breaks off")
+
+    if action == "end_break":
+        # Clear a forced break early. With a "user", ends just theirs; without
+        # one, ends everyone's. Zeroes the durable counters so the work streak
+        # also restarts; the enforcer/watchdog then unlock within seconds.
+        st = store or HistoryStore()
+        user = str(cmd.get("user", "")).strip()
+        try:
+            names = ([user] if user
+                     else [n for n, _ in list_human_users()])
+        except Exception:
+            names = [user] if user else []
+        for n in names:
+            st.set_state(f"__break_until__{n}", 0)
+            st.set_state(f"__break_work__{n}", 0)
+        return True, (f"ended {user}'s break" if user else "ended all breaks")
+
     return False, f"unknown action '{action}'"
 
 
@@ -3741,6 +3915,16 @@ class LockWatchdog(threading.Thread):
         self.runtime.reap_fire_and_forget()
         locked = self.runtime.snapshot()
 
+        # A forced break that has run its time is over: unlock at the ~3s
+        # watchdog cadence rather than waiting up to ~45s for the next break
+        # recompute, so the screen frees the moment the break ends.
+        now = int(time.time())
+        for user in list(locked):
+            info = self.runtime.lock_info(user)
+            if info and info.get("reason") == "break" and info.get("until", 0) <= now:
+                self.runtime.discard(user)
+                locked.discard(user)
+
         # Anyone tracked but no longer in the locked set: tell them to close.
         for user in list(self._sessions):
             if user not in locked:
@@ -3763,13 +3947,30 @@ class LockWatchdog(threading.Thread):
                           "--lock-overlay", user])
                 if proc is not None:
                     self._sessions[user] = LockOverlaySession(user, proc)
+                    self._send_lock_info(self._sessions[user])
                 continue
-            if service_overlay_password(session, self.store, pm):
+            # Keep the overlay's mode/countdown current (a budget lock that
+            # becomes a break, or the break's remaining time ticking down).
+            self._send_lock_info(session)
+            if service_overlay_password(session, self.store, pm, self.runtime):
                 # Correct password just now -- unlock immediately rather
                 # than waiting for the next ~45s budget recompute to agree.
                 self.runtime.discard(user)
                 session.close()
                 del self._sessions[user]
+
+    def _send_lock_info(self, session):
+        """Tell the overlay why it's up so it can show the right message: a
+        forced break (with seconds remaining, for the countdown) or the daily
+        budget 'time's up'. Cheap and idempotent -- sent every tick."""
+        info = self.runtime.lock_info(session.username)
+        if not info:
+            return
+        if info.get("reason") == "break":
+            left = max(0, int(info.get("until", 0)) - int(time.time()))
+            session.send(f"INFO:break:{left}")
+        else:
+            session.send("INFO:budget")
 
 
 # --------------------------------------------------------------------------- #
@@ -4114,6 +4315,7 @@ class AppState:
         self.sync = self._default_sync()        # remote dashboard (GitHub) sync
         self.tv_sync = self._default_tv_sync()  # TV Locker Guard screen-time bridge
         self.screen_budget = self._default_screen_budget()  # daily computer-time lock
+        self.break_rule = self._default_break_rule()  # forced work/break cycle
         self.block_adult = False                # built-in adult-content blocklist
         self.web_schedules = []                 # scheduled website blocks (downtime)
         # "Distractions": sites blocked by default (machine-wide) that the parent
@@ -4184,6 +4386,27 @@ class AppState:
                     except (TypeError, ValueError):
                         continue
             cfg["per_user"] = clean
+        return cfg
+
+    @staticmethod
+    def _default_break_rule():
+        return {"enabled": False, "work_minutes": BREAK_WORK_MINUTES,
+                "break_minutes": BREAK_MINUTES}
+
+    def _normalize_break_rule(self, value):
+        """Forced-break rule: after `work_minutes` of active use, lock the
+        screen for `break_minutes`. Applies to every monitored user; a parent
+        password (or a dashboard command) ends the break early. Disabled by
+        default -- opt-in like the daily budget."""
+        cfg = self._default_break_rule()
+        if isinstance(value, dict):
+            cfg["enabled"] = bool(value.get("enabled"))
+            for key, dflt in (("work_minutes", BREAK_WORK_MINUTES),
+                              ("break_minutes", BREAK_MINUTES)):
+                try:
+                    cfg[key] = max(1, int(value.get(key, dflt)))
+                except (TypeError, ValueError):
+                    cfg[key] = dflt
         return cfg
 
     @staticmethod
@@ -4394,6 +4617,7 @@ class AppState:
             self.tv_sync = self._normalize_tv_sync(data.get("tv_sync"))
             self.screen_budget = self._normalize_screen_budget(
                 data.get("screen_budget"))
+            self.break_rule = self._normalize_break_rule(data.get("break_rule"))
             self.block_adult = bool(data.get("block_adult"))
             self.web_schedules = self._normalize_web_schedules(
                 data.get("web_schedules"))
@@ -4408,6 +4632,7 @@ class AppState:
             self.sync = self._default_sync()
             self.tv_sync = self._default_tv_sync()
             self.screen_budget = self._default_screen_budget()
+            self.break_rule = self._default_break_rule()
             self.block_adult = False
             self.web_schedules = []
             self.distractions = []
@@ -4437,6 +4662,8 @@ class AppState:
                 self.tv_sync = self._normalize_tv_sync(data.get("tv_sync"))
                 self.screen_budget = self._normalize_screen_budget(
                     data.get("screen_budget"))
+                self.break_rule = self._normalize_break_rule(
+                    data.get("break_rule"))
                 self.block_adult = bool(data.get("block_adult"))
                 self.web_schedules = self._normalize_web_schedules(
                     data.get("web_schedules"))
@@ -4457,6 +4684,7 @@ class AppState:
                                  "sync": self.sync,
                                  "tv_sync": self.tv_sync,
                                  "screen_budget": self.screen_budget,
+                                 "break_rule": self.break_rule,
                                  "block_adult": self.block_adult,
                                  "web_schedules": self.web_schedules,
                                  "distractions": self.distractions,
@@ -4651,6 +4879,12 @@ class AppState:
             self.screen_budget = self._normalize_screen_budget(cfg)
             self.save_locked()
             return dict(self.screen_budget)
+
+    def set_break_rule(self, cfg):
+        with self.lock:
+            self.break_rule = self._normalize_break_rule(cfg)
+            self.save_locked()
+            return dict(self.break_rule)
 
     def set_block_adult(self, enabled):
         with self.lock:
@@ -5923,6 +6157,96 @@ class AppBlockerUI:
         tk.Button(bar, text="Cancel", command=win.destroy, relief="flat",
                   padx=12, pady=6, cursor="hand2").pack(side="left")
 
+    def break_rule_dialog(self):
+        with self.state.lock:
+            cfg = dict(self.state.break_rule)
+        win = tk.Toplevel(self.root)
+        win.title("Forced Breaks")
+        win.configure(bg=COLOR_BG)
+        win.geometry("520x460")
+        win.minsize(440, 360)
+        self._present(win)
+
+        bar = tk.Frame(win, bg=COLOR_BG)
+        bar.pack(side="bottom", fill="x", padx=16, pady=14)
+        body = self._scroll_body(win)
+
+        tk.Label(body, text="☕ Forced Breaks", bg=COLOR_BG, fg=COLOR_HEADER,
+                 font=("Helvetica", 14, "bold")).pack(pady=(14, 2))
+        tk.Label(body, text="After a stretch of active use, locks the screen "
+                 "for a break, then unlocks on its own. Active use is measured "
+                 "the same way as per-app time (idle time doesn't count, and a "
+                 "long enough idle stretch counts as a break). Applies to every "
+                 "monitored user on this computer. The lock screen's parent "
+                 "password ends a break early; so does the dashboard's "
+                 "“End break now”.",
+                 bg=COLOR_BG, fg="#7f8c8d", wraplength=470,
+                 justify="left").pack(padx=16, pady=(0, 8))
+        tk.Label(body, text="If Remote Dashboard syncing is set up, saving here "
+                 "shares these settings with your other machines automatically.",
+                 bg=COLOR_BG, fg="#7f8c8d", wraplength=470,
+                 justify="left").pack(padx=16, pady=(0, 8))
+
+        enabled = tk.BooleanVar(value=cfg.get("enabled", False))
+        tk.Checkbutton(body, text="Enable forced breaks", variable=enabled,
+                       bg=COLOR_BG, font=("Helvetica", 11, "bold")).pack(
+                           anchor="w", padx=16)
+
+        wrow = tk.Frame(body, bg=COLOR_BG)
+        wrow.pack(fill="x", padx=16, pady=(10, 0))
+        tk.Label(wrow, text="Work for:", bg=COLOR_BG).pack(side="left")
+        work_minutes = tk.StringVar(
+            value=str(cfg.get("work_minutes", BREAK_WORK_MINUTES)))
+        tk.Spinbox(wrow, from_=1, to=600, width=5, textvariable=work_minutes
+                   ).pack(side="left", padx=6)
+        tk.Label(wrow, text="minutes, then break for:", bg=COLOR_BG).pack(side="left")
+        break_minutes = tk.StringVar(
+            value=str(cfg.get("break_minutes", BREAK_MINUTES)))
+        tk.Spinbox(wrow, from_=1, to=600, width=5, textvariable=break_minutes
+                   ).pack(side="left", padx=6)
+        tk.Label(wrow, text="minutes", bg=COLOR_BG).pack(side="left")
+
+        tk.Label(body, text="Verify the lock works on this machine before "
+                 "relying on it (same lock screen as the budget):\n"
+                 "  sudo appblocker --lock-test USERNAME\n"
+                 "Emergency off switch:\n"
+                 "  sudo appblocker --unlock-clear",
+                 bg=COLOR_BG, fg="#7f8c8d", wraplength=470, justify="left"
+                 ).pack(padx=16, pady=(10, 0))
+
+        def collect():
+            def pos(var, dflt):
+                try:
+                    return max(1, int(var.get()))
+                except ValueError:
+                    return dflt
+            return {"enabled": enabled.get(),
+                    "work_minutes": pos(work_minutes, BREAK_WORK_MINUTES),
+                    "break_minutes": pos(break_minutes, BREAK_MINUTES)}
+
+        def save():
+            cfg = collect()
+            self.state.set_break_rule(cfg)
+            with self.state.lock:
+                sync_cfg = dict(self.state.sync)
+            extra = ""
+            if (sync_cfg.get("enabled") and sync_cfg.get("repo")
+                    and sync_cfg.get("token")):
+                n = broadcast_command(
+                    sync_cfg, dict(cfg, action="set_break_rule"),
+                    exclude_ids={machine_id()})
+                if n:
+                    extra = f" Synced to {n} other machine(s)."
+            messagebox.showinfo("Saved", "Forced-break settings saved." + extra,
+                                parent=win)
+            win.destroy()
+
+        tk.Button(bar, text="Save", command=save, bg=COLOR_ACTIVE, fg="white",
+                  relief="flat", padx=16, pady=6, cursor="hand2").pack(
+                      side="right")
+        tk.Button(bar, text="Cancel", command=win.destroy, relief="flat",
+                  padx=12, pady=6, cursor="hand2").pack(side="left")
+
     def activity_dialog(self):
         store = HistoryStore()
         win = tk.Toplevel(self.root)
@@ -6061,6 +6385,10 @@ class AppBlockerUI:
                   cursor="hand2").pack(side="left", padx=8)
         tk.Button(bar, text="⏰ Screen Time Budget…",
                   command=self.screen_budget_dialog, bg="#c0392b", fg="white",
+                  relief="flat", padx=12, pady=6, cursor="hand2").pack(
+                      side="left", padx=8)
+        tk.Button(bar, text="☕ Forced Breaks…",
+                  command=self.break_rule_dialog, bg="#c0392b", fg="white",
                   relief="flat", padx=12, pady=6, cursor="hand2").pack(
                       side="left", padx=8)
         tk.Button(bar, text="Refresh now", command=lambda: (
@@ -7140,13 +7468,14 @@ def import_settings(path, include_password=True):
 # --------------------------------------------------------------------------- #
 def run_lock_overlay(username):
     """
-    --lock-overlay USERNAME: a fullscreen, un-closable "time's up" window.
-    Relays password attempts to the parent daemon over the inherited
-    stdin/stdout pipe (see the LockOverlaySession docs above for the wire
-    protocol) rather than checking the password itself. Exits as soon as
-    the parent sends OK or UNLOCK. The Shut Down button needs no parent
-    involvement at all -- it's the same power-off action available from the
-    user's own desktop menu, run directly as that user.
+    --lock-overlay USERNAME: a fullscreen, un-closable window, shown either for
+    a daily-budget "time's up" or a forced break (the parent's INFO message
+    switches the wording and shows a countdown). Relays password attempts to
+    the parent daemon over the inherited stdin/stdout pipe (see the
+    LockOverlaySession docs above for the wire protocol) rather than checking
+    the password itself. Exits when the parent sends OK or UNLOCK. The Shut
+    Down button relays a SHUTDOWN request to the (root) parent, since the
+    unprivileged overlay usually can't power off on its own.
     """
     if not HAS_TK:
         sys.stderr.write("[lock-overlay] tkinter not available\n")
@@ -7166,12 +7495,24 @@ def run_lock_overlay(username):
     except tk.TclError:
         pass
 
-    tk.Label(root, text="⏰ Time's up for today",
-             font=("Helvetica", 28, "bold"), fg="white", bg="#1b2631"
-             ).pack(pady=(120, 10))
-    tk.Label(root, text=f"Hi {username} — ask a parent to unlock more time.",
-             font=("Helvetica", 15), fg="#bdc3c7", bg="#1b2631"
-             ).pack(pady=(0, 40))
+    # Mode starts as the daily-budget "time's up"; a parent-break INFO message
+    # from the daemon (see poll_parent) switches the heading/subtext/button and
+    # shows a live countdown. Labels are kept as references so they can be
+    # re-textualised in place.
+    heading = tk.Label(root, text="⏰ Time's up for today",
+                       font=("Helvetica", 28, "bold"), fg="white", bg="#1b2631")
+    heading.pack(pady=(120, 10))
+    subtext = tk.Label(
+        root, text=f"Hi {username} — ask a parent to unlock more time.",
+        font=("Helvetica", 15), fg="#bdc3c7", bg="#1b2631")
+    subtext.pack(pady=(0, 10))
+    # Break countdown (hidden until a break INFO arrives).
+    countdown = tk.Label(root, text="", font=("Helvetica", 40, "bold"),
+                         fg="#2ecc71", bg="#1b2631")
+    countdown.pack(pady=(0, 20))
+
+    # Overlay mode + break deadline, mutated by INFO messages / the ticker.
+    mode = {"kind": "budget", "until": 0}
 
     form = tk.Frame(root, bg="#1b2631")
     form.pack(pady=10)
@@ -7205,11 +7546,36 @@ def run_lock_overlay(username):
     submit_btn.pack(pady=4)
     entry.bind("<Return>", submit)
 
+    def fmt_left(secs):
+        secs = max(0, int(secs))
+        return f"{secs // 60}:{secs % 60:02d}"
+
+    def apply_break_mode():
+        heading.config(text="☕ Time for a break", fg="#2ecc71")
+        subtext.config(
+            text=f"Hi {username} — you've been on a while. Take a short break; "
+                 "the screen unlocks on its own. A parent can unlock sooner.")
+        submit_btn.config(text="Parent: end break now")
+        tick_countdown()
+
+    def tick_countdown():
+        if mode["kind"] != "break":
+            return
+        left = mode["until"] - time.time()
+        countdown.config(text=fmt_left(left) if left > 0 else "0:00")
+        root.after(1000, tick_countdown)
+
     def shutdown(event=None):
-        # Same graceful power-off path the user's own desktop "Shut Down"
-        # menu already uses -- lets running apps prompt to save first,
-        # rather than cutting power. No password needed: this doesn't grant
-        # any extra computer time, it only ends the session.
+        # The overlay runs unprivileged and usually CAN'T power off (polkit
+        # rejects it with no active-session agent) -- which is the bug this
+        # fixes. Ask the root daemon (our parent) to do it over the pipe, and
+        # still attempt it locally as a fallback for the --lock-test path,
+        # where there's no root parent servicing the pipe.
+        try:
+            sys.stdout.buffer.write(b"SHUTDOWN\n")
+            sys.stdout.buffer.flush()
+        except (BrokenPipeError, OSError):
+            pass
         for cmd in (["systemctl", "poweroff"], ["loginctl", "poweroff"]):
             try:
                 subprocess.run(cmd, timeout=10)
@@ -7298,6 +7664,17 @@ def run_lock_overlay(username):
                 status.config(text="Incorrect password", fg="#e74c3c")
                 submit_btn.config(state="normal")
                 entry.focus_set()
+            elif text.startswith("INFO:break:"):
+                try:
+                    left = int(text.rsplit(":", 1)[1])
+                except ValueError:
+                    left = 0
+                mode["until"] = time.time() + max(0, left)
+                if mode["kind"] != "break":
+                    mode["kind"] = "break"
+                    apply_break_mode()
+            elif text == "INFO:budget":
+                mode["kind"] = "budget"
         root.after(300, poll_parent)
 
     root.after(50, grab_input)
