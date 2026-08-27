@@ -68,6 +68,23 @@
   .grp-h .dom { font-weight:600; word-break:break-all; }
   .grp-h .cnt { margin-left:auto; font-size:12px; white-space:nowrap;
                 padding-left:8px; }
+  /* Quick-add (block/watch/distraction on all devices) */
+  .qadd { display:inline-flex; gap:3px; margin-left:8px; flex:0 0 auto; }
+  .qadd .qa { border:1px solid var(--line); background:#fff; border-radius:6px;
+              cursor:pointer; font-size:12px; line-height:1; padding:3px 5px;
+              opacity:.55; transition:opacity .12s, background .12s; }
+  .qadd .qa:hover { opacity:1; }
+  .qadd .qa-block:hover { background:#fdecea; }
+  .qadd .qa-watch:hover { background:#eaf3fd; }
+  .qadd .qa-distract:hover { background:#fef3e7; }
+  td .qadd { margin-left:4px; }
+  #toast { position:fixed; left:50%; bottom:22px; transform:translateX(-50%) translateY(20px);
+           background:#2c3e50; color:#fff; padding:9px 15px; border-radius:8px;
+           font-size:13px; box-shadow:0 4px 16px rgba(0,0,0,.25); opacity:0;
+           pointer-events:none; transition:opacity .18s, transform .18s; z-index:9999;
+           max-width:90vw; }
+  #toast.show { opacity:1; transform:translateX(-50%) translateY(0); }
+  #toast.bad { background:var(--bad,#c0392b); }
   .grp-body { display:none; padding:2px 14px 10px 32px; }
   .grp.open .grp-body { display:block; }
   /* Each item stacks: the term/page on its own full-width line (wraps by
@@ -681,7 +698,9 @@ function render(){
   const tbN=$("tb-newsites"); tbN.innerHTML="";
   nd.slice(0,3000).forEach(n=>{ const tr=document.createElement("tr");
     tr.innerHTML=`<td>${fmtWhen(n.ts)}</td><td>${esc(n.user)}</td>`+mcell(n.m)+
-                 `<td class="url">${esc(n.domain)}</td>`; tbN.appendChild(tr); });
+                 `<td class="url">${esc(n.domain)} ${qaddButtons(n.domain)}</td>`;
+    tbN.appendChild(tr); });
+  wireQuickAdd(tbN);
   $("c-newsites").textContent="("+nd.length+")";
   $("e-newsites").classList.toggle("hidden", nd.length>0);
 
@@ -759,7 +778,7 @@ function render(){
       wrap.className="qrow-site";
       let sh=`<div class="qrow${hasSearch?" qrow-exp":""}">`+
         (hasSearch?`<span class="tw">${sOpen?"▾":"▸"}</span> `:"")+
-        `<span class="q">${esc(s.domain)}</span>`+
+        `<span class="q">${esc(s.domain)}</span>`+qaddButtons(s.domain)+
         `<span class="qmeta">${s.visits} visit${s.visits!=1?"s":""} · `+
         `${fmtDur(s.secs)}${who}</span></div>`;
       if(hasSearch){
@@ -782,6 +801,7 @@ function render(){
       }
       td.appendChild(wrap);
     });
+    wireQuickAdd(td);
     dtr.appendChild(td);
     tr.onclick=()=>{
       if(openTime.has(d.user)) openTime.delete(d.user); else openTime.add(d.user);
@@ -890,10 +910,10 @@ async function sendToMachine(id, cmd){
   }
   throw new Error("repo busy");
 }
-async function sendCommand(baseCmd, label){
+async function sendCommand(baseCmd, label, forceAll){
   const c=getCfg();
   if(!c||!c.repo||!c.token){ ctlMsg("Not connected.","bad"); return; }
-  const targets = SEL_CTL==="*"
+  const targets = (forceAll || SEL_CTL==="*")
     ? MACHINES.filter(m=>m.id!==TV_MACHINE_ID).map(m=>m.id) : [SEL_CTL];
   if(!targets.length){ ctlMsg("No machine selected.","bad"); return; }
   let id=Date.now(); if(id<=lastId) id=lastId+1; lastId=id;
@@ -916,6 +936,41 @@ async function sendCommand(baseCmd, label){
   } else {
     ctlMsg("Send failed: "+failMsg,"bad");
   }
+}
+// Quick-add: three small buttons that add a visited domain to the block /
+// watch / distraction list on EVERY device at once (broadcast).
+function qaddButtons(dom){
+  const d=esc(dom);
+  return `<span class="qadd" onclick="event.stopPropagation()">`+
+    `<button class="qa qa-block" data-qadd="block" data-dom="${d}" `+
+      `title="Block ${d} on all devices">⛔</button>`+
+    `<button class="qa qa-watch" data-qadd="watch" data-dom="${d}" `+
+      `title="Watch ${d} on all devices">👁</button>`+
+    `<button class="qa qa-distract" data-qadd="distract" data-dom="${d}" `+
+      `title="Add ${d} to distractions on all devices">🎯</button></span>`;
+}
+function wireQuickAdd(root){
+  root.querySelectorAll("[data-qadd]").forEach(b=>{
+    b.onclick=(e)=>{ e.stopPropagation();
+      quickAddSite(b.dataset.dom, b.dataset.qadd); };
+  });
+}
+function quickAddSite(dom, kind){
+  dom=(dom||"").trim(); if(!dom) return;
+  const map={ block:   ["add_website",    "Blocked",     "block"],
+              watch:   ["add_watch",      "Watching",    "watch"],
+              distract:["add_distraction","Distraction", "add distraction"] };
+  const m=map[kind]; if(!m) return;
+  const n=MACHINES.filter(x=>x.id!==TV_MACHINE_ID).length;
+  if(!n){ toast("No devices connected yet.", true); return; }
+  toast(`${m[1]} ${dom} on ${n} device${n!=1?"s":""}…`);
+  sendCommand({action:m[0], domain:dom}, m[2]+" "+dom, true);   // forceAll = all devices
+}
+function toast(msg, bad){
+  let t=$("toast");
+  if(!t){ t=document.createElement("div"); t.id="toast"; document.body.appendChild(t); }
+  t.textContent=msg; t.className="show"+(bad?" bad":"");
+  clearTimeout(t._h); t._h=setTimeout(()=>{ t.className=""; }, 3200);
 }
 function onCtlButton(b){
   const act=b.dataset.act;
