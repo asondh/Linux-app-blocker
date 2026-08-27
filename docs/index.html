@@ -173,6 +173,23 @@
                      display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
   #ctl-machine-row select { padding:8px; border:1px solid var(--line);
                             border-radius:6px; font-size:14px; }
+  /* Auto-block rules */
+  .rule-card { display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+               padding:8px 0; border-bottom:1px dashed var(--line); }
+  .rule-card.off { opacity:.6; }
+  .rule-sum { flex:1 1 260px; font-size:13px; line-height:1.4; }
+  .rule-btns { display:flex; gap:6px; margin-left:auto; }
+  .rule-form { margin-top:12px; padding:12px; border:1px solid var(--line);
+               border-radius:8px; background:var(--card); }
+  .rule-form-h { font-weight:700; font-size:13px; margin-bottom:8px; color:var(--head); }
+  .rule-lbl { display:block; font-size:12px; color:var(--muted); margin:6px 0 3px; }
+  .rule-chk { display:flex; align-items:center; gap:6px; font-size:13px;
+              padding:3px 0; cursor:pointer; }
+  .rule-chk input { min-width:0; width:auto; flex:0 0 auto; }
+  .rule-tgts, .rule-users { display:flex; flex-wrap:wrap; gap:4px 16px;
+              margin:2px 0 6px; }
+  .rule-form .ctl-in { display:block; width:100%; margin-top:6px; box-sizing:border-box; }
+  .rule-row-btn { margin-top:10px; }
 </style>
 </head>
 <body>
@@ -1014,6 +1031,31 @@ function onCtlButton(b){
     if(!u){ ctlMsg("No user to grant to yet — one shows up here once they have some activity.","bad"); return; }
     return sendCommand({action:"grant_screen_time",user:u,minutes:m}, "grant "+u+" +"+m+"m");
   }
+  // Rules — always broadcast to every device so they stay in sync everywhere.
+  if(act==="toggle_rule")
+    return sendCommand({action:"toggle_rule",rule_id:b.dataset.id,enabled:b.dataset.en==="1"},
+                       (b.dataset.en==="1"?"enable":"disable")+" rule", true);
+  if(act==="remove_rule")
+    return sendCommand({action:"remove_rule",rule_id:b.dataset.id}, "remove rule", true);
+  if(act==="add_rule"){
+    const trig=($("rule-trig")||{}).value||"";
+    if(!trig){ ctlMsg("Pick a trigger app first.","bad"); return; }
+    const targets=[...document.querySelectorAll(".rule-tgt:checked")]
+      .map(c=>c.dataset.proc).filter(p=>p!==trig);   // never target the trigger
+    const bd=!!($("rule-bd")||{}).checked;
+    const sites=(($("rule-sites")||{}).value||"").replace(/;/g,",").split(",")
+      .map(s=>s.trim()).filter(Boolean);
+    const users=[...document.querySelectorAll(".rule-user:checked")].map(c=>c.dataset.user);
+    if(!targets.length && !sites.length && !bd){
+      ctlMsg("Pick something to block — tick “All distraction sites”, some apps, or add sites.","bad"); return; }
+    const name=(($("rule-name")||{}).value||"").trim();
+    // A client-generated id so every device stores the rule under the same id
+    // (broadcast sends one identical command), keeping toggle/remove in sync.
+    const id="r"+Date.now().toString(36)+Math.random().toString(36).slice(2,8);
+    const rule={id,name,enabled:true,trigger:trig,targets,block_sites:sites,
+                block_distractions:bd,users};
+    return sendCommand({action:"add_rule",rule}, "add rule"+(name?" "+name:""), true);
+  }
 }
 function fmtClock(ts){ const d=new Date(ts*1000);
   return String(d.getHours()).padStart(2,"0")+":"+String(d.getMinutes()).padStart(2,"0"); }
@@ -1048,6 +1090,84 @@ function renderCtlStatus(){
 }
 function ctlRowBtn(act, cls, txt, extra){
   return '<button class="'+cls+'" data-act="'+act+'"'+(extra||"")+'>'+txt+'</button>';
+}
+// Human summary of one auto-block rule, mapping trigger/target proc names to
+// their app labels via this machine's apps list.
+function ruleSummary(rule, apps){
+  const p2n={}; (apps||[]).forEach(a=>{ p2n[(a.proc||"").toLowerCase()]=a.name; });
+  const nm=p=>p2n[(p||"").toLowerCase()]||p;
+  const parts=[];
+  (rule.targets||[]).forEach(t=>parts.push(esc(nm(t))));
+  if((rule.block_sites||[]).length) parts.push("sites: "+esc(rule.block_sites.join(", ")));
+  if(rule.block_distractions) parts.push("<b>ALL distraction sites</b>");
+  const what=parts.join(", ")||"(nothing)";
+  const who=(rule.users||[]).length ? esc(rule.users.join(", ")) : "any user";
+  return "While <b>"+esc(nm(rule.trigger))+"</b> is running → block "+what+
+         " · for "+who;
+}
+// The Auto-block rules section: list + toggle + remove existing rules, and a
+// form to add one (broadcast to every device). Shown per-machine because the
+// trigger/target app pickers come from that machine's app list; the rule it
+// builds is sent to all machines so it applies everywhere.
+function ctlRulesSection(ctl, broadcast){
+  let h='<div class="ctl-sec"><h3>Auto-block rules</h3>';
+  if(broadcast || !ctl){
+    h+='<div class="ctl-note">Pick a specific machine above to see its rules and '+
+       'add new ones. Rules you add there apply to <b>every device</b>.</div></div>';
+    return h;
+  }
+  const rules=ctl.rules||[];
+  if(rules.length){
+    rules.forEach(r=>{
+      const on=r.enabled!==false;
+      h+='<div class="rule-card'+(on?"":" off")+'">'+
+         '<div class="rule-sum">'+ruleSummary(r, ctl.apps)+
+         (r.name?' <span class="pill">'+esc(r.name)+'</span>':'')+
+         (on?'':' <span class="pill red">off</span>')+'</div>'+
+         '<div class="rule-btns">'+
+         ctlRowBtn("toggle_rule", (on?"ghost":"green")+" small",
+                   on?"Disable":"Enable",
+                   ' data-id="'+esc(r.id)+'" data-en="'+(on?"0":"1")+'"')+
+         ctlRowBtn("remove_rule","red small","Remove",' data-id="'+esc(r.id)+'"')+
+         '</div></div>';
+    });
+  } else {
+    h+='<div class="ctl-note">No rules yet on this machine.</div>';
+  }
+  // Add-rule form.
+  const apps=ctl.apps||[];
+  h+='<div class="rule-form"><div class="rule-form-h">Add a rule (all devices)</div>';
+  if(!apps.length){
+    h+='<div class="ctl-note">Add the apps you want to trigger on in AppBlocker '+
+       'first, then they’ll show up here as trigger/target choices.</div></div></div>';
+    return h;
+  }
+  h+='<label class="rule-lbl">When this app is running:</label>'+
+     '<select id="rule-trig" class="ctl-in">'+
+     apps.map(a=>'<option value="'+esc(a.proc)+'">'+esc(a.name)+'</option>').join("")+
+     '</select>';
+  h+='<label class="rule-lbl" style="margin-top:8px;">…block all these at once:</label>'+
+     '<label class="rule-chk"><input type="checkbox" id="rule-bd" checked> '+
+     '<b>All distraction sites</b> (your whole distraction list)</label>';
+  h+='<div class="rule-tgts">';
+  apps.forEach(a=>{ h+='<label class="rule-chk"><input type="checkbox" class="rule-tgt" '+
+    'data-proc="'+esc(a.proc)+'"> '+esc(a.name)+'</label>'; });
+  h+='</div>';
+  h+='<input id="rule-sites" class="ctl-in" placeholder="extra sites, comma-separated (optional)">';
+  const users=ctl.human_users||[];
+  if(users.length){
+    h+='<label class="rule-lbl" style="margin-top:8px;">For which users? '+
+       '(none ticked = any user)</label><div class="rule-users">'+
+       users.map(u=>'<label class="rule-chk"><input type="checkbox" class="rule-user" '+
+         'data-user="'+esc(u)+'"> '+esc(u)+'</label>').join("")+'</div>';
+  }
+  h+='<input id="rule-name" class="ctl-in" placeholder="label (optional, e.g. Homework mode)">';
+  h+='<div class="rule-row-btn">'+ctlRowBtn("add_rule","red small","＋ Add rule")+'</div>';
+  h+='<div class="ctl-note">Blocks apply to the whole computer while the trigger app '+
+     'is open, and re-open the moment it closes. “All distraction sites” overrides any '+
+     'free time you’ve granted.</div>';
+  h+='</div></div>';
+  return h;
 }
 function renderControls(){
   const body=$("ctl-body"); if(!body) return;
@@ -1197,6 +1317,9 @@ function renderControls(){
      '<div class="ctl-note">Blocked by default so schoolwork on any site stays '+
      'focused. Grant free time or allow one site, and it re-locks on its own'+
      (broadcast?", on every machine":"")+'.</div></div>';
+
+  // Auto-block rules (list / toggle / remove / add — see helper above).
+  h+=ctlRulesSection(ctl, broadcast);
 
   // Screen-time budget: a read-only status line (from _control_snapshot's
   // screen_budget, which now syncs across machines when saved from the app)

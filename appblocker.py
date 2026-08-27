@@ -2824,6 +2824,17 @@ def _control_snapshot(state):
         distract_allow = {d: int(t) for d, t in state.distract_allow.items()
                           if int(t) > now}
         screen_budget = dict(state.screen_budget)
+        # Auto-block rules, so the dashboard can list / toggle / remove them and
+        # add new ones. Proc names are resolved to human labels client-side via
+        # the apps list above.
+        rules = [{"id": r.get("id", ""), "name": r.get("name", ""),
+                  "enabled": bool(r.get("enabled", True)),
+                  "trigger": r.get("trigger", ""),
+                  "targets": list(r.get("targets") or []),
+                  "block_sites": list(r.get("block_sites") or []),
+                  "block_distractions": bool(r.get("block_distractions")),
+                  "users": list(r.get("users") or [])}
+                 for r in state.rules]
     try:
         human_users = [name for name, _uid in list_human_users()]
     except Exception:
@@ -2832,7 +2843,8 @@ def _control_snapshot(state):
             "lockdown": lockdown, "block_adult": adult,
             "human_users": human_users, "remote_enabled": remote_enabled,
             "distractions": distractions, "distract_free_until": free_until,
-            "distract_allow": distract_allow, "screen_budget": screen_budget}
+            "distract_allow": distract_allow, "screen_budget": screen_budget,
+            "rules": rules}
 
 
 def build_report_data(store, days=REPORT_DAYS, limit=REPORT_LIMIT,
@@ -3647,6 +3659,32 @@ def apply_remote_command(state, cmd, store=None):
         (store or HistoryStore()).add_bonus_seconds(user, day, minutes * 60)
         return True, f"granted {user} +{minutes}m screen time"
 
+    if action == "add_rule":
+        rule = cmd.get("rule")
+        if not isinstance(rule, dict) or not str(rule.get("trigger") or "").strip():
+            return False, "rule needs a trigger app"
+        added = state.add_rule(rule)
+        if not added:
+            return False, "invalid rule"
+        return True, f"added rule “{added.get('name') or added.get('trigger')}”"
+
+    if action == "remove_rule":
+        # note: "id" is the command's own sequence number, so the rule's id
+        # travels as "rule_id".
+        rid = str(cmd.get("rule_id", ""))
+        if not rid:
+            return False, "rule id required"
+        return ((True, "removed rule") if state.remove_rule_by_id(rid)
+                else (False, "rule not found"))
+
+    if action == "toggle_rule":
+        rid = str(cmd.get("rule_id", ""))
+        if not rid:
+            return False, "rule id required"
+        en = bool(cmd.get("enabled"))
+        return ((True, f"rule {'enabled' if en else 'disabled'}")
+                if state.toggle_rule_by_id(rid, en) else (False, "rule not found"))
+
     if action == "set_screen_budget":
         # Lets the screen-time budget config (default minutes + per-user
         # overrides) sync across machines: whichever machine an admin edits
@@ -3819,6 +3857,7 @@ class ProcessMonitor(threading.Thread):
             return win_cache[uid]
 
         dynamic_sites = set()
+        force_distractions = False   # a block_distractions rule is firing now
         for rule in trigger_rules:
             if not rule.get("enabled", True):
                 continue
@@ -3853,6 +3892,8 @@ class ProcessMonitor(threading.Thread):
                     continue  # never kill the trigger itself
                 blockers.append((tgt_app, set(active_uids)))
             dynamic_sites.update(rule.get("block_sites") or [])
+            if rule.get("block_distractions"):
+                force_distractions = True
 
         if blockers:
             for pid, comm, uid, exe, cmd in procs:
@@ -3885,8 +3926,14 @@ class ProcessMonitor(threading.Thread):
                     domains |= set(sch.get("sites") or [])
             # Distractions: blocked by default unless free time is granted or the
             # specific site has an unexpired allow. Auto re-locks when they lapse
-            # because this recomputes every sweep.
-            domains |= active_distractions(distractions, free_until, allow)
+            # because this recomputes every sweep. But while a "block all
+            # distractions" rule's trigger app is running, the ENTIRE distraction
+            # list is hard-blocked -- overriding any granted free time or per-site
+            # allow -- until the trigger closes.
+            if force_distractions:
+                domains |= set(distractions)
+            else:
+                domains |= active_distractions(distractions, free_until, allow)
             sync_blocked_websites(sorted(domains))
             # Block the same sites INSIDE the browser (URLBlocklist policy) so it
             # takes hold on already-open tabs without a reload and survives DoH —
@@ -4224,20 +4271,35 @@ class AppState:
         return apps
 
     @staticmethod
+    def _rule_id(r):
+        """Stable id for a rule, derived from its identity (not its enabled
+        state), so the same rule broadcast to several machines gets the same id
+        and can be toggled/removed by id from the dashboard."""
+        basis = json.dumps(
+            [r.get("trigger", ""), sorted(r.get("targets") or []),
+             sorted(r.get("block_sites") or []),
+             bool(r.get("block_distractions")), r.get("name", "")],
+            sort_keys=True)
+        return "r" + hashlib.md5(basis.encode("utf-8")).hexdigest()[:10]
+
+    @staticmethod
     def _normalize_rules(rules):
         """
         Auto-block trigger rule:
             {
+              "id": "r1a2b3c4d5",        # stable id (auto-derived if absent)
               "name": "While gaming, block browsers",
               "enabled": True,
               "trigger": "steam",        # proc name that, while running...
               "targets": ["firefox"],    # ...causes these proc names to block
               "block_sites": ["x.com"],  # ...and these websites to be blocked
+              "block_distractions": False,  # ...and block the whole distraction list
               "users": []                # [] = any user, else specific names
             }
         Target apps are blocked only for the user(s) running the trigger;
-        website blocks are machine-wide (the hosts file is global) but only
-        while the trigger is running.
+        website blocks (block_sites, and the distraction list when
+        block_distractions is set) are machine-wide (the hosts file is global)
+        but only while the trigger is running.
         """
         clean = []
         for r in rules or []:
@@ -4247,8 +4309,11 @@ class AppState:
             r.setdefault("enabled", True)
             r.setdefault("targets", [])
             r.setdefault("users", [])
+            r["block_distractions"] = bool(r.get("block_distractions"))
             r["block_sites"] = [normalize_domain(d) for d in r.get("block_sites", [])
                                 if normalize_domain(d)]
+            rid = str(r.get("id") or "").strip()
+            r["id"] = rid or AppState._rule_id(r)
             clean.append(r)
         return clean
 
@@ -4496,14 +4561,22 @@ class AppState:
     # -- auto-block rules --------------------------------------------------- #
     def add_rule(self, rule):
         with self.lock:
-            self.rules.append(rule)
-            self.save_locked()
+            # Normalize so a rule added from the dashboard (or the GUI) always
+            # carries a stable id + the block_distractions flag.
+            norm = self._normalize_rules([rule])
+            if norm:
+                self.rules.append(norm[0])
+                self.save_locked()
+                return norm[0]
+            return None
 
     def update_rule(self, index, rule):
         with self.lock:
             if 0 <= index < len(self.rules):
-                self.rules[index] = rule
-                self.save_locked()
+                norm = self._normalize_rules([rule])
+                if norm:
+                    self.rules[index] = norm[0]
+                    self.save_locked()
 
     def remove_rule(self, index):
         with self.lock:
@@ -4516,6 +4589,30 @@ class AppState:
             if 0 <= index < len(self.rules):
                 self.rules[index]["enabled"] = enabled
                 self.save_locked()
+
+    def remove_rule_by_id(self, rule_id):
+        """Remove the rule with this id (dashboard broadcast). True if removed."""
+        rule_id = str(rule_id or "")
+        with self.lock:
+            keep = [r for r in self.rules if str(r.get("id", "")) != rule_id]
+            if len(keep) == len(self.rules):
+                return False
+            self.rules = keep
+            self.save_locked()
+            return True
+
+    def toggle_rule_by_id(self, rule_id, enabled):
+        """Enable/disable the rule with this id. True if a rule matched."""
+        rule_id = str(rule_id or "")
+        with self.lock:
+            hit = False
+            for r in self.rules:
+                if str(r.get("id", "")) == rule_id:
+                    r["enabled"] = bool(enabled)
+                    hit = True
+            if hit:
+                self.save_locked()
+            return hit
 
     # -- blocked websites --------------------------------------------------- #
     def set_websites(self, domains):
@@ -5220,6 +5317,8 @@ class AppBlockerUI:
         sites = rule.get("block_sites") or []
         if sites:
             parts.append("websites: " + ", ".join(sites))
+        if rule.get("block_distractions"):
+            parts.append("ALL distraction sites")
         what = ", ".join(parts) or "(nothing)"
         who = ", ".join(rule.get("users") or []) or "any user"
         return f"While {trig_name} is running  →  block {what}\nfor {who}"
@@ -5376,6 +5475,22 @@ class AppBlockerUI:
                      fg="#7f8c8d", wraplength=400, justify="left").pack(
                          anchor="w", padx=24)
 
+        # Block the whole distraction list while the trigger runs (system mode).
+        distract_var = None
+        if SYSTEM_MODE:
+            distract_var = tk.BooleanVar(
+                value=bool(existing.get("block_distractions")))
+            tk.Checkbutton(
+                body, variable=distract_var, bg=COLOR_BG, anchor="w",
+                font=("Helvetica", 11),
+                text="…and block ALL distraction sites while it runs").pack(
+                    fill="x", padx=18, pady=(12, 0))
+            tk.Label(body, text="Hard-blocks every site on your distraction list "
+                     "for the whole computer while the trigger runs — overriding "
+                     "any free time you've granted.", bg=COLOR_BG,
+                     fg="#7f8c8d", wraplength=400, justify="left").pack(
+                         anchor="w", padx=24)
+
         # users (system mode)
         user_vars = {}
         if SYSTEM_MODE:
@@ -5421,19 +5536,25 @@ class AppBlockerUI:
             if sites_var is not None:
                 sites = [normalize_domain(s) for s in sites_var.get().replace(
                     ";", ",").split(",") if normalize_domain(s)]
-            if not targets and not sites:
+            block_distractions = bool(distract_var.get()) if distract_var else False
+            if not targets and not sites and not block_distractions:
                 messagebox.showwarning(
                     "Nothing to block",
-                    "Choose at least one app or website to block.", parent=win)
+                    "Choose at least one app or website to block (or tick "
+                    "“block ALL distraction sites”).", parent=win)
                 return
             rule = {
                 "name": name_var.get().strip(),
-                "enabled": True,
+                "enabled": existing.get("enabled", True),
                 "trigger": trig_proc,
                 "targets": targets,
                 "block_sites": sites,
+                "block_distractions": block_distractions,
                 "users": [u for u, v in user_vars.items() if v.get()],
             }
+            # Keep the same id when editing so the dashboard's view stays stable.
+            if existing.get("id"):
+                rule["id"] = existing["id"]
             if index is None:
                 self.state.add_rule(rule)
             else:
