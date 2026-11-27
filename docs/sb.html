@@ -1,0 +1,305 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AppBlocker (Supabase)</title>
+<style>
+  :root{ --bg:#f4f6f8; --card:#fff; --line:#e1e6ea; --head:#1b2631; --accent:#2980b9;
+         --muted:#7f8c8d; --red:#c0392b; --ok:#1e8449; }
+  @media (prefers-color-scheme: dark){ :root:not([data-theme="light"]){
+    --bg:#11161b; --card:#1b2330; --line:#2b3644; --head:#e8eef4; --accent:#4aa3df;
+    --muted:#94a3b2; --red:#e74c3c; --ok:#2ecc71; } }
+  *{ box-sizing:border-box; }
+  body{ margin:0; font:15px/1.45 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+        background:var(--bg); color:var(--head); }
+  header{ background:var(--head); color:#fff; padding:12px 16px; display:flex;
+          align-items:center; gap:12px; flex-wrap:wrap; }
+  header h1{ font-size:17px; margin:0; } header .sp{ margin-left:auto; }
+  header button{ background:#ffffff22; color:#fff; border:1px solid #ffffff44; }
+  main{ max-width:960px; margin:0 auto; padding:16px; }
+  button{ background:var(--accent); color:#fff; border:0; border-radius:7px;
+          padding:8px 12px; font-size:14px; cursor:pointer; }
+  button.ghost{ background:transparent; color:var(--accent); border:1px solid var(--accent); }
+  button.red{ background:var(--red); } button.green{ background:var(--ok); }
+  button.sm{ padding:5px 9px; font-size:13px; }
+  input,select{ padding:9px 10px; border:1px solid var(--line); border-radius:7px;
+                font-size:15px; background:var(--card); color:var(--head); }
+  .card{ background:var(--card); border:1px solid var(--line); border-radius:10px;
+         padding:14px 16px; margin-bottom:14px; }
+  .card h2{ font-size:14px; margin:0 0 10px; color:var(--accent); }
+  .hint{ color:var(--muted); font-size:13px; }
+  .center{ max-width:420px; margin:10vh auto; }
+  table{ width:100%; border-collapse:collapse; font-size:13px; }
+  th,td{ text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th{ color:var(--muted); font-weight:600; cursor:default; }
+  .nw{ white-space:nowrap; } .r{ text-align:right; }
+  .pill{ display:inline-block; background:var(--line); border-radius:10px; padding:1px 8px;
+         font-size:11px; color:var(--muted); }
+  .row{ display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  .dev{ display:flex; gap:10px; align-items:baseline; flex-wrap:wrap; padding:6px 0;
+        border-bottom:1px dashed var(--line); }
+  .dev:last-child{ border-bottom:0; }
+  .muted{ color:var(--muted); }
+  label.chk{ display:inline-flex; gap:6px; align-items:center; font-size:13px; color:var(--muted); cursor:pointer; }
+  #err{ color:var(--red); font-size:13px; margin:8px 0; }
+  #toast{ position:fixed; left:50%; bottom:24px; transform:translateX(-50%);
+          background:var(--head); color:#fff; padding:10px 16px; border-radius:8px;
+          opacity:0; transition:opacity .2s; pointer-events:none; font-size:14px; }
+  #toast.show{ opacity:.95; } #toast.bad{ background:var(--red); }
+  .hidden{ display:none !important; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🔒 AppBlocker</h1>
+  <span class="pill" id="who"></span>
+  <span class="sp"></span>
+  <button id="btn-refresh" class="hidden ghost sm">Refresh</button>
+  <button id="btn-signout" class="hidden sm">Sign out</button>
+</header>
+<main>
+  <!-- LOGIN -->
+  <div id="login" class="card center hidden">
+    <h2>Sign in</h2>
+    <p class="hint">Enter your email and we'll send you a one-click sign-in link.</p>
+    <div class="row">
+      <input id="email" type="email" placeholder="you@example.com" style="flex:1">
+      <button id="btn-magic">Send link</button>
+    </div>
+    <p id="login-msg" class="hint"></p>
+  </div>
+
+  <!-- JOIN -->
+  <div id="join" class="card center hidden">
+    <h2>Link to your household</h2>
+    <p class="hint">Paste your household enrollment code (the same one you put into
+      AppBlocker on your computers) to connect this account.</p>
+    <div class="row">
+      <input id="code" placeholder="household code" style="flex:1">
+      <button id="btn-join">Link</button>
+    </div>
+  </div>
+
+  <div id="err"></div>
+
+  <!-- APP -->
+  <div id="app" class="hidden">
+    <div class="card" id="c-devices"><h2>Devices</h2><div id="devices"></div></div>
+
+    <div class="card">
+      <h2>Controls (all devices)</h2>
+      <div class="row" style="margin-bottom:8px">
+        <input id="ctl-site" placeholder="block a site, e.g. tiktok.com" style="flex:1">
+        <button class="red sm" data-cmd="add_website">Block site</button>
+        <button class="sm" data-cmd="add_distraction">Add distraction</button>
+      </div>
+      <div class="row">
+        <button class="red sm" data-cmd="quick_block">⚡ Block all browsers</button>
+        <button class="green sm" data-cmd="unblock_all">🔓 Unblock everything</button>
+        <button class="green sm" data-cmd="grant_free_time" data-min="30">Free time 30m</button>
+        <button class="green sm" data-cmd="end_break">End breaks</button>
+      </div>
+      <p class="hint" id="ctl-msg"></p>
+    </div>
+
+    <div class="card">
+      <h2>Recent activity</h2>
+      <div class="row" style="margin-bottom:8px">
+        <input id="fx-site" placeholder="filter by site…" style="flex:1">
+        <label class="chk"><input type="checkbox" id="fx-bg"> show background loads</label>
+      </div>
+      <div style="overflow-x:auto"><table id="t-visits"><thead><tr>
+        <th>When</th><th>User</th><th>Device</th><th>Site / page</th><th class="r">Time</th>
+      </tr></thead><tbody></tbody></table></div>
+      <p class="hint" id="visits-empty"></p>
+    </div>
+
+    <div class="card">
+      <h2>Searches</h2>
+      <div style="overflow-x:auto"><table id="t-search"><thead><tr>
+        <th>When</th><th>User</th><th>Search</th><th>On</th>
+      </tr></thead><tbody></tbody></table></div>
+      <p class="hint" id="search-empty"></p>
+    </div>
+  </div>
+</main>
+<div id="toast"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js"></script>
+<script>
+const SB_URL = "https://bptrkvzzuhfxbqbxfbhl.supabase.co";
+const SB_KEY = "sb_publishable_LDFRXQlOlHQYmIQwDmLxRA_H4hz1H3F";
+const client = window.supabase.createClient(SB_URL, SB_KEY);
+const ab = () => client.schema("appblocker");
+
+const $ = id => document.getElementById(id);
+const esc = s => (s==null?"":String(s)).replace(/[&<>"]/g, c =>
+  ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+let HOUSEHOLD = null, DEVICES = {}, VISITS = [], rt = null;
+
+function show(which){ ["login","join","app"].forEach(x => $(x).classList.toggle("hidden", x!==which)); }
+function toast(m, bad){ const t=$("toast"); t.textContent=m; t.className="show"+(bad?" bad":"");
+  clearTimeout(t._h); t._h=setTimeout(()=>t.className="", 3000); }
+function err(m){ $("err").textContent = m||""; }
+function fmtDur(s){ s=Math.max(0,Math.round(s||0)); if(!s) return "0m"; const m=Math.floor(s/60);
+  if(m>=60) return Math.floor(m/60)+"h "+(m%60)+"m"; return m? m+"m":"<1m"; }
+function fmtWhen(iso){ const d=new Date(iso);
+  return '<span class="nw">'+d.toLocaleDateString([], {month:"2-digit",day:"2-digit"})+
+    "</span> <span class='nw'>"+d.toLocaleTimeString([], {hour:"2-digit",minute:"2-digit"})+"</span>"; }
+
+// ---------- auth ----------
+$("btn-magic").onclick = async () => {
+  const email = $("email").value.trim(); if(!email) return;
+  $("login-msg").textContent = "Sending…";
+  const { error } = await client.auth.signInWithOtp(
+    { email, options: { emailRedirectTo: location.href.split("#")[0] } });
+  $("login-msg").textContent = error ? ("✗ "+error.message)
+    : "✓ Check your email for the sign-in link, then come back here.";
+};
+$("btn-signout").onclick = async () => { await client.auth.signOut(); location.reload(); };
+$("btn-join").onclick = async () => {
+  const code = $("code").value.trim(); if(!code) return;
+  const { error } = await client.rpc("appblocker_join_household", { p_code: code });
+  if(error){ err("Couldn't link: "+error.message); return; }
+  err(""); await afterLogin();
+};
+
+client.auth.onAuthStateChange((_e, session) => { route(session); });
+
+async function route(session){
+  if(!session){ show("login"); $("who").textContent="";
+    $("btn-signout").classList.add("hidden"); $("btn-refresh").classList.add("hidden"); return; }
+  $("who").textContent = session.user.email;
+  $("btn-signout").classList.remove("hidden");
+  await afterLogin();
+}
+
+async function afterLogin(){
+  // Am I a member of a household yet?
+  const { data, error } = await ab().from("household_member").select("household_id").limit(1);
+  if(error){ // most likely the schema isn't exposed to the API yet
+    if(/schema|not exist|406|PGRST/i.test(error.message||error.code||""))
+      err("The database isn't exposed to the dashboard yet. In Supabase → Settings → "+
+          "API → Exposed schemas, add “appblocker”, then Refresh.");
+    else err(error.message);
+    show("app"); $("app").classList.add("hidden"); return;
+  }
+  if(!data || !data.length){ show("join"); return; }
+  HOUSEHOLD = data[0].household_id;
+  show("app"); $("btn-refresh").classList.remove("hidden");
+  await loadAll(); subscribe();
+}
+
+// ---------- data ----------
+async function loadAll(){
+  err("");
+  const today = new Date(); const ds = today.getFullYear()+"-"+
+    String(today.getMonth()+1).padStart(2,"0")+"-"+String(today.getDate()).padStart(2,"0");
+  const since = new Date(Date.now()-2*86400e3).toISOString();
+  const [dev, snap, st, at, vis] = await Promise.all([
+    ab().from("device").select("id,label,last_seen"),
+    ab().from("snapshot").select("device_id,generated_at,data,updated_at"),
+    ab().from("screen_time").select("device_id,username,seconds,bonus_seconds").eq("day", ds),
+    ab().from("app_time").select("device_id,username,app,label,seconds").eq("day", ds),
+    ab().from("visit").select("device_id,username,domain,url,ts,duration,background,query")
+      .gte("ts", since).order("ts",{ascending:false}).limit(1500),
+  ]);
+  const anyErr = [dev,snap,st,at,vis].find(r=>r.error);
+  if(anyErr){ err(anyErr.error.message); return; }
+  DEVICES = {}; (dev.data||[]).forEach(d => DEVICES[d.id]=d.label||d.id.slice(0,6));
+  renderDevices(dev.data||[], snap.data||[], st.data||[], at.data||[]);
+  VISITS = vis.data||[];
+  renderVisits(); renderSearches();
+}
+
+function renderDevices(devs, snaps, st, at){
+  const snapBy = {}; snaps.forEach(s=>snapBy[s.device_id]=s);
+  const stBy = {}; st.forEach(r=>{ (stBy[r.device_id]=stBy[r.device_id]||{})[r.username]=r; });
+  const atBy = {}; at.forEach(r=>{ (atBy[r.device_id]=atBy[r.device_id]||[]).push(r); });
+  let h="";
+  if(!devs.length) h='<p class="hint">No devices enrolled yet.</p>';
+  devs.forEach(d=>{
+    const s=snapBy[d.id], seen=d.last_seen? new Date(d.last_seen).toLocaleString():"never";
+    const users=Object.values(stBy[d.id]||{}).map(r=>
+      esc(r.username)+" "+fmtDur((r.seconds||0))).join(" · ");
+    h+='<div class="dev"><b>'+esc(d.label||d.id.slice(0,6))+'</b>'+
+       '<span class="muted">last seen '+esc(seen)+'</span>'+
+       (users?'<span class="pill">today: '+users+'</span>':'')+'</div>';
+  });
+  $("devices").innerHTML=h;
+}
+
+function activeVisits(){
+  const site=($("fx-site").value||"").toLowerCase().trim();
+  const showBg=$("fx-bg").checked;
+  return VISITS.filter(v=>{
+    if(!showBg && v.background) return false;
+    if(site && !((v.domain||"").toLowerCase().includes(site))) return false;
+    return true;
+  });
+}
+function renderVisits(){
+  const rows=activeVisits().slice(0,400);
+  $("t-visits").tBodies[0].innerHTML = rows.map(v=>
+    "<tr><td>"+fmtWhen(v.ts)+"</td><td>"+esc(v.username||"")+"</td><td>"+
+    esc(DEVICES[v.device_id]||"")+"</td><td>"+esc(v.domain||"")+
+    (v.url?'<div class="muted" style="max-width:360px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(v.url)+"</div>":"")+
+    "</td><td class='r nw'>"+(typeof v.duration==="number"?fmtDur(v.duration):"")+"</td></tr>").join("");
+  $("visits-empty").textContent = rows.length? "" : "Nothing to show.";
+}
+function renderSearches(){
+  const rows=VISITS.filter(v=>v.query).slice(0,200);
+  $("t-search").tBodies[0].innerHTML = rows.map(v=>
+    "<tr><td>"+fmtWhen(v.ts)+"</td><td>"+esc(v.username||"")+"</td><td>"+
+    esc(v.query)+"</td><td>"+esc(v.domain||"")+"</td></tr>").join("");
+  $("search-empty").textContent = rows.length? "" : "No searches recorded.";
+}
+$("fx-site").addEventListener("input", renderVisits);
+$("fx-bg").addEventListener("change", renderVisits);
+$("btn-refresh").onclick = loadAll;
+
+// ---------- controls (issue commands to every device) ----------
+async function issue(action, payload){
+  const ids=Object.keys(DEVICES);
+  if(!ids.length){ toast("No devices yet.", true); return; }
+  const { data:{ user } } = await client.auth.getUser();
+  const rows=ids.map(id=>({ household_id:HOUSEHOLD, target_device_id:id,
+    action, payload:payload||{}, created_by:user.id }));
+  const { error } = await ab().from("command").insert(rows);
+  if(error){ $("ctl-msg").textContent="✗ "+error.message; toast("Failed", true); return; }
+  $("ctl-msg").textContent="✓ Sent “"+action+"” to "+ids.length+" device(s). Applies within ~1 min.";
+  toast("Sent to "+ids.length+" device(s)");
+}
+document.querySelectorAll("[data-cmd]").forEach(b=>{
+  b.onclick=()=>{
+    const cmd=b.dataset.cmd;
+    if(cmd==="add_website"||cmd==="add_distraction"){
+      const d=($("ctl-site").value||"").trim(); if(!d){ toast("Enter a site first.",true); return; }
+      issue(cmd, {domain:d}); $("ctl-site").value="";
+    } else if(cmd==="grant_free_time"){ issue(cmd, {minutes:parseInt(b.dataset.min,10)}); }
+    else if(cmd==="end_break"){ issue(cmd, {}); }
+    else { issue(cmd, {}); }
+  };
+});
+
+// ---------- realtime ----------
+function subscribe(){
+  if(rt) client.removeChannel(rt);
+  rt = client.channel("ab-"+Date.now())
+    .on("postgres_changes", {event:"INSERT", schema:"appblocker", table:"visit"}, p=>{
+      VISITS.unshift(p.new); if(VISITS.length>1600) VISITS.pop();
+      renderVisits(); renderSearches();
+    })
+    .on("postgres_changes", {event:"*", schema:"appblocker", table:"snapshot"}, ()=>loadAll())
+    .subscribe();
+}
+
+// ---------- boot ----------
+(async () => {
+  const { data:{ session } } = await client.auth.getSession();
+  route(session);
+})();
+</script>
+</body>
+</html>
