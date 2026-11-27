@@ -2621,6 +2621,8 @@ class HistoryMonitor(threading.Thread):
                 # Poll for remote-control commands from the dashboard and apply
                 # them (fast — pushes an updated snapshot right after applying).
                 self._poll_commands(store)
+                # Same, from Supabase (dual-source; no-op unless configured).
+                self._poll_supabase_commands(store)
                 # Opportunistically push the remote dashboard data.
                 now = time.time()
                 if now - self._last_sync >= SYNC_INTERVAL:
@@ -2631,6 +2633,19 @@ class HistoryMonitor(threading.Thread):
                             sys.stderr.write(f"[sync] pushed {n} bytes\n")
                     except Exception as exc:
                         sys.stderr.write(f"[sync] failed: {exc}\n")
+                    # Supabase data push (dual-write; no-op unless configured).
+                    try:
+                        with self.state.lock:
+                            sb_on = bool(self.state.supabase.get("enabled"))
+                        if sb_on:
+                            data = build_report_data(
+                                store, state=self.state,
+                                cmd_results=self._cmd_results,
+                                cmd_ts=int(store.get_state("__cmd_ts__") or 0))
+                            if supabase_push_data(self.state, store, data):
+                                sys.stderr.write("[supabase] pushed data\n")
+                    except Exception as exc:
+                        sys.stderr.write(f"[supabase] push failed: {exc}\n")
                 if now - self._last_tv_sync >= SYNC_INTERVAL:
                     self._last_tv_sync = now
                     try:
@@ -2726,6 +2741,47 @@ class HistoryMonitor(threading.Thread):
             self._push_dashboard(store)
         except Exception as exc:
             sys.stderr.write(f"[control] push after apply failed: {exc}\n")
+
+    def _poll_supabase_commands(self, store):
+        """Pull, apply and ack remote-control commands from Supabase. Mirrors
+        _poll_commands' apply path (same apply_remote_command + the end_break
+        break-recompute), but acks by command id instead of a GitHub watermark.
+        No-op unless Supabase sync is enabled."""
+        with self.state.lock:
+            if not self.state.supabase.get("enabled"):
+                return
+        cmds = supabase_fetch_commands(self.state, store)
+        if not cmds:
+            return
+        acks = []
+        maxid = int(store.get_state("__sb_cmd_since__") or 0)
+        touched_break = False
+        for c in cmds:
+            cid = int(c.get("id", 0))
+            maxid = max(maxid, cid)
+            action = c.get("action", "")
+            payload = c.get("payload") or {}
+            cmd = dict(payload)
+            cmd["action"] = action
+            try:
+                ok, msg = apply_remote_command(self.state, cmd, store)
+            except Exception as exc:
+                ok, msg = False, str(exc)
+            acks.append({"id": cid, "ok": bool(ok), "msg": msg})
+            self._cmd_results.append({"id": cid, "action": action, "ok": bool(ok),
+                                      "msg": msg, "at": int(time.time())})
+            if action in ("end_break", "set_break_rule"):
+                touched_break = True
+            sys.stderr.write(
+                f"[supabase] {'OK ' if ok else 'ERR'} {action}: {msg}\n")
+        self._cmd_results = self._cmd_results[-40:]
+        store.set_state("__sb_cmd_since__", maxid)
+        if touched_break:
+            try:
+                self._check_forced_break(store)
+            except Exception as exc:
+                sys.stderr.write(f"[break] post-command recompute failed: {exc}\n")
+        supabase_ack(self.state, acks)
 
     def _email_cfg(self):
         with self.state.lock:
@@ -3354,6 +3410,169 @@ def push_reports_to_github(cfg, data):
     path = machine_data_path(cfg)   # machines/<this-host>.json — never clobbers others
     return push_json_to_github(
         cfg, path, data, f"Update activity {data.get('generated_at_str', '')}")
+
+
+# --------------------------------------------------------------------------- #
+# Supabase sync (dual-write alongside GitHub).
+#
+# A machine POSTs to the `appblocker-ingest` edge function, authenticating with
+# its own device key. The function writes only that device's rows and returns
+# any pending remote-control commands. The parent pastes url + anon_key +
+# enroll_code into the app once; the daemon enrolls on its first sync, stores
+# the returned device_key, and uses it from then on.
+# --------------------------------------------------------------------------- #
+SUPABASE_FN_PATH = "/functions/v1/appblocker-ingest"
+
+
+def supabase_ready(cfg):
+    """True if enough is configured to at least enroll."""
+    return bool(cfg.get("enabled") and cfg.get("url") and cfg.get("anon_key")
+                and (cfg.get("device_key") or cfg.get("enroll_code")))
+
+
+def _supabase_call(cfg, body, timeout=20):
+    """POST one op to the ingest function. Returns parsed JSON (dict), or raises.
+    The anon key rides as the gateway credential; the function does the real
+    (device-key) auth itself."""
+    url = cfg.get("url", "").strip().rstrip("/") + SUPABASE_FN_PATH
+    anon = cfg.get("anon_key", "").strip()
+    raw = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(url, data=raw, method="POST")
+    req.add_header("content-type", "application/json")
+    req.add_header("apikey", anon)
+    req.add_header("Authorization", "Bearer " + anon)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8") or "{}")
+
+
+def supabase_enroll(state):
+    """One-time: register this machine and store its device key. Returns the
+    device_key on success, else None. Safe to call every cycle — it no-ops once
+    a device_key is already stored."""
+    with state.lock:
+        cfg = dict(state.supabase)
+    if cfg.get("device_key"):
+        return cfg["device_key"]
+    if not (cfg.get("enabled") and cfg.get("url") and cfg.get("anon_key")
+            and cfg.get("enroll_code")):
+        return None
+    try:
+        resp = _supabase_call(cfg, {
+            "op": "enroll", "enroll_code": cfg["enroll_code"],
+            "machine_key": machine_id(),
+            "label": (os.uname().nodename if hasattr(os, "uname") else "")})
+    except Exception as exc:
+        sys.stderr.write(f"[supabase] enroll failed: {exc}\n")
+        return None
+    key = (resp or {}).get("device_key")
+    if not key:
+        sys.stderr.write(f"[supabase] enroll rejected: {resp}\n")
+        return None
+    cfg["device_key"] = key
+    cfg["device_id"] = (resp or {}).get("device_id", "")
+    state.set_supabase(cfg)
+    sys.stderr.write("[supabase] enrolled this machine\n")
+    return key
+
+
+def build_supabase_payload(state, store, data):
+    """Turn a build_report_data() dict into the ingest function's payload, and
+    return (payload, new_cursor). Only visits/events newer than the stored
+    push cursor are sent (the function dedupes anyway; this just saves egress).
+    Screen/app/break state and the control snapshot are sent in full each time
+    (they're small and upserted)."""
+    today = data.get("screen_day")
+    cur = int(store.get_cursor("__sb_ts__") or 0)
+
+    def newer(rows):
+        return [r for r in rows if int(r.get("ts", 0)) > cur]
+
+    visits = newer(data.get("visits", []))
+    attempts = newer(data.get("attempts", []))
+    blocked = newer(data.get("blocked_sites", []))
+    newdoms = newer(data.get("new_domains", []))
+
+    screen_time = [{"u": u, "day": today, "seconds": int(s or 0),
+                    "bonus": int((data.get("bonus_time") or {}).get(u, 0))}
+                   for u, s in (data.get("screen_time") or {}).items()]
+    app_time = []
+    for u, lst in (data.get("app_time") or {}).items():
+        for a in (lst or []):
+            app_time.append({"u": u, "day": today, "app": a.get("app"),
+                             "label": a.get("label"), "seconds": int(a.get("secs", 0))})
+    break_state = []
+    for uname in (data.get("control") or {}).get("human_users", []):
+        until = int(store.get_state(f"__break_until__{uname}") or 0)
+        work = int(store.get_state(f"__break_work__{uname}") or 0)
+        if until or work:
+            break_state.append({"u": uname, "work_seconds": work,
+                                 "break_until": until or None})
+
+    # Snapshot = everything except the big per-event arrays (those go to tables).
+    snapshot = {k: v for k, v in data.items()
+                if k not in ("visits", "attempts", "blocked_sites", "new_domains")}
+
+    all_ts = ([int(v["ts"]) for v in visits] + [int(a["ts"]) for a in attempts]
+              + [int(b["ts"]) for b in blocked] + [int(n["ts"]) for n in newdoms])
+    new_cursor = max([cur] + all_ts) if all_ts else cur
+
+    payload = {"snapshot": snapshot, "visits": visits, "screen_time": screen_time,
+               "app_time": app_time, "attempts": attempts,
+               "blocked_sites": blocked, "new_domains": newdoms,
+               "break_state": break_state}
+    return payload, new_cursor
+
+
+def supabase_push_data(state, store, data):
+    """Full data push. Enrolls if needed. Advances the push cursor on success.
+    Ignores any commands returned here — command handling is the poll's job."""
+    key = supabase_enroll(state)
+    if not key:
+        return False
+    with state.lock:
+        cfg = dict(state.supabase)
+    payload, new_cursor = build_supabase_payload(state, store, data)
+    payload.update({"op": "push", "device_key": key,
+                    "since": 2 ** 62})   # suppress command return on the data push
+    try:
+        _supabase_call(cfg, payload)
+    except Exception as exc:
+        sys.stderr.write(f"[supabase] data push failed: {exc}\n")
+        return False
+    store.set_state("__sb_ts__", int(new_cursor))
+    return True
+
+
+def supabase_fetch_commands(state, store):
+    """Cheap poll: no data, just pull pending commands for this device. Returns
+    a list of {id, action, payload}."""
+    key = supabase_enroll(state)
+    if not key:
+        return []
+    with state.lock:
+        cfg = dict(state.supabase)
+    since = int(store.get_state("__sb_cmd_since__") or 0)
+    try:
+        resp = _supabase_call(cfg, {"op": "push", "device_key": key, "since": since})
+    except Exception as exc:
+        sys.stderr.write(f"[supabase] command poll failed: {exc}\n")
+        return []
+    return (resp or {}).get("commands") or []
+
+
+def supabase_ack(state, applied):
+    """Mark commands applied (with per-command ok/msg). Best-effort."""
+    if not applied:
+        return
+    key = supabase_enroll(state)
+    if not key:
+        return
+    with state.lock:
+        cfg = dict(state.supabase)
+    try:
+        _supabase_call(cfg, {"op": "ack", "device_key": key, "applied": applied})
+    except Exception as exc:
+        sys.stderr.write(f"[supabase] ack failed: {exc}\n")
 
 
 # Fixed pseudo-machine id for the TV Locker Guard Android app's screen-time
@@ -4313,6 +4532,7 @@ class AppState:
         self.monitor = self._default_monitor()  # website-visit monitoring config
         self.lockdown = {"enabled": False}      # browser incognito lockdown
         self.sync = self._default_sync()        # remote dashboard (GitHub) sync
+        self.supabase = self._default_supabase() # remote dashboard (Supabase) sync
         self.tv_sync = self._default_tv_sync()  # TV Locker Guard screen-time bridge
         self.screen_budget = self._default_screen_budget()  # daily computer-time lock
         self.break_rule = self._default_break_rule()  # forced work/break cycle
@@ -4338,6 +4558,23 @@ class AppState:
             cfg["enabled"] = bool(value.get("enabled"))
             cfg["control"] = bool(value.get("control"))
             for k in ("repo", "branch", "path", "token"):
+                if value.get(k):
+                    cfg[k] = str(value[k]).strip()
+        return cfg
+
+    @staticmethod
+    def _default_supabase():
+        # Supabase sync (dual-write alongside GitHub). url + anon_key + enroll_code
+        # are pasted by the parent; device_key/device_id are filled in once, on
+        # the daemon's first successful enrollment, and persisted here.
+        return {"enabled": False, "url": "", "anon_key": "", "enroll_code": "",
+                "device_key": "", "device_id": ""}
+
+    def _normalize_supabase(self, value):
+        cfg = self._default_supabase()
+        if isinstance(value, dict):
+            cfg["enabled"] = bool(value.get("enabled"))
+            for k in ("url", "anon_key", "enroll_code", "device_key", "device_id"):
                 if value.get(k):
                     cfg[k] = str(value[k]).strip()
         return cfg
@@ -4614,6 +4851,7 @@ class AppState:
             self.lockdown = {"enabled": bool(
                 (data.get("lockdown") or {}).get("enabled"))}
             self.sync = self._normalize_sync(data.get("sync"))
+            self.supabase = self._normalize_supabase(data.get("supabase"))
             self.tv_sync = self._normalize_tv_sync(data.get("tv_sync"))
             self.screen_budget = self._normalize_screen_budget(
                 data.get("screen_budget"))
@@ -4630,6 +4868,7 @@ class AppState:
             self.monitor = self._default_monitor()
             self.lockdown = {"enabled": False}
             self.sync = self._default_sync()
+            self.supabase = self._default_supabase()
             self.tv_sync = self._default_tv_sync()
             self.screen_budget = self._default_screen_budget()
             self.break_rule = self._default_break_rule()
@@ -4659,6 +4898,7 @@ class AppState:
                 self.lockdown = {"enabled": bool(
                     (data.get("lockdown") or {}).get("enabled"))}
                 self.sync = self._normalize_sync(data.get("sync"))
+                self.supabase = self._normalize_supabase(data.get("supabase"))
                 self.tv_sync = self._normalize_tv_sync(data.get("tv_sync"))
                 self.screen_budget = self._normalize_screen_budget(
                     data.get("screen_budget"))
@@ -4682,6 +4922,7 @@ class AppState:
                                  "monitor": self.monitor,
                                  "lockdown": self.lockdown,
                                  "sync": self.sync,
+                                 "supabase": self.supabase,
                                  "tv_sync": self.tv_sync,
                                  "screen_budget": self.screen_budget,
                                  "break_rule": self.break_rule,
@@ -4867,6 +5108,12 @@ class AppState:
             self.sync = self._normalize_sync(cfg)
             self.save_locked()
             return dict(self.sync)
+
+    def set_supabase(self, cfg):
+        with self.lock:
+            self.supabase = self._normalize_supabase(cfg)
+            self.save_locked()
+            return dict(self.supabase)
 
     def set_tv_sync(self, cfg):
         with self.lock:
@@ -5912,6 +6159,43 @@ class AppBlockerUI:
                           wraplength=470, justify="left")
         status.pack(padx=16, pady=(8, 0))
 
+        # ---- Supabase (optional, dual-write alongside GitHub) ----
+        with self.state.lock:
+            sbcfg = dict(self.state.supabase)
+        tk.Label(body, text="— or also push to Supabase —", bg=COLOR_BG,
+                 fg=COLOR_HEADER, font=("Helvetica", 11, "bold")).pack(
+                     anchor="w", padx=16, pady=(14, 2))
+        sb_enabled = tk.BooleanVar(value=sbcfg.get("enabled", False))
+        tk.Checkbutton(body, text="Also push activity to Supabase",
+                       variable=sb_enabled, bg=COLOR_BG).pack(anchor="w", padx=16)
+        sbform = tk.Frame(body, bg=COLOR_BG)
+        sbform.pack(fill="x", padx=16, pady=(6, 0))
+        sb_fields = [("Project URL", "url"), ("Anon/publishable key", "anon_key"),
+                     ("Enrollment code", "enroll_code")]
+        sb_vars = {}
+        for i, (label, key) in enumerate(sb_fields):
+            tk.Label(sbform, text=label + ":", bg=COLOR_BG).grid(
+                row=i, column=0, sticky="w", pady=3)
+            v = tk.StringVar(value=str(sbcfg.get(key, "") or ""))
+            tk.Entry(sbform, textvariable=v, width=34,
+                     show=("*" if key == "enroll_code" else None)).grid(
+                         row=i, column=1, sticky="we", pady=3)
+            sb_vars[key] = v
+        sbform.columnconfigure(1, weight=1)
+        sb_state = tk.Label(
+            body, text=("✓ This machine is enrolled." if sbcfg.get("device_key")
+                        else "Not enrolled yet — saves, then enrolls on next sync."),
+            bg=COLOR_BG, fg="#7f8c8d", wraplength=470, justify="left")
+        sb_state.pack(anchor="w", padx=16, pady=(4, 0))
+
+        def collect_supabase():
+            with self.state.lock:
+                cur = dict(self.state.supabase)
+            cur["enabled"] = sb_enabled.get()
+            for k in ("url", "anon_key", "enroll_code"):
+                cur[k] = sb_vars[k].get().strip()
+            return cur
+
         def collect():
             return {"enabled": enabled.get(),
                     "control": control.get(),
@@ -5922,19 +6206,32 @@ class AppBlockerUI:
 
         def save():
             self.state.set_sync(collect())
+            self.state.set_supabase(collect_supabase())
             messagebox.showinfo("Saved", "Dashboard settings saved.", parent=win)
             win.destroy()
 
         def sync_now():
             self.state.set_sync(collect())
+            self.state.set_supabase(collect_supabase())
             status.config(text="Pushing…")
             win.update_idletasks()
+            msgs = []
             try:
                 n = push_reports_to_github(
                     collect(), build_report_data(HistoryStore(), state=self.state))
-                status.config(text=f"✓ Pushed {n} bytes to {collect()['repo']}.")
+                msgs.append(f"✓ GitHub: {n} bytes")
             except Exception as exc:
-                status.config(text=f"✗ {exc}")
+                msgs.append(f"✗ GitHub: {exc}")
+            if sb_enabled.get():
+                store = HistoryStore()
+                try:
+                    data = build_report_data(store, state=self.state)
+                    ok = supabase_push_data(self.state, store, data)
+                    msgs.append("✓ Supabase: pushed" if ok
+                                else "✗ Supabase: not enrolled / failed")
+                except Exception as exc:
+                    msgs.append(f"✗ Supabase: {exc}")
+            status.config(text="\n".join(msgs))
 
         # `bar` was pinned to the bottom before the scrollable body above.
         tk.Button(bar, text="Save", command=save, bg=COLOR_ACTIVE, fg="white",
