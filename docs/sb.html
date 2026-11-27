@@ -62,10 +62,15 @@
   <!-- LOGIN -->
   <div id="login" class="card center hidden">
     <h2>Sign in</h2>
-    <p class="hint">Enter your email and we'll send you a one-click sign-in link.</p>
+    <p class="hint">Enter your email and we'll send you a sign-in code (or link).</p>
     <div class="row">
       <input id="email" type="email" placeholder="you@example.com" style="flex:1">
-      <button id="btn-magic">Send link</button>
+      <button id="btn-magic">Send code</button>
+    </div>
+    <div class="row hidden" id="otp-row" style="margin-top:8px">
+      <input id="otp" inputmode="numeric" autocomplete="one-time-code"
+             placeholder="6-digit code from the email" style="flex:1">
+      <button id="btn-verify" class="green">Verify</button>
     </div>
     <p id="login-msg" class="hint"></p>
   </div>
@@ -154,9 +159,22 @@ $("btn-magic").onclick = async () => {
   $("login-msg").textContent = "Sending…";
   const { error } = await client.auth.signInWithOtp(
     { email, options: { emailRedirectTo: location.href.split("#")[0] } });
-  $("login-msg").textContent = error ? ("✗ "+error.message)
-    : "✓ Check your email for the sign-in link, then come back here.";
+  if(error){ $("login-msg").textContent = "✗ "+error.message; return; }
+  $("otp-row").classList.remove("hidden");
+  $("login-msg").textContent = "✓ We emailed you a 6-digit code (or a link). "+
+    "Enter the code below, or click the link in the email.";
+  $("otp").focus();
 };
+$("btn-verify").onclick = async () => {
+  const email = $("email").value.trim();
+  const token = ($("otp").value||"").trim().replace(/\s+/g,"");
+  if(!email || !token) return;
+  $("login-msg").textContent = "Verifying…";
+  const { error } = await client.auth.verifyOtp({ email, token, type: "email" });
+  if(error) $("login-msg").textContent = "✗ "+error.message;
+  // success fires onAuthStateChange, which routes to the app.
+};
+$("otp") && $("otp").addEventListener("keydown", e => { if(e.key==="Enter") $("btn-verify").click(); });
 $("btn-signout").onclick = async () => { await client.auth.signOut(); location.reload(); };
 $("btn-join").onclick = async () => {
   const code = $("code").value.trim(); if(!code) return;
