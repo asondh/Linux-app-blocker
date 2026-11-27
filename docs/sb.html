@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>AppBlocker (Supabase)</title>
+<title>AppBlocker</title>
 <style>
   :root{ --bg:#f4f6f8; --card:#fff; --line:#e1e6ea; --head:#1b2631; --accent:#2980b9;
          --muted:#7f8c8d; --red:#c0392b; --ok:#1e8449; }
@@ -13,311 +13,365 @@
   *{ box-sizing:border-box; }
   body{ margin:0; font:15px/1.45 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
         background:var(--bg); color:var(--head); }
-  header{ background:var(--head); color:#fff; padding:12px 16px; display:flex;
-          align-items:center; gap:12px; flex-wrap:wrap; }
+  header{ background:var(--head); color:#fff; padding:10px 16px; display:flex;
+          align-items:center; gap:10px; flex-wrap:wrap; }
   header h1{ font-size:17px; margin:0; } header .sp{ margin-left:auto; }
   header button{ background:#ffffff22; color:#fff; border:1px solid #ffffff44; }
-  main{ max-width:960px; margin:0 auto; padding:16px; }
+  header select{ background:#ffffff14; color:#fff; border:1px solid #ffffff44; }
+  main{ max-width:980px; margin:0 auto; padding:14px 16px 60px; }
   button{ background:var(--accent); color:#fff; border:0; border-radius:7px;
           padding:8px 12px; font-size:14px; cursor:pointer; }
   button.ghost{ background:transparent; color:var(--accent); border:1px solid var(--accent); }
   button.red{ background:var(--red); } button.green{ background:var(--ok); }
   button.sm{ padding:5px 9px; font-size:13px; }
-  input,select{ padding:9px 10px; border:1px solid var(--line); border-radius:7px;
-                font-size:15px; background:var(--card); color:var(--head); }
+  input,select{ padding:8px 9px; border:1px solid var(--line); border-radius:7px;
+                font-size:14px; background:var(--card); color:var(--head); }
   .card{ background:var(--card); border:1px solid var(--line); border-radius:10px;
-         padding:14px 16px; margin-bottom:14px; }
-  .card h2{ font-size:14px; margin:0 0 10px; color:var(--accent); }
-  .hint{ color:var(--muted); font-size:13px; }
+         padding:12px 14px; margin-bottom:12px; }
+  .card h2{ font-size:14px; margin:0 0 6px; color:var(--accent); }
+  .sec{ padding:10px 0; border-bottom:1px solid var(--line); } .sec:last-child{ border-bottom:0; }
+  .sec h3{ font-size:13px; margin:0 0 8px; color:var(--head); }
+  .hint{ color:var(--muted); font-size:12.5px; margin:4px 0; }
   .center{ max-width:420px; margin:10vh auto; }
   table{ width:100%; border-collapse:collapse; font-size:13px; }
   th,td{ text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
-  th{ color:var(--muted); font-weight:600; cursor:default; }
+  th{ color:var(--muted); font-weight:600; }
   .nw{ white-space:nowrap; } .r{ text-align:right; }
   .pill{ display:inline-block; background:var(--line); border-radius:10px; padding:1px 8px;
          font-size:11px; color:var(--muted); }
-  .row{ display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
-  .dev{ display:flex; gap:10px; align-items:baseline; flex-wrap:wrap; padding:6px 0;
-        border-bottom:1px dashed var(--line); }
-  .dev:last-child{ border-bottom:0; }
+  .pill.red{ background:#f9d7d2; color:#922; } .pill.ok{ background:#d6f0e0; color:#145a32; }
+  @media (prefers-color-scheme: dark){ :root:not([data-theme="light"]) .pill.red{ background:#52221c; color:#f3b4a9 }
+    :root:not([data-theme="light"]) .pill.ok{ background:#17432c; color:#8fe3b2 } }
+  .row{ display:flex; gap:8px; flex-wrap:wrap; align-items:center; padding:5px 0; }
+  .row .nm{ font-weight:600; } .row .sp{ margin-left:auto; }
   .muted{ color:var(--muted); }
+  .tabs{ display:flex; gap:6px; flex-wrap:wrap; margin-bottom:12px; }
+  .tabs button{ background:#e7ecf1; color:#2c3e50; }
+  @media (prefers-color-scheme: dark){ :root:not([data-theme="light"]) .tabs button{ background:#232d3a; color:#c7d2dd } }
+  .tabs button.on{ background:var(--head); color:#fff; }
   label.chk{ display:inline-flex; gap:6px; align-items:center; font-size:13px; color:var(--muted); cursor:pointer; }
   #err{ color:var(--red); font-size:13px; margin:8px 0; }
-  #toast{ position:fixed; left:50%; bottom:24px; transform:translateX(-50%);
-          background:var(--head); color:#fff; padding:10px 16px; border-radius:8px;
-          opacity:0; transition:opacity .2s; pointer-events:none; font-size:14px; }
-  #toast.show{ opacity:.95; } #toast.bad{ background:var(--red); }
+  #toast{ position:fixed; left:50%; bottom:24px; transform:translateX(-50%); background:var(--head);
+          color:#fff; padding:10px 16px; border-radius:8px; opacity:0; transition:opacity .2s;
+          pointer-events:none; font-size:14px; z-index:9; } #toast.show{ opacity:.95; } #toast.bad{ background:var(--red); }
   .hidden{ display:none !important; }
+  .grow{ flex:1; min-width:120px; }
 </style>
 </head>
 <body>
 <header>
   <h1>🔒 AppBlocker</h1>
   <span class="pill" id="who"></span>
+  <label class="hidden" id="mwrap" style="color:#fff;font-size:13px">Machine
+    <select id="mach"></select></label>
   <span class="sp"></span>
-  <button id="btn-refresh" class="hidden ghost sm">Refresh</button>
+  <button id="btn-refresh" class="hidden sm">Refresh</button>
   <button id="btn-signout" class="hidden sm">Sign out</button>
 </header>
 <main>
-  <!-- LOGIN -->
   <div id="login" class="card center hidden">
     <h2>Sign in</h2>
-    <p class="hint">Enter your email and we'll send you a sign-in code (or link).</p>
-    <div class="row">
-      <input id="email" type="email" placeholder="you@example.com" style="flex:1">
-      <button id="btn-magic">Send code</button>
-    </div>
-    <div class="row hidden" id="otp-row" style="margin-top:8px">
-      <input id="otp" inputmode="numeric" autocomplete="one-time-code"
-             placeholder="6-digit code from the email" style="flex:1">
-      <button id="btn-verify" class="green">Verify</button>
-    </div>
+    <p class="hint">Enter your email and we'll send a sign-in code.</p>
+    <div class="row"><input id="email" type="email" placeholder="you@example.com" class="grow">
+      <button id="btn-magic">Send code</button></div>
+    <div class="row hidden" id="otp-row"><input id="otp" inputmode="numeric"
+      autocomplete="one-time-code" placeholder="6-digit code" class="grow">
+      <button id="btn-verify" class="green">Verify</button></div>
     <p id="login-msg" class="hint"></p>
   </div>
 
-  <!-- JOIN -->
   <div id="join" class="card center hidden">
     <h2>Link to your household</h2>
-    <p class="hint">Paste your household enrollment code (the same one you put into
-      AppBlocker on your computers) to connect this account.</p>
-    <div class="row">
-      <input id="code" placeholder="household code" style="flex:1">
-      <button id="btn-join">Link</button>
-    </div>
+    <p class="hint">Paste your household code (same one from the AppBlocker app).</p>
+    <div class="row"><input id="code" placeholder="household code" class="grow">
+      <button id="btn-join">Link</button></div>
   </div>
 
   <div id="err"></div>
 
-  <!-- APP -->
   <div id="app" class="hidden">
-    <div class="card" id="c-devices"><h2>Devices</h2><div id="devices"></div></div>
-
-    <div class="card">
-      <h2>Controls (all devices)</h2>
-      <div class="row" style="margin-bottom:8px">
-        <input id="ctl-site" placeholder="block a site, e.g. tiktok.com" style="flex:1">
-        <button class="red sm" data-cmd="add_website">Block site</button>
-        <button class="sm" data-cmd="add_distraction">Add distraction</button>
-      </div>
-      <div class="row">
-        <button class="red sm" data-cmd="quick_block">⚡ Block all browsers</button>
-        <button class="green sm" data-cmd="unblock_all">🔓 Unblock everything</button>
-        <button class="green sm" data-cmd="grant_free_time" data-min="30">Free time 30m</button>
-        <button class="green sm" data-cmd="end_break">End breaks</button>
-      </div>
-      <p class="hint" id="ctl-msg"></p>
+    <div class="tabs" id="tabs">
+      <button data-tab="controls" class="on">Controls</button>
+      <button data-tab="visits">Activity</button>
+      <button data-tab="time">Time on computer</button>
+      <button data-tab="searches">Searches</button>
+      <button data-tab="newsites">New sites</button>
+      <button data-tab="blocked">Blocked</button>
     </div>
-
-    <div class="card">
-      <h2>Recent activity</h2>
-      <div class="row" style="margin-bottom:8px">
-        <input id="fx-site" placeholder="filter by site…" style="flex:1">
-        <label class="chk"><input type="checkbox" id="fx-bg"> show background loads</label>
-      </div>
-      <div style="overflow-x:auto"><table id="t-visits"><thead><tr>
-        <th>When</th><th>User</th><th>Device</th><th>Site / page</th><th class="r">Time</th>
-      </tr></thead><tbody></tbody></table></div>
-      <p class="hint" id="visits-empty"></p>
-    </div>
-
-    <div class="card">
-      <h2>Searches</h2>
-      <div style="overflow-x:auto"><table id="t-search"><thead><tr>
-        <th>When</th><th>User</th><th>Search</th><th>On</th>
-      </tr></thead><tbody></tbody></table></div>
-      <p class="hint" id="search-empty"></p>
-    </div>
+    <div id="p-controls"></div>
+    <div id="p-visits" class="hidden"></div>
+    <div id="p-time" class="hidden"></div>
+    <div id="p-searches" class="hidden"></div>
+    <div id="p-newsites" class="hidden"></div>
+    <div id="p-blocked" class="hidden"></div>
+    <div id="status" class="hint"></div>
   </div>
 </main>
 <div id="toast"></div>
 
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js"></script>
 <script>
-const SB_URL = "https://bptrkvzzuhfxbqbxfbhl.supabase.co";
-const SB_KEY = "sb_publishable_LDFRXQlOlHQYmIQwDmLxRA_H4hz1H3F";
-const client = window.supabase.createClient(SB_URL, SB_KEY);
-const ab = () => client.schema("appblocker");
+const SB_URL="https://bptrkvzzuhfxbqbxfbhl.supabase.co";
+const SB_KEY="sb_publishable_LDFRXQlOlHQYmIQwDmLxRA_H4hz1H3F";
+const client=window.supabase.createClient(SB_URL,SB_KEY);
+const ab=()=>client.schema("appblocker");
+const $=id=>document.getElementById(id);
+const esc=s=>(s==null?"":String(s)).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+let HOUSEHOLD=null, UID=null, DEVICES=[], SNAP={}, VISITS=[], NEWD=[], BLK=[], ATT=[], SEL="*", TAB="controls", rt=null;
 
-const $ = id => document.getElementById(id);
-const esc = s => (s==null?"":String(s)).replace(/[&<>"]/g, c =>
-  ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
-let HOUSEHOLD = null, DEVICES = {}, VISITS = [], rt = null;
-
-function show(which){ ["login","join","app"].forEach(x => $(x).classList.toggle("hidden", x!==which)); }
-function toast(m, bad){ const t=$("toast"); t.textContent=m; t.className="show"+(bad?" bad":"");
-  clearTimeout(t._h); t._h=setTimeout(()=>t.className="", 3000); }
-function err(m){ $("err").textContent = m||""; }
+function show(w){ ["login","join","app"].forEach(x=>$(x).classList.toggle("hidden",x!==w)); }
+function toast(m,bad){ const t=$("toast"); t.textContent=m; t.className="show"+(bad?" bad":"");
+  clearTimeout(t._h); t._h=setTimeout(()=>t.className="",3000); }
+function err(m){ $("err").textContent=m||""; }
 function fmtDur(s){ s=Math.max(0,Math.round(s||0)); if(!s) return "0m"; const m=Math.floor(s/60);
-  if(m>=60) return Math.floor(m/60)+"h "+(m%60)+"m"; return m? m+"m":"<1m"; }
+  if(m>=60) return Math.floor(m/60)+"h "+(m%60)+"m"; return m?m+"m":"<1m"; }
+function fmtClock(ts){ const d=new Date((ts||0)*1000);
+  return String(d.getHours()).padStart(2,"0")+":"+String(d.getMinutes()).padStart(2,"0"); }
 function fmtWhen(iso){ const d=new Date(iso);
-  return '<span class="nw">'+d.toLocaleDateString([], {month:"2-digit",day:"2-digit"})+
-    "</span> <span class='nw'>"+d.toLocaleTimeString([], {hour:"2-digit",minute:"2-digit"})+"</span>"; }
+  return '<span class="nw">'+d.toLocaleDateString([],{month:"2-digit",day:"2-digit"})+
+    "</span> <span class='nw'>"+d.toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"})+"</span>"; }
+const devName=id=>{ const d=DEVICES.find(x=>x.id===id); return d?(d.label||id.slice(0,6)):id.slice(0,6); };
 
-// ---------- auth ----------
-$("btn-magic").onclick = async () => {
-  const email = $("email").value.trim(); if(!email) return;
-  $("login-msg").textContent = "Sending…";
-  const { error } = await client.auth.signInWithOtp(
-    { email, options: { emailRedirectTo: location.href.split("#")[0] } });
-  if(error){ $("login-msg").textContent = "✗ "+error.message; return; }
+/* ---------------- auth ---------------- */
+$("btn-magic").onclick=async()=>{ const email=$("email").value.trim(); if(!email) return;
+  $("login-msg").textContent="Sending…";
+  const {error}=await client.auth.signInWithOtp({email,options:{emailRedirectTo:location.href.split("#")[0]}});
+  if(error){ $("login-msg").textContent="✗ "+error.message; return; }
   $("otp-row").classList.remove("hidden");
-  $("login-msg").textContent = "✓ We emailed you a 6-digit code (or a link). "+
-    "Enter the code below, or click the link in the email.";
-  $("otp").focus();
-};
-$("btn-verify").onclick = async () => {
-  const email = $("email").value.trim();
-  const token = ($("otp").value||"").trim().replace(/\s+/g,"");
-  if(!email || !token) return;
-  $("login-msg").textContent = "Verifying…";
-  const { error } = await client.auth.verifyOtp({ email, token, type: "email" });
-  if(error) $("login-msg").textContent = "✗ "+error.message;
-  // success fires onAuthStateChange, which routes to the app.
-};
-$("otp") && $("otp").addEventListener("keydown", e => { if(e.key==="Enter") $("btn-verify").click(); });
-$("btn-signout").onclick = async () => { await client.auth.signOut(); location.reload(); };
-$("btn-join").onclick = async () => {
-  const code = $("code").value.trim(); if(!code) return;
-  const { error } = await client.rpc("appblocker_join_household", { p_code: code });
-  if(error){ err("Couldn't link: "+error.message); return; }
-  err(""); await afterLogin();
-};
-
-client.auth.onAuthStateChange((_e, session) => { route(session); });
+  $("login-msg").textContent="✓ We emailed you a 6-digit code (or a link). Enter the code, or click the link."; $("otp").focus(); };
+$("btn-verify").onclick=async()=>{ const email=$("email").value.trim(), token=($("otp").value||"").trim().replace(/\s+/g,"");
+  if(!email||!token) return; $("login-msg").textContent="Verifying…";
+  const {error}=await client.auth.verifyOtp({email,token,type:"email"});
+  if(error) $("login-msg").textContent="✗ "+error.message; };
+$("otp")&&$("otp").addEventListener("keydown",e=>{ if(e.key==="Enter") $("btn-verify").click(); });
+$("btn-signout").onclick=async()=>{ await client.auth.signOut(); location.reload(); };
+$("btn-join").onclick=async()=>{ const code=$("code").value.trim(); if(!code) return;
+  const {error}=await client.rpc("appblocker_join_household",{p_code:code});
+  if(error){ err("Couldn't link: "+error.message); return; } err(""); afterLogin(); };
+client.auth.onAuthStateChange((_e,s)=>route(s));
 
 async function route(session){
-  if(!session){ show("login"); $("who").textContent="";
-    $("btn-signout").classList.add("hidden"); $("btn-refresh").classList.add("hidden"); return; }
-  $("who").textContent = session.user.email;
-  $("btn-signout").classList.remove("hidden");
-  await afterLogin();
+  if(!session){ show("login"); $("who").textContent=""; ["btn-signout","btn-refresh","mwrap"].forEach(i=>$(i).classList.add("hidden")); return; }
+  UID=session.user.id; $("who").textContent=session.user.email; $("btn-signout").classList.remove("hidden"); afterLogin();
 }
-
 async function afterLogin(){
-  // Am I a member of a household yet?
-  const { data, error } = await ab().from("household_member").select("household_id").limit(1);
-  if(error){ // most likely the schema isn't exposed to the API yet
-    if(/schema|not exist|406|PGRST/i.test(error.message||error.code||""))
-      err("The database isn't exposed to the dashboard yet. In Supabase → Settings → "+
-          "API → Exposed schemas, add “appblocker”, then Refresh.");
-    else err(error.message);
-    show("app"); $("app").classList.add("hidden"); return;
-  }
-  if(!data || !data.length){ show("join"); return; }
-  HOUSEHOLD = data[0].household_id;
-  show("app"); $("btn-refresh").classList.remove("hidden");
+  const {data,error}=await ab().from("household_member").select("household_id").limit(1);
+  if(error){ if(/schema|not exist|PGRST|406/i.test(error.message||error.code||""))
+      err("The database isn't exposed to the dashboard yet. In Supabase → Settings → API → Exposed schemas, add “appblocker”, then Refresh.");
+    else err(error.message); show("app"); ["p-controls","p-visits","p-time","p-searches","p-newsites","p-blocked"].forEach(i=>$(i).innerHTML=""); return; }
+  if(!data||!data.length){ show("join"); return; }
+  HOUSEHOLD=data[0].household_id; show("app");
+  ["btn-refresh","mwrap"].forEach(i=>$(i).classList.remove("hidden"));
   await loadAll(); subscribe();
 }
 
-// ---------- data ----------
+/* ---------------- data ---------------- */
+function todayStr(){ const d=new Date(); return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0"); }
 async function loadAll(){
   err("");
-  const today = new Date(); const ds = today.getFullYear()+"-"+
-    String(today.getMonth()+1).padStart(2,"0")+"-"+String(today.getDate()).padStart(2,"0");
-  const since = new Date(Date.now()-2*86400e3).toISOString();
-  const [dev, snap, st, at, vis] = await Promise.all([
+  const since=new Date(Date.now()-3*86400e3).toISOString();
+  const [dev,snap,vis,nd,bl,at]=await Promise.all([
     ab().from("device").select("id,label,last_seen"),
-    ab().from("snapshot").select("device_id,generated_at,data,updated_at"),
-    ab().from("screen_time").select("device_id,username,seconds,bonus_seconds").eq("day", ds),
-    ab().from("app_time").select("device_id,username,app,label,seconds").eq("day", ds),
-    ab().from("visit").select("device_id,username,domain,url,ts,duration,background,query")
-      .gte("ts", since).order("ts",{ascending:false}).limit(1500),
+    ab().from("snapshot").select("device_id,generated_at,data"),
+    ab().from("visit").select("device_id,username,domain,url,ts,duration,background,query").gte("ts",since).order("ts",{ascending:false}).limit(2000),
+    ab().from("new_domain").select("device_id,username,domain,ts").gte("ts",since).order("ts",{ascending:false}).limit(500),
+    ab().from("blocked_site").select("device_id,username,domain,url,ts").gte("ts",since).order("ts",{ascending:false}).limit(500),
+    ab().from("attempt").select("device_id,username,app,ts").gte("ts",since).order("ts",{ascending:false}).limit(500),
   ]);
-  const anyErr = [dev,snap,st,at,vis].find(r=>r.error);
-  if(anyErr){ err(anyErr.error.message); return; }
-  DEVICES = {}; (dev.data||[]).forEach(d => DEVICES[d.id]=d.label||d.id.slice(0,6));
-  renderDevices(dev.data||[], snap.data||[], st.data||[], at.data||[]);
-  VISITS = vis.data||[];
-  renderVisits(); renderSearches();
+  const e=[dev,snap,vis,nd,bl,at].find(r=>r.error); if(e){ err(e.error.message); return; }
+  DEVICES=(dev.data||[]).slice().sort((a,b)=>(a.label||"").localeCompare(b.label||""));
+  SNAP={}; (snap.data||[]).forEach(s=>SNAP[s.device_id]=s.data||{});
+  VISITS=vis.data||[]; NEWD=nd.data||[]; BLK=bl.data||[]; ATT=at.data||[];
+  renderMachinePicker(); render();
 }
+function renderMachinePicker(){
+  const m=$("mach"); const prev=SEL;
+  m.innerHTML='<option value="*">All machines</option>'+DEVICES.map(d=>'<option value="'+esc(d.id)+'">'+esc(d.label||d.id.slice(0,6))+'</option>').join("");
+  if(prev!=="*"&&!DEVICES.find(d=>d.id===prev)) SEL="*";
+  m.value=SEL; m.onchange=()=>{ SEL=m.value; render(); };
+}
+function curDevices(){ return SEL==="*"?DEVICES.map(d=>d.id):[SEL]; }
+function visitScope(v){ return SEL==="*"||v.device_id===SEL; }
 
-function renderDevices(devs, snaps, st, at){
-  const snapBy = {}; snaps.forEach(s=>snapBy[s.device_id]=s);
-  const stBy = {}; st.forEach(r=>{ (stBy[r.device_id]=stBy[r.device_id]||{})[r.username]=r; });
-  const atBy = {}; at.forEach(r=>{ (atBy[r.device_id]=atBy[r.device_id]||[]).push(r); });
-  let h="";
-  if(!devs.length) h='<p class="hint">No devices enrolled yet.</p>';
-  devs.forEach(d=>{
-    const s=snapBy[d.id], seen=d.last_seen? new Date(d.last_seen).toLocaleString():"never";
-    const users=Object.values(stBy[d.id]||{}).map(r=>
-      esc(r.username)+" "+fmtDur((r.seconds||0))).join(" · ");
-    h+='<div class="dev"><b>'+esc(d.label||d.id.slice(0,6))+'</b>'+
-       '<span class="muted">last seen '+esc(seen)+'</span>'+
-       (users?'<span class="pill">today: '+users+'</span>':'')+'</div>';
+/* ---------------- commands ---------------- */
+async function issue(targets, action, payload){
+  targets=targets.filter(Boolean); if(!targets.length){ toast("No machine.",true); return; }
+  const rows=targets.map(id=>({household_id:HOUSEHOLD,target_device_id:id,action,payload:payload||{},created_by:UID}));
+  const {error}=await ab().from("command").insert(rows);
+  if(error){ $("status").textContent="✗ "+error.message; toast("Failed",true); return; }
+  $("status").textContent="✓ Sent “"+action+"” to "+targets.length+" machine(s). Applies within ~1 min — Refresh to confirm.";
+  toast("Sent to "+targets.length+" machine(s)");
+}
+const toSel=(action,payload)=>issue(curDevices(),action,payload);           // selected (all or one)
+const toDev=(id,action,payload)=>issue([id],action,payload);                // one specific
+
+/* ---------------- render ---------------- */
+function render(){ renderControls(); renderVisits(); renderTime(); renderSearches(); renderNewsites(); renderBlocked(); }
+document.querySelectorAll("#tabs button").forEach(b=>b.onclick=()=>{
+  TAB=b.dataset.tab; document.querySelectorAll("#tabs button").forEach(x=>x.classList.toggle("on",x===b));
+  ["controls","visits","time","searches","newsites","blocked"].forEach(t=>$("p-"+t).classList.toggle("hidden",t!==TAB)); });
+$("btn-refresh").onclick=loadAll;
+
+function blkMode(){ const v=($("ctl-mode")||{}).value||"manual"; return v==="manual"?{mode:"manual"}:{mode:"timer",minutes:parseInt(v,10)}; }
+
+function renderControls(){
+  const one=SEL!=="*", snap=one?(SNAP[SEL]||{}):null, ctl=snap?(snap.control||{}):null;
+  let h='<div class="card"><h2>Screen time — grant more without the password</h2>';
+  // Per-device screen-time + grant (always per device, to avoid double-counting bonus).
+  DEVICES.filter(d=>SEL==="*"||d.id===SEL).forEach(d=>{
+    const s=SNAP[d.id]||{}, c=s.control||{}, bud=c.screen_budget||{};
+    const st=s.screen_time||{}, bn=s.bonus_time||{};
+    const users=Array.from(new Set([...(c.human_users||[]),...Object.keys(st)]));
+    h+='<div class="sec"><h3>'+esc(d.label||d.id.slice(0,6))+(bud.enabled?'':' <span class="pill">no budget set</span>')+'</h3>';
+    if(!users.length) h+='<div class="hint">No users seen today.</div>';
+    users.forEach(u=>{
+      const used=st[u]||0, bonus=bn[u]||0;
+      const bm=(bud.per_user&&bud.per_user[u]!=null)?bud.per_user[u]:(bud.default_minutes||0);
+      const rem=bud.enabled&&bm>0?(bm*60+bonus-used):null;
+      const tag=rem==null?'<span class="pill">no limit</span>':
+        (rem<=0?'<span class="pill red">out of time</span>':'<span class="pill ok">'+fmtDur(rem)+' left</span>');
+      h+='<div class="row"><span class="nm">'+esc(u)+'</span> '+tag+
+         ' <span class="muted">used '+fmtDur(used)+(bonus?' · +'+fmtDur(bonus)+' bonus':'')+'</span>'+
+         '<span class="sp"></span>'+
+         gbtn(d.id,u,15)+gbtn(d.id,u,30)+gbtn(d.id,u,60)+'</div>';
+    });
+    h+='</div>';
   });
-  $("devices").innerHTML=h;
+  h+='</div>';
+
+  // Forced breaks (status across scope + end; config broadcast)
+  h+='<div class="card"><h2>Forced breaks</h2>';
+  let anyBreak=false;
+  DEVICES.filter(d=>SEL==="*"||d.id===SEL).forEach(d=>{ const bs=(SNAP[d.id]||{}).break_status||{};
+    Object.entries(bs).forEach(([u,until])=>{ anyBreak=true;
+      h+='<div class="row"><span class="nm">☕ '+esc(u)+'</span> <span class="muted">on '+esc(d.label||'')+' until '+fmtClock(until)+'</span><span class="sp"></span>'+
+         '<button class="green sm" onclick="toDev(\''+d.id+'\',\'end_break\',{user:\''+esc(u)+'\'})">End now</button></div>'; }); });
+  if(!anyBreak) h+='<div class="hint">Nobody is on a break right now.</div>';
+  const br=one&&ctl?(ctl.break_rule||{}):null;
+  if(one&&br){ h+='<div class="row"><label class="chk"><input type="checkbox" id="brk-en"'+(br.enabled?" checked":"")+'> enable</label>'+
+    ' work <input id="brk-w" type="number" min="1" style="width:64px" value="'+(br.work_minutes||30)+'">'+
+    ' break <input id="brk-b" type="number" min="1" style="width:64px" value="'+(br.break_minutes||20)+'"> min'+
+    '<button class="sm" onclick="saveBreak()">Save</button></div>';
+  } else h+='<div class="hint">Pick one machine above to change the break schedule.</div>';
+  h+='</div>';
+
+  // Websites / distractions / watched (add broadcasts; lists are per-machine)
+  h+='<div class="card"><h2>Websites</h2>'+
+     '<div class="row"><input id="w-site" class="grow" placeholder="block on all machines, e.g. tiktok.com">'+
+     '<button class="red sm" onclick="addSite(\'add_website\',\'w-site\')">Block</button>'+
+     '<button class="sm" onclick="addSite(\'add_watch\',\'w-site\')">Watch</button>'+
+     '<button class="sm" onclick="addSite(\'add_distraction\',\'w-site\')">Distraction</button></div>';
+  if(one&&ctl){
+    h+=listBlock("Blocked",(ctl.websites||[]),(x)=>'<button class="green sm" onclick="toSel(\'remove_website\',{domain:\''+esc(x)+'\'})">Unblock</button>');
+    h+=listBlock("Watched",(ctl.watch||[]),(x)=>'<button class="green sm" onclick="toSel(\'remove_watch\',{domain:\''+esc(x)+'\'})">Unwatch</button>');
+    const now=Math.floor(Date.now()/1000), fu=ctl.distract_free_until||0, al=ctl.distract_allow||{};
+    h+='<h3 style="margin-top:8px">Distractions '+(fu>now?'<span class="pill ok">free until '+fmtClock(fu)+'</span>':'<span class="pill">locked</span>')+'</h3>';
+    h+='<div class="row">'+(fu>now?'<button class="red sm" onclick="toSel(\'end_free_time\',{})">Re-lock now</button>':
+      '<button class="green sm" onclick="toSel(\'grant_free_time\',{minutes:15})">Free 15m</button><button class="green sm" onclick="toSel(\'grant_free_time\',{minutes:30})">30m</button><button class="green sm" onclick="toSel(\'grant_free_time\',{minutes:60})">60m</button>')+'</div>';
+    (ctl.distractions||[]).forEach(x=>{ const a=al[x]||0; h+='<div class="row"><span class="nm">'+esc(x)+'</span>'+(a>now?' <span class="pill">allowed → '+fmtClock(a)+'</span>':'')+
+      '<span class="sp"></span><button class="sm" onclick="toSel(\'allow_distraction\',{domain:\''+esc(x)+'\',minutes:20})">Allow 20m</button>'+
+      '<button class="green sm" onclick="toSel(\'remove_distraction\',{domain:\''+esc(x)+'\'})">Remove</button></div>'; });
+  } else h+='<div class="hint">Pick one machine above to see and remove its site lists, grant free time, etc.</div>';
+  h+='</div>';
+
+  // Apps + quick actions
+  h+='<div class="card"><h2>Apps'+(one?'':' <span class="pill">pick a machine</span>')+'</h2>'+
+     '<div class="row"><span class="muted">Block for</span><select id="ctl-mode" class="sm"><option value="manual">until I unblock</option><option value="30">30 min</option><option value="60">1 hour</option><option value="120">2 hours</option></select>'+
+     '<span class="sp"></span><button class="red sm" onclick="toSel(\'quick_block\',blkMode())">⚡ Block all browsers</button>'+
+     '<button class="green sm" onclick="toSel(\'unblock_all\',{})">🔓 Unblock everything</button></div>';
+  if(one&&ctl){ (ctl.apps||[]).forEach(a=>{ h+='<div class="row"><span class="nm">'+esc(a.name)+'</span> '+
+      (a.blocked?'<span class="pill red">blocked</span>':'<span class="pill ok">active</span>')+'<span class="sp"></span>'+
+      (a.blocked?'<button class="green sm" onclick="toSel(\'unblock_app\',{app:\''+esc(a.proc)+'\'})">Unblock</button>':
+        '<button class="red sm" onclick="toSel(\'block_app\',Object.assign({app:\''+esc(a.proc)+'\'},blkMode()))">Block</button>')+'</div>'; });
+    if(!(ctl.apps||[]).length) h+='<div class="hint">No apps in this machine\'s list.</div>'; }
+  h+='</div>';
+
+  // Rules
+  if(one&&ctl){ h+='<div class="card"><h2>Auto-block rules</h2>';
+    (ctl.rules||[]).forEach(r=>{ const p2n={}; (ctl.apps||[]).forEach(a=>p2n[(a.proc||"").toLowerCase()]=a.name);
+      const nm=x=>p2n[(x||"").toLowerCase()]||x;
+      const what=[...(r.targets||[]).map(nm),...((r.block_sites||[]).length?["sites: "+r.block_sites.join(", ")]:[]),...(r.block_distractions?["ALL distractions"]:[])].join(", ")||"(nothing)";
+      h+='<div class="row"><span>While <b>'+esc(nm(r.trigger))+'</b> → '+esc(what)+(r.enabled?'':' <span class="pill red">off</span>')+'</span><span class="sp"></span>'+
+        '<button class="sm" onclick="toSel(\''+(r.enabled?'toggle_rule':'toggle_rule')+'\',{rule_id:\''+esc(r.id)+'\',enabled:'+(!r.enabled)+'})">'+(r.enabled?'Disable':'Enable')+'</button>'+
+        '<button class="red sm" onclick="toSel(\'remove_rule\',{rule_id:\''+esc(r.id)+'\'})">Remove</button></div>'; });
+    if(!(ctl.rules||[]).length) h+='<div class="hint">No rules on this machine.</div>';
+    h+='</div>'; }
+
+  // Protection
+  if(one&&ctl){ h+='<div class="card"><h2>Protection</h2>'+
+    '<div class="row"><span class="nm">Adult-content blocklist</span> '+(ctl.block_adult?'<span class="pill ok">on</span>':'<span class="pill red">off</span>')+'<span class="sp"></span>'+
+      '<button class="'+(ctl.block_adult?'ghost':'red')+' sm" onclick="toSel(\'set_block_adult\',{enabled:'+(!ctl.block_adult)+'})">'+(ctl.block_adult?'Turn off':'Turn on')+'</button></div>'+
+    '<div class="row"><span class="nm">Browser lockdown</span> '+(ctl.lockdown?'<span class="pill ok">on</span>':'<span class="pill red">off</span>')+'<span class="sp"></span>'+
+      '<button class="'+(ctl.lockdown?'ghost':'red')+' sm" onclick="toSel(\'set_lockdown\',{enabled:'+(!ctl.lockdown)+'})">'+(ctl.lockdown?'Turn off':'Turn on')+'</button></div></div>'; }
+
+  $("p-controls").innerHTML=h;
+}
+function gbtn(dev,user,min){ return '<button class="green sm" onclick="toDev(\''+dev+'\',\'grant_screen_time\',{user:\''+esc(user)+'\',minutes:'+min+'})">+'+min+'m</button>'; }
+function listBlock(title,arr,btn){ if(!arr.length) return '<h3 style="margin-top:8px">'+title+'</h3><div class="hint">none</div>';
+  return '<h3 style="margin-top:8px">'+title+'</h3>'+arr.map(x=>'<div class="row"><span class="nm">'+esc(x)+'</span><span class="sp"></span>'+btn(x)+'</div>').join(""); }
+function addSite(action,inp){ const d=($(inp).value||"").trim(); if(!d){ toast("Enter a site",true); return; } toSel(action,{domain:d}); $(inp).value=""; }
+function saveBreak(){ toSel("set_break_rule",{enabled:$("brk-en").checked,work_minutes:parseInt($("brk-w").value,10)||30,break_minutes:parseInt($("brk-b").value,10)||20}); }
+
+function activeVisits(){ const site=($("fx-site")||{}).value||""; const u=($("fx-user")||{}).value||"*"; const bg=($("fx-bg")||{}).checked;
+  return VISITS.filter(v=>visitScope(v) && (bg||!v.background) && (u==="*"||v.username===u) && (!site||(v.domain||"").toLowerCase().includes(site.toLowerCase()))); }
+function userOpts(){ const us=new Set(); VISITS.filter(visitScope).forEach(v=>v.username&&us.add(v.username));
+  return '<option value="*">All users</option>'+[...us].sort().map(u=>'<option>'+esc(u)+'</option>').join(""); }
+
+function renderVisits(){ const rows=activeVisits();
+  $("p-visits").innerHTML='<div class="card"><div class="row"><select id="fx-user" class="sm">'+userOpts()+'</select>'+
+    '<input id="fx-site" class="grow" placeholder="filter by site…"><label class="chk"><input type="checkbox" id="fx-bg"> background loads</label></div>'+
+    '<div style="overflow-x:auto"><table><thead><tr><th>When</th><th>User</th><th>Machine</th><th>Site / page</th><th class="r">Time</th></tr></thead><tbody>'+
+    rows.slice(0,500).map(v=>'<tr><td>'+fmtWhen(v.ts)+'</td><td>'+esc(v.username||"")+'</td><td>'+esc(devName(v.device_id))+'</td><td>'+esc(v.domain||"")+
+      (v.url?'<div class="muted" style="max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(v.url)+'</div>':'')+
+      '</td><td class="r nw">'+(typeof v.duration==="number"?fmtDur(v.duration):"")+'</td></tr>').join("")+
+    '</tbody></table></div>'+(rows.length?'':'<div class="hint">Nothing to show.</div>')+'</div>';
+  const u=$("fx-user"); if(u){ u.onchange=renderVisits; } const si=$("fx-site"); if(si) si.oninput=renderVisits; const b=$("fx-bg"); if(b) b.onchange=renderVisits;
+}
+function renderTime(){ // per-app (from snapshot app_time) + per-site (from visits durations)
+  let h='<div class="card"><h2>Active time per app (focused window)</h2>';
+  const apps={}; DEVICES.filter(d=>SEL==="*"||d.id===SEL).forEach(d=>{ const at=(SNAP[d.id]||{}).app_time||{};
+    Object.entries(at).forEach(([u,list])=>{ (list||[]).forEach(a=>{ const k=u+"|"+a.app; apps[k]=apps[k]||{u,label:a.label||a.app,secs:0}; apps[k].secs+=a.secs||0; }); }); });
+  const al=Object.values(apps).sort((a,b)=>b.secs-a.secs);
+  h+=al.length?'<table><thead><tr><th>User</th><th>App</th><th class="r">Today</th></tr></thead><tbody>'+
+    al.map(a=>'<tr><td>'+esc(a.u)+'</td><td>'+esc(a.label)+'</td><td class="r nw">'+fmtDur(a.secs)+'</td></tr>').join("")+'</tbody></table>':'<div class="hint">No per-app time yet (X11 only).</div>';
+  h+='</div><div class="card"><h2>Time on sites (from real page durations)</h2>';
+  const sites={}; activeSiteVisits().forEach(v=>{ if(v.background) return; const k=(v.username||"")+"|"+(v.domain||""); sites[k]=sites[k]||{u:v.username,d:v.domain,secs:0,n:0};
+    sites[k].secs+=(typeof v.duration==="number"?v.duration:0); sites[k].n++; });
+  const sl=Object.values(sites).sort((a,b)=>b.secs-a.secs).slice(0,60);
+  h+=sl.length?'<table><thead><tr><th>User</th><th>Site</th><th class="r">Time</th><th class="r">Visits</th></tr></thead><tbody>'+
+    sl.map(s=>'<tr><td>'+esc(s.u||"")+'</td><td>'+esc(s.d||"")+'</td><td class="r nw">'+fmtDur(s.secs)+'</td><td class="r">'+s.n+'</td></tr>').join("")+'</tbody></table>':'<div class="hint">No data.</div>';
+  $("p-time").innerHTML=h+'</div>';
+}
+function activeSiteVisits(){ return VISITS.filter(v=>visitScope(v)); }
+function renderSearches(){ const rows=VISITS.filter(v=>visitScope(v)&&v.query);
+  $("p-searches").innerHTML='<div class="card"><h2>Searches</h2>'+(rows.length?'<table><thead><tr><th>When</th><th>User</th><th>Search</th><th>On</th></tr></thead><tbody>'+
+    rows.slice(0,300).map(v=>'<tr><td>'+fmtWhen(v.ts)+'</td><td>'+esc(v.username||"")+'</td><td>'+esc(v.query)+'</td><td>'+esc(v.domain||"")+'</td></tr>').join("")+'</tbody></table>':'<div class="hint">No searches recorded.</div>')+'</div>';
+}
+function renderNewsites(){ const rows=NEWD.filter(visitScope);
+  $("p-newsites").innerHTML='<div class="card"><h2>New sites</h2>'+(rows.length?'<table><thead><tr><th>When</th><th>User</th><th>Machine</th><th>Domain</th></tr></thead><tbody>'+
+    rows.slice(0,300).map(v=>'<tr><td>'+fmtWhen(v.ts)+'</td><td>'+esc(v.username||"")+'</td><td>'+esc(devName(v.device_id))+'</td><td>'+esc(v.domain||"")+'</td></tr>').join("")+'</tbody></table>':'<div class="hint">No new sites in range.</div>')+'</div>';
+}
+function renderBlocked(){ const sites=BLK.filter(visitScope), apps=ATT.filter(visitScope);
+  let h='<div class="card"><h2>Blocked attempts</h2>';
+  h+='<h3>Apps</h3>'+(apps.length?'<table><thead><tr><th>When</th><th>User</th><th>Machine</th><th>App</th></tr></thead><tbody>'+
+    apps.slice(0,200).map(a=>'<tr><td>'+fmtWhen(a.ts)+'</td><td>'+esc(a.username||"")+'</td><td>'+esc(devName(a.device_id))+'</td><td>'+esc(a.app||"")+'</td></tr>').join("")+'</tbody></table>':'<div class="hint">none</div>');
+  h+='<h3 style="margin-top:8px">Sites</h3>'+(sites.length?'<table><thead><tr><th>When</th><th>User</th><th>Machine</th><th>Site</th></tr></thead><tbody>'+
+    sites.slice(0,200).map(s=>'<tr><td>'+fmtWhen(s.ts)+'</td><td>'+esc(s.username||"")+'</td><td>'+esc(devName(s.device_id))+'</td><td>'+esc(s.domain||"")+'</td></tr>').join("")+'</tbody></table>':'<div class="hint">none</div>');
+  $("p-blocked").innerHTML=h+'</div>';
 }
 
-function activeVisits(){
-  const site=($("fx-site").value||"").toLowerCase().trim();
-  const showBg=$("fx-bg").checked;
-  return VISITS.filter(v=>{
-    if(!showBg && v.background) return false;
-    if(site && !((v.domain||"").toLowerCase().includes(site))) return false;
-    return true;
-  });
-}
-function renderVisits(){
-  const rows=activeVisits().slice(0,400);
-  $("t-visits").tBodies[0].innerHTML = rows.map(v=>
-    "<tr><td>"+fmtWhen(v.ts)+"</td><td>"+esc(v.username||"")+"</td><td>"+
-    esc(DEVICES[v.device_id]||"")+"</td><td>"+esc(v.domain||"")+
-    (v.url?'<div class="muted" style="max-width:360px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(v.url)+"</div>":"")+
-    "</td><td class='r nw'>"+(typeof v.duration==="number"?fmtDur(v.duration):"")+"</td></tr>").join("");
-  $("visits-empty").textContent = rows.length? "" : "Nothing to show.";
-}
-function renderSearches(){
-  const rows=VISITS.filter(v=>v.query).slice(0,200);
-  $("t-search").tBodies[0].innerHTML = rows.map(v=>
-    "<tr><td>"+fmtWhen(v.ts)+"</td><td>"+esc(v.username||"")+"</td><td>"+
-    esc(v.query)+"</td><td>"+esc(v.domain||"")+"</td></tr>").join("");
-  $("search-empty").textContent = rows.length? "" : "No searches recorded.";
-}
-$("fx-site").addEventListener("input", renderVisits);
-$("fx-bg").addEventListener("change", renderVisits);
-$("btn-refresh").onclick = loadAll;
-
-// ---------- controls (issue commands to every device) ----------
-async function issue(action, payload){
-  const ids=Object.keys(DEVICES);
-  if(!ids.length){ toast("No devices yet.", true); return; }
-  const { data:{ user } } = await client.auth.getUser();
-  const rows=ids.map(id=>({ household_id:HOUSEHOLD, target_device_id:id,
-    action, payload:payload||{}, created_by:user.id }));
-  const { error } = await ab().from("command").insert(rows);
-  if(error){ $("ctl-msg").textContent="✗ "+error.message; toast("Failed", true); return; }
-  $("ctl-msg").textContent="✓ Sent “"+action+"” to "+ids.length+" device(s). Applies within ~1 min.";
-  toast("Sent to "+ids.length+" device(s)");
-}
-document.querySelectorAll("[data-cmd]").forEach(b=>{
-  b.onclick=()=>{
-    const cmd=b.dataset.cmd;
-    if(cmd==="add_website"||cmd==="add_distraction"){
-      const d=($("ctl-site").value||"").trim(); if(!d){ toast("Enter a site first.",true); return; }
-      issue(cmd, {domain:d}); $("ctl-site").value="";
-    } else if(cmd==="grant_free_time"){ issue(cmd, {minutes:parseInt(b.dataset.min,10)}); }
-    else if(cmd==="end_break"){ issue(cmd, {}); }
-    else { issue(cmd, {}); }
-  };
-});
-
-// ---------- realtime ----------
-function subscribe(){
-  if(rt) client.removeChannel(rt);
-  rt = client.channel("ab-"+Date.now())
-    .on("postgres_changes", {event:"INSERT", schema:"appblocker", table:"visit"}, p=>{
-      VISITS.unshift(p.new); if(VISITS.length>1600) VISITS.pop();
-      renderVisits(); renderSearches();
-    })
-    .on("postgres_changes", {event:"*", schema:"appblocker", table:"snapshot"}, ()=>loadAll())
+/* ---------------- realtime ---------------- */
+function subscribe(){ if(rt) client.removeChannel(rt);
+  rt=client.channel("ab-"+Date.now())
+    .on("postgres_changes",{event:"INSERT",schema:"appblocker",table:"visit"},p=>{ VISITS.unshift(p.new); if(VISITS.length>2200) VISITS.pop(); if(TAB==="visits") renderVisits(); })
+    .on("postgres_changes",{event:"*",schema:"appblocker",table:"snapshot"},()=>loadAll())
     .subscribe();
 }
+// Expose the handlers used by inline onclick= attributes (const/function
+// bindings in a classic script aren't reachable from inline handlers otherwise).
+Object.assign(window,{toSel,toDev,issue,blkMode,saveBreak,addSite,gbtn});
 
-// ---------- boot ----------
-(async () => {
-  const { data:{ session } } = await client.auth.getSession();
-  route(session);
-})();
+(async()=>{ const {data:{session}}=await client.auth.getSession(); route(session); })();
 </script>
 </body>
 </html>
